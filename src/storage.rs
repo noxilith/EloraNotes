@@ -143,6 +143,8 @@ pub struct Note {
     pub trashed: bool,
     /// Explicitly assigned tags (stored in frontmatter)
     pub explicit_tags: Vec<String>,
+    /// Optional Tabler icon name (e.g. `flare`), stored in frontmatter
+    pub icon: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub file_path: PathBuf,
@@ -162,6 +164,7 @@ impl Note {
             pinned: false,
             trashed: false,
             explicit_tags: Vec::new(),
+            icon: None,
             created_at: now,
             updated_at: now,
             file_path,
@@ -384,11 +387,15 @@ impl Note {
         };
 
         format!(
-            "---\ntitle: \"{}\"\npinned: {}\ntrashed: {}\ntags: {}\ncreated_at: {}\nupdated_at: {}\n---\n{}",
+            "---\ntitle: \"{}\"\npinned: {}\ntrashed: {}\ntags: {}\n{}created_at: {}\nupdated_at: {}\n---\n{}",
             escaped_title,
             self.pinned,
             self.trashed,
             tags_serialized,
+            self.icon
+                .as_ref()
+                .map(|i| format!("icon: {i}\n"))
+                .unwrap_or_default(),
             self.created_at.to_rfc3339(),
             self.updated_at.to_rfc3339(),
             self.body
@@ -407,6 +414,7 @@ impl Note {
             let mut pinned = false;
             let mut trashed = false;
             let mut explicit_tags = Vec::new();
+            let mut icon = None;
             let mut created_at = fallback_time;
             let mut updated_at = fallback_time;
 
@@ -427,6 +435,14 @@ impl Note {
                         }
                         "tags" => {
                             explicit_tags = parse_yaml_tags(val);
+                        }
+                        "icon" => {
+                            let name: String = val
+                                .trim_matches('"')
+                                .chars()
+                                .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+                                .collect();
+                            icon = (!name.is_empty()).then_some(name);
                         }
                         "created_at" => {
                             if let Ok(dt) = DateTime::parse_from_rfc3339(val.trim_matches('"')) {
@@ -450,6 +466,7 @@ impl Note {
                 pinned,
                 trashed,
                 explicit_tags,
+                icon,
                 created_at,
                 updated_at,
                 file_path,
@@ -481,6 +498,7 @@ impl Note {
                 pinned: false,
                 trashed: false,
                 explicit_tags: Vec::new(),
+                icon: None,
                 created_at: fallback_time,
                 updated_at: fallback_time,
                 file_path,
@@ -948,6 +966,23 @@ pub fn sort_notes(notes: &mut [Note], order: SortOrder) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_note_icon_round_trip() {
+        let dir = std::path::Path::new("/tmp");
+        let mut note = Note::new("Icon note", "body", dir);
+        note.icon = Some("flare".to_string());
+        let md = note.to_markdown();
+        assert!(md.contains("\nicon: flare\n"));
+        let parsed = Note::from_markdown(note.id.clone(), &md, note.file_path.clone());
+        assert_eq!(parsed.icon.as_deref(), Some("flare"));
+
+        note.icon = None;
+        let md = note.to_markdown();
+        assert!(!md.contains("icon:"));
+        let parsed = Note::from_markdown(note.id.clone(), &md, note.file_path.clone());
+        assert_eq!(parsed.icon, None);
+    }
+
     use super::*;
     use std::env;
 

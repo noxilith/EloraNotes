@@ -1,5 +1,14 @@
+use crate::icon_names::TABLER_ICON_NAMES;
 use egui::{FontData, FontDefinitions, FontFamily};
 use std::sync::Arc;
+
+/// Looks up the Tabler glyph for an icon name such as `flare`.
+pub fn tabler_glyph(name: &str) -> Option<&'static str> {
+    TABLER_ICON_NAMES
+        .binary_search_by_key(&name, |(n, _)| n)
+        .ok()
+        .map(|i| TABLER_ICON_NAMES[i].1)
+}
 
 /// Embedded Tabler Icons outline font (MIT License).
 pub const TABLER_FONT_BYTES: &[u8] = include_bytes!("../assets/tabler-icons.ttf");

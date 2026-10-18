@@ -1,6 +1,8 @@
-use crate::icons::{icon, install_tabler_icons};
+use crate::icon_names::TABLER_ICON_NAMES;
+use crate::icons::{icon, install_tabler_icons, tabler_glyph};
 use crate::markdown::{
     apply_highlight_selection, build_editor_layout_job, clear_formatting_selection,
+    insert_at_selection,
     color_swatch_button, markdown_to_html, render_inline_spans_ui, rgb_to_hex, wrap_selection,
     HIGHLIGHT_PRESETS,
 };
@@ -59,6 +61,8 @@ pub struct EloraApp {
     show_formatting_bar: bool,
     /// Current glow highlight color `[R, G, B]` selected by the user's color picker.
     highlight_rgb: [u8; 3],
+    /// Color used by the toolbar's "Text Color" button for the next wrapped selection.
+    text_color_rgb: [u8; 3],
     /// User-chosen overrides for background, text, accent and pin colors.
     colors: ColorOverrides,
     /// Body text size in points.
@@ -72,6 +76,10 @@ pub struct EloraApp {
     last_editor_selection: Option<(usize, usize)>,
     confirm_delete_id: Option<String>,
     command_palette_open: bool,
+    icon_picker_open: bool,
+    /// True when the picker is inserting a glyph into the body instead of setting the header icon.
+    icon_picker_for_body: bool,
+    icon_search: String,
     command_palette_query: String,
     command_palette_selected: usize,
     focus_search_next_frame: bool,
@@ -131,6 +139,7 @@ enum EditorFormatOp {
     Underline,
     InlineCode,
     GlowHighlight([u8; 3]),
+    TextColor([u8; 3]),
     WikiLink,
     Heading1,
     Heading2,
@@ -204,6 +213,10 @@ impl EloraApp {
             last_seen_body: None,
             confirm_delete_id: None,
             command_palette_open: false,
+            icon_picker_open: false,
+            icon_picker_for_body: false,
+            text_color_rgb: [78, 205, 255],
+            icon_search: String::new(),
             command_palette_query: String::new(),
             command_palette_selected: 0,
             focus_search_next_frame: false,
@@ -713,6 +726,10 @@ impl EloraApp {
                 self.highlight_rgb = rgb;
                 apply_highlight_selection(body, range, rgb);
                 self.persist_settings();
+            }
+            EditorFormatOp::TextColor(rgb) => {
+                let open = format!("{{color:{}}}", rgb_to_hex(rgb));
+                wrap_selection(body, range, &open, "{/color}", "colored text")
             }
             EditorFormatOp::WikiLink => wrap_selection(body, range, "[[", "]]", "Note Title"),
             EditorFormatOp::Heading1 => wrap_selection(body, range, "\n# ", "\n", "Heading 1"),
@@ -1965,6 +1982,107 @@ impl EloraApp {
         });
     }
 
+    /// Floating, searchable Tabler icon picker for the selected note.
+    /// Returns `Some(Some(name))` to set an icon, `Some(None)` to remove it.
+    fn render_icon_picker(
+        &mut self,
+        ctx: &egui::Context,
+        p: &Palette,
+        note_idx: usize,
+    ) -> Option<Option<String>> {
+        if !self.icon_picker_open {
+            return None;
+        }
+        let current = if self.icon_picker_for_body {
+            None
+        } else {
+            self.notes[note_idx].icon.clone()
+        };
+        let query = self.icon_search.trim().to_lowercase().replace(' ', "-");
+        let mut choice: Option<Option<String>> = None;
+        let mut open = true;
+
+        let title = if self.icon_picker_for_body {
+            "Insert icon"
+        } else {
+            "Note icon"
+        };
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, 68.0))
+            .fixed_size(Vec2::new(420.0, 380.0))
+            .frame(
+                Frame::new()
+                    .fill(p.bg_sidebar)
+                    .stroke(Stroke::new(1.5_f32, p.accent))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::symmetric(14, 12)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(icon::SEARCH).color(p.accent).size(16.0));
+                    ui.add(
+                        TextEdit::singleline(&mut self.icon_search)
+                            .hint_text("Search Tabler icons… (e.g. book, star, flare)")
+                            .frame(false)
+                            .desired_width(340.0),
+                    );
+                    if current.is_some()
+                        && ui
+                            .button(RichText::new("Remove").size(12.0).color(p.danger))
+                            .clicked()
+                    {
+                        choice = Some(None);
+                    }
+                });
+                ui.separator();
+
+                let matches: Vec<(&str, &str)> = TABLER_ICON_NAMES
+                    .iter()
+                    .filter(|(name, _)| query.is_empty() || name.contains(query.as_str()))
+                    .copied()
+                    .collect();
+                let total = matches.len();
+                ui.label(
+                    RichText::new(format!("{total} icons"))
+                        .size(11.0)
+                        .color(p.fg_muted),
+                );
+
+                egui::ScrollArea::vertical()
+                    .max_height(320.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            for &(name, glyph) in matches.iter().take(400) {
+                                let selected = current.as_deref() == Some(name);
+                                let btn = egui::Button::new(
+                                    RichText::new(glyph).size(18.0).color(if selected {
+                                        p.accent
+                                    } else {
+                                        p.fg_primary
+                                    }),
+                                )
+                                .frame(selected)
+                                .min_size(Vec2::splat(34.0));
+                                if ui.add(btn).on_hover_text(name).clicked() {
+                                    choice = Some(Some(name.to_string()));
+                                }
+                            }
+                        });
+                    });
+            });
+
+        if !open || choice.is_some() {
+            self.icon_picker_open = false;
+            self.icon_picker_for_body = false;
+            self.icon_search.clear();
+        }
+        choice
+    }
+
     fn render_editor(&mut self, ui: &mut Ui, p: &Palette) {
         let Some(selected_id) = self.selected_id.clone() else {
             ui.centered_and_justified(|ui| {
@@ -2041,6 +2159,29 @@ impl EloraApp {
                 .clicked()
             {
                 self.focus_mode = !self.focus_mode;
+            }
+
+            ui.label(RichText::new("·").color(p.fg_muted));
+
+            // Note icon picker button
+            let note_icon = self.notes[note_idx].icon.clone();
+            let icon_glyph = note_icon.as_deref().and_then(tabler_glyph).unwrap_or(icon::PLUS);
+            let icon_tooltip = match note_icon.as_deref() {
+                Some(name) => format!("Note icon: {name} (click to change)"),
+                None => "Add an icon to this note".to_string(),
+            };
+            if ui
+                .add(
+                    egui::Button::new(RichText::new(icon_glyph).size(13.0).color(
+                        if note_icon.is_some() { p.accent } else { p.fg_secondary },
+                    ))
+                    .frame(self.icon_picker_open),
+                )
+                .on_hover_text(icon_tooltip)
+                .clicked()
+            {
+                self.icon_picker_for_body = false;
+                self.icon_picker_open = !self.icon_picker_open;
             }
 
             ui.label(RichText::new("·").color(p.fg_muted));
@@ -2230,6 +2371,22 @@ impl EloraApp {
             });
         });
 
+        let inserting = self.icon_picker_for_body;
+        if let Some(choice) = self.render_icon_picker(ui.ctx(), p, note_idx) {
+            if inserting {
+                if let Some(glyph) = choice.as_deref().and_then(tabler_glyph) {
+                    let range = self.last_editor_selection;
+                    insert_at_selection(&mut self.notes[note_idx].body, range, glyph);
+                    self.notes[note_idx].updated_at = Utc::now();
+                    needs_save = true;
+                }
+            } else {
+                self.notes[note_idx].icon = choice;
+                self.notes[note_idx].updated_at = Utc::now();
+                needs_save = true;
+            }
+        }
+
         ui.add_space(8.0);
 
         // Title Field
@@ -2397,6 +2554,47 @@ impl EloraApp {
                     {
                         queued_format_op = Some(op);
                     }
+                }
+
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(icon::SPARKLES).size(13.5).color(p.fg_secondary),
+                        )
+                        .fill(p.bg_elevated)
+                        .corner_radius(CornerRadius::same(5)),
+                    )
+                    .on_hover_text("Insert a Tabler icon at the cursor")
+                    .clicked()
+                {
+                    self.icon_picker_for_body = true;
+                    self.icon_picker_open = true;
+                    self.icon_search.clear();
+                }
+
+                ui.add_space(4.0);
+                ui.label(RichText::new("·").color(p.fg_muted));
+                ui.add_space(2.0);
+
+                // Text color: color picker + apply button wraps selection in {color:#HEX}...{/color}
+                ui.color_edit_button_srgb(&mut self.text_color_rgb)
+                    .on_hover_text("Pick text color");
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("A Text Color").size(12.0).color(Color32::from_rgb(
+                                self.text_color_rgb[0],
+                                self.text_color_rgb[1],
+                                self.text_color_rgb[2],
+                            )),
+                        )
+                        .fill(p.bg_elevated)
+                        .corner_radius(CornerRadius::same(6)),
+                    )
+                    .on_hover_text("Color the selected text with the chosen color")
+                    .clicked()
+                {
+                    queued_format_op = Some(EditorFormatOp::TextColor(self.text_color_rgb));
                 }
 
                 ui.add_space(4.0);

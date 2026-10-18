@@ -64,6 +64,10 @@ pub enum InlineSpan {
         text: String,
         color: Option<Color32>,
     },
+    Colored {
+        text: String,
+        color: Color32,
+    },
     Tag(String),
     WikiLink {
         target: String,
@@ -122,6 +126,26 @@ pub fn parse_inline_spans(input: &str) -> Vec<InlineSpan> {
                     spans.push(InlineSpan::WikiLink { target, display });
                     idx += 2 + end + 2;
                     continue;
+                }
+            }
+        }
+
+        // 3a. Text color: {color:#RRGGBB}text{/color}
+        if let Some(after) = rest.strip_prefix("{color:#") {
+            if after.len() >= 7 && after.as_bytes()[6] == b'}' {
+                if let Some(color) = parse_hex_color(&after[..6]) {
+                    let content = &after[7..];
+                    if let Some(end) = content.find("{/color}") {
+                        if end > 0 {
+                            flush_plain(&mut plain_buf, &mut spans);
+                            spans.push(InlineSpan::Colored {
+                                text: content[..end].to_string(),
+                                color,
+                            });
+                            idx += "{color:#".len() + 7 + end + "{/color}".len();
+                            continue;
+                        }
+                    }
                 }
             }
         }
@@ -304,6 +328,9 @@ pub fn render_inline_spans_ui(
                         .size(font_size)
                         .color(p.fg_primary),
                 );
+            }
+            InlineSpan::Colored { text, color } => {
+                ui.label(RichText::new(text).size(font_size).color(color));
             }
             InlineSpan::Code(s) => {
                 ui.add_space(2.0);
@@ -606,6 +633,51 @@ fn append_styled_editor_line(
 
     while idx < len {
         let rest = &line[idx..];
+
+        // Text color: {color:#RRGGBB}text{/color}
+        if let Some(after) = rest.strip_prefix("{color:#") {
+            if after.len() >= 7 && after.as_bytes()[6] == b'}' {
+                if let Some(col) = parse_hex_color(&after[..6]) {
+                    let content = &after[7..];
+                    if let Some(end) = content.find("{/color}") {
+                        if end > 0 {
+                            flush_plain(job, &line[plain_start..idx]);
+                            let open_len = "{color:#".len() + 7;
+                            job.append(
+                                &rest[..open_len],
+                                0.0,
+                                TextFormat {
+                                    font_id: body_font.clone(),
+                                    color: syntax_dim,
+                                    ..Default::default()
+                                },
+                            );
+                            job.append(
+                                &content[..end],
+                                0.0,
+                                TextFormat {
+                                    font_id: body_font.clone(),
+                                    color: col,
+                                    ..Default::default()
+                                },
+                            );
+                            job.append(
+                                "{/color}",
+                                0.0,
+                                TextFormat {
+                                    font_id: body_font.clone(),
+                                    color: syntax_dim,
+                                    ..Default::default()
+                                },
+                            );
+                            idx += open_len + end + "{/color}".len();
+                            plain_start = idx;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
 
         // Highlight: =={#RRGGBB}text== or ==text==
         if let Some(after) = rest.strip_prefix("==") {
@@ -910,6 +982,21 @@ pub fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
         .unwrap_or(s.len())
 }
 
+/// Inserts `insert` at the character range `range`, replacing any selected text.
+/// Appends to the end of `text` when no range is known.
+pub fn insert_at_selection(text: &mut String, range: Option<(usize, usize)>, insert: &str) {
+    let (lo, hi) = match range {
+        Some((a, b)) => (a.min(b), a.max(b)),
+        None => {
+            let n = text.chars().count();
+            (n, n)
+        }
+    };
+    let b_lo = char_to_byte_idx(text, lo);
+    let b_hi = char_to_byte_idx(text, hi);
+    text.replace_range(b_lo..b_hi, insert);
+}
+
 /// Wraps (or unwraps if already wrapped) the character range `[start_char..end_char]` with `prefix` and `suffix`.
 /// If `start_char == end_char` (no selection), inserts `prefix + placeholder + suffix` at the cursor.
 pub fn wrap_selection(
@@ -1044,7 +1131,9 @@ pub fn strip_all_inline_markers(s: &str) -> String {
             | InlineSpan::Underline(t)
             | InlineSpan::Code(t)
             | InlineSpan::Tag(t) => out.push_str(&t),
-            InlineSpan::Highlight { text, .. } => out.push_str(&text),
+            InlineSpan::Highlight { text, .. } | InlineSpan::Colored { text, .. } => {
+                out.push_str(&text)
+            }
             InlineSpan::WikiLink { display, .. } => out.push_str(&display),
         }
     }
@@ -1105,6 +1194,11 @@ fn inline_to_html(line: &str) -> String {
             InlineSpan::Highlight { text, .. } => {
                 out.push_str(&format!("<mark>{}</mark>", html_escape(&text)))
             }
+            InlineSpan::Colored { text, color } => out.push_str(&format!(
+                "<span style=\"color:{}\">{}</span>",
+                rgb_to_hex([color.r(), color.g(), color.b()]),
+                html_escape(&text)
+            )),
             InlineSpan::Tag(t) => {
                 out.push_str(&format!("<span class=\"tag\">{}</span>", html_escape(&t)))
             }
@@ -1275,6 +1369,43 @@ mod tests {
         assert!(html.contains("<blockquote>"));
         assert!(html.contains("<pre><code>&lt;raw&gt;\n</code></pre>"));
         assert!(html.trim_end().ends_with("</html>"));
+    }
+
+    #[test]
+    fn test_parse_text_color_span() {
+        let spans = parse_inline_spans("a {color:#FF0000}red{/color} b");
+        assert_eq!(
+            spans,
+            vec![
+                InlineSpan::Plain("a ".to_string()),
+                InlineSpan::Colored {
+                    text: "red".to_string(),
+                    color: Color32::from_rgb(255, 0, 0),
+                },
+                InlineSpan::Plain(" b".to_string()),
+            ]
+        );
+        assert_eq!(strip_all_inline_markers("{color:#00FF00}green{/color}"), "green");
+        // An unterminated or invalid marker stays plain text.
+        assert_eq!(
+            parse_inline_spans("{color:#FF0000}open"),
+            vec![InlineSpan::Plain("{color:#FF0000}open".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_insert_at_selection() {
+        let mut text = "Hello world".to_string();
+        insert_at_selection(&mut text, Some((5, 5)), "\u{ec36}");
+        assert_eq!(text, "Hello\u{ec36} world");
+
+        // A selected range is replaced by the inserted text.
+        insert_at_selection(&mut text, Some((0, 5)), "X");
+        assert_eq!(text, "X\u{ec36} world");
+
+        // Without a known cursor, the text is appended.
+        insert_at_selection(&mut text, None, "!");
+        assert_eq!(text, "X\u{ec36} world!");
     }
 
     #[test]
