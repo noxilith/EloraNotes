@@ -1,0 +1,4 @@
+# Copy this into ~/.config/matugen/config.toml and change input_path to your checkout.
+[templates.elora]
+input_path = "/path/to/EloraNotes/matugen/elora.json"
+output_path = "~/.config/elora/matugen.json"

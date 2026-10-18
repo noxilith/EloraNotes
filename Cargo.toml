@@ -1,0 +1,24 @@
+[package]
+name = "elora-notes"
+version = "0.1.0"
+edition = "2021"
+description = "EloraNotes — A calm, minimalistic cross-platform Markdown notes desktop app"
+authors = ["EloraNotes"]
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "elora"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+egui = "0.31"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
