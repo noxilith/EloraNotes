@@ -2,9 +2,8 @@ use crate::icon_names::TABLER_ICON_NAMES;
 use crate::icons::{icon, install_tabler_icons, tabler_glyph};
 use crate::markdown::{
     apply_highlight_selection, build_editor_layout_job, clear_formatting_selection,
-    insert_at_selection,
-    color_swatch_button, markdown_to_html, render_inline_spans_ui, rgb_to_hex, wrap_selection,
-    HIGHLIGHT_PRESETS,
+    color_swatch_button, insert_at_selection, markdown_to_html, render_inline_spans_ui, rgb_to_hex,
+    wrap_selection, HIGHLIGHT_PRESETS,
 };
 use crate::storage::{
     extract_wiki_links, fuzzy_subsequence, normalize_tag, sort_notes, AppSettings, Note,
@@ -13,8 +12,8 @@ use crate::storage::{
 use crate::theme::{ColorOverrides, Palette, ThemeMode};
 use chrono::{Local, Utc};
 use egui::{
-    Align, Color32, CornerRadius, FontFamily, FontId, Frame, Id, Key, Layout, Margin, RichText,
-    Align2, Pos2, ScrollArea, Sense, Stroke, TextEdit, TextStyle, Ui, Vec2,
+    Align, Align2, Color32, CornerRadius, FontFamily, FontId, Frame, Id, Key, Layout, Margin, Pos2,
+    RichText, ScrollArea, Sense, Stroke, TextEdit, TextStyle, Ui, Vec2,
 };
 use std::collections::BTreeMap;
 use std::f32::consts::TAU;
@@ -63,6 +62,8 @@ pub struct EloraApp {
     highlight_rgb: [u8; 3],
     /// Color used by the toolbar's "Text Color" button for the next wrapped selection.
     text_color_rgb: [u8; 3],
+    /// Note that the icon picker was opened for; the picker closes if another note is selected.
+    icon_picker_note_id: Option<String>,
     /// User-chosen overrides for background, text, accent and pin colors.
     colors: ColorOverrides,
     /// Body text size in points.
@@ -152,7 +153,12 @@ enum EditorFormatOp {
 
 /// One row of the Settings color section: a checkbox that enables an override, plus a color
 /// picker shown while enabled. Returns true when the value changed.
-fn color_override_row(ui: &mut Ui, label: &str, value: &mut Option<[u8; 3]>, default: Color32) -> bool {
+fn color_override_row(
+    ui: &mut Ui,
+    label: &str,
+    value: &mut Option<[u8; 3]>,
+    default: Color32,
+) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
         let mut enabled = value.is_some();
@@ -215,7 +221,8 @@ impl EloraApp {
             command_palette_open: false,
             icon_picker_open: false,
             icon_picker_for_body: false,
-            text_color_rgb: [78, 205, 255],
+            text_color_rgb: settings.text_color_rgb,
+            icon_picker_note_id: None,
             icon_search: String::new(),
             command_palette_query: String::new(),
             command_palette_selected: 0,
@@ -232,6 +239,7 @@ impl EloraApp {
             sort_order: self.sort_order,
             show_formatting_bar: self.show_formatting_bar,
             highlight_rgb: self.highlight_rgb,
+            text_color_rgb: self.text_color_rgb,
             font_size: self.font_size,
             glow_strength: self.glow_strength,
             colors: self.colors,
@@ -283,14 +291,28 @@ impl EloraApp {
 
                 ui.label(RichText::new("Colors").strong());
                 ui.label("Tick a color to override the theme's default.");
-                changed |= color_override_row(ui, "Background", &mut self.colors.bg, defaults.bg_canvas);
-                changed |= color_override_row(ui, "Sidebar", &mut self.colors.sidebar, defaults.bg_sidebar);
+                changed |=
+                    color_override_row(ui, "Background", &mut self.colors.bg, defaults.bg_canvas);
+                changed |= color_override_row(
+                    ui,
+                    "Sidebar",
+                    &mut self.colors.sidebar,
+                    defaults.bg_sidebar,
+                );
                 changed |= color_override_row(ui, "Text", &mut self.colors.fg, defaults.fg_primary);
-                changed |= color_override_row(ui, "Accent", &mut self.colors.accent, defaults.accent);
+                changed |=
+                    color_override_row(ui, "Accent", &mut self.colors.accent, defaults.accent);
                 changed |= color_override_row(ui, "Pin", &mut self.colors.pin, defaults.pin_color);
-                changed |= color_override_row(ui, "Muted text", &mut self.colors.fg_muted, defaults.fg_muted);
-                changed |= color_override_row(ui, "Borders", &mut self.colors.border, defaults.border);
-                changed |= color_override_row(ui, "Danger", &mut self.colors.danger, defaults.danger);
+                changed |= color_override_row(
+                    ui,
+                    "Muted text",
+                    &mut self.colors.fg_muted,
+                    defaults.fg_muted,
+                );
+                changed |=
+                    color_override_row(ui, "Borders", &mut self.colors.border, defaults.border);
+                changed |=
+                    color_override_row(ui, "Danger", &mut self.colors.danger, defaults.danger);
                 if ui.button("Reset colors to theme").clicked() {
                     self.colors = Default::default();
                     changed = true;
@@ -299,7 +321,9 @@ impl EloraApp {
 
                 ui.label(RichText::new("Glow highlights").strong());
                 changed |= ui
-                    .add(egui::Slider::new(&mut self.glow_strength, 0.0..=1.0).text("Glow strength"))
+                    .add(
+                        egui::Slider::new(&mut self.glow_strength, 0.0..=1.0).text("Glow strength"),
+                    )
                     .changed();
                 ui.horizontal(|ui| {
                     ui.label("Default glow color");
@@ -473,11 +497,15 @@ impl EloraApp {
                     }
                 }
 
-                let hover = response.hover_pos().and_then(|pos| {
-                    positions.iter().position(|q| q.distance(pos) <= 10.0)
-                });
+                let hover = response
+                    .hover_pos()
+                    .and_then(|pos| positions.iter().position(|q| q.distance(pos) <= 10.0));
                 for (i, node) in nodes.iter().enumerate() {
-                    let color = if hover == Some(i) { p.accent } else { p.fg_secondary };
+                    let color = if hover == Some(i) {
+                        p.accent
+                    } else {
+                        p.fg_secondary
+                    };
                     painter.circle_filled(positions[i], 6.0, color);
                     painter.text(
                         positions[i] + Vec2::new(0.0, 10.0),
@@ -1100,10 +1128,7 @@ impl EloraApp {
 
         for (glyph, label, shortcut, cmd) in actions {
             let label_lower = label.to_lowercase();
-            if q.is_empty()
-                || label_lower.contains(&q)
-                || fuzzy_subsequence(&label_lower, &q)
-            {
+            if q.is_empty() || label_lower.contains(&q) || fuzzy_subsequence(&label_lower, &q) {
                 items.push(PaletteItem::Action {
                     icon_glyph: glyph,
                     label: (*label).to_string(),
@@ -1244,11 +1269,8 @@ impl EloraApp {
                                             } else {
                                                 icon::FILE_TEXT
                                             };
-                                            let g_col = if *pinned {
-                                                p.pin_color
-                                            } else {
-                                                p.fg_secondary
-                                            };
+                                            let g_col =
+                                                if *pinned { p.pin_color } else { p.fg_secondary };
                                             ui.label(RichText::new(g).color(g_col).size(14.5));
                                             ui.label(
                                                 RichText::new(title)
@@ -1286,9 +1308,7 @@ impl EloraApp {
                                                     .size(14.5),
                                             );
                                             ui.label(
-                                                RichText::new(label)
-                                                    .size(13.5)
-                                                    .color(p.fg_primary),
+                                                RichText::new(label).size(13.5).color(p.fg_primary),
                                             );
                                             if !shortcut.is_empty() {
                                                 ui.with_layout(
@@ -1405,7 +1425,9 @@ impl EloraApp {
                 if ui
                     .add(
                         egui::Button::new(
-                            RichText::new(icon::SETTINGS).size(15.0).color(p.fg_secondary),
+                            RichText::new(icon::SETTINGS)
+                                .size(15.0)
+                                .color(p.fg_secondary),
                         )
                         .frame(false),
                     )
@@ -1481,11 +1503,7 @@ impl EloraApp {
         ui.add_space(6.0);
 
         let active_count = self.notes.iter().filter(|n| !n.trashed).count();
-        let pinned_count = self
-            .notes
-            .iter()
-            .filter(|n| !n.trashed && n.pinned)
-            .count();
+        let pinned_count = self.notes.iter().filter(|n| !n.trashed && n.pinned).count();
         let trash_count = self.notes.iter().filter(|n| n.trashed).count();
 
         ui.horizontal(|ui| {
@@ -1519,8 +1537,8 @@ impl EloraApp {
                 self.select_first_visible();
             }
 
-            if trash_count > 0 || self.sidebar_section == SidebarSection::Trash {
-                if nav_pill(
+            if (trash_count > 0 || self.sidebar_section == SidebarSection::Trash)
+                && nav_pill(
                     ui,
                     icon::TRASH,
                     "Trash",
@@ -1529,10 +1547,9 @@ impl EloraApp {
                     p,
                 )
                 .clicked()
-                {
-                    self.sidebar_section = SidebarSection::Trash;
-                    self.select_first_visible();
-                }
+            {
+                self.sidebar_section = SidebarSection::Trash;
+                self.select_first_visible();
             }
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1640,7 +1657,9 @@ impl EloraApp {
                     for idx in &pinned_indices {
                         let note = &self.notes[*idx];
                         let is_selected = self.selected_id.as_deref() == Some(note.id.as_str());
-                        if let Some(action) = render_note_card(ui, note, is_selected, p, &self.search_query) {
+                        if let Some(action) =
+                            render_note_card(ui, note, is_selected, p, &self.search_query)
+                        {
                             match action {
                                 CardAction::SelectNote(id) => clicked_note_id = Some(id),
                                 CardAction::FilterTag(t) => clicked_tag = Some(t),
@@ -1669,7 +1688,9 @@ impl EloraApp {
                     for idx in &unpinned_indices {
                         let note = &self.notes[*idx];
                         let is_selected = self.selected_id.as_deref() == Some(note.id.as_str());
-                        if let Some(action) = render_note_card(ui, note, is_selected, p, &self.search_query) {
+                        if let Some(action) =
+                            render_note_card(ui, note, is_selected, p, &self.search_query)
+                        {
                             match action {
                                 CardAction::SelectNote(id) => clicked_note_id = Some(id),
                                 CardAction::FilterTag(t) => clicked_tag = Some(t),
@@ -1703,9 +1724,7 @@ impl EloraApp {
     ) {
         ui.set_min_width(240.0);
 
-        let has_selection = self
-            .last_editor_selection
-            .is_some_and(|(a, b)| a != b);
+        let has_selection = self.last_editor_selection.is_some_and(|(a, b)| a != b);
         let header_txt = if has_selection {
             "Format Selection"
         } else {
@@ -1734,18 +1753,14 @@ impl EloraApp {
             ui.close_menu();
         }
         if ui
-            .button(
-                RichText::new(format!("{}  Underline", icon::UNDERLINE)).size(13.0),
-            )
+            .button(RichText::new(format!("{}  Underline", icon::UNDERLINE)).size(13.0))
             .clicked()
         {
             *queued_op = Some(EditorFormatOp::Underline);
             ui.close_menu();
         }
         if ui
-            .button(
-                RichText::new(format!("{}  Strikethrough", icon::STRIKETHROUGH)).size(13.0),
-            )
+            .button(RichText::new(format!("{}  Strikethrough", icon::STRIKETHROUGH)).size(13.0))
             .clicked()
         {
             *queued_op = Some(EditorFormatOp::Strikethrough);
@@ -1926,7 +1941,11 @@ impl EloraApp {
             let undo = !redo && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::Z));
             if undo || redo {
                 let hist = self.edit_history.entry(note_id.clone()).or_default();
-                let target = if undo { hist.undo.pop() } else { hist.redo.pop() };
+                let target = if undo {
+                    hist.undo.pop()
+                } else {
+                    hist.redo.pop()
+                };
                 if let Some(prev) = target {
                     let current = std::mem::replace(&mut self.notes[note_idx].body, prev);
                     if undo {
@@ -1991,6 +2010,13 @@ impl EloraApp {
         note_idx: usize,
     ) -> Option<Option<String>> {
         if !self.icon_picker_open {
+            return None;
+        }
+        // The picker targets the note it was opened for; close it if the user switched notes.
+        if self.icon_picker_note_id.as_deref() != Some(self.notes[note_idx].id.as_str()) {
+            self.icon_picker_open = false;
+            self.icon_picker_for_body = false;
+            self.icon_picker_note_id = None;
             return None;
         }
         let current = if self.icon_picker_for_body {
@@ -2078,6 +2104,7 @@ impl EloraApp {
         if !open || choice.is_some() {
             self.icon_picker_open = false;
             self.icon_picker_for_body = false;
+            self.icon_picker_note_id = None;
             self.icon_search.clear();
         }
         choice
@@ -2165,7 +2192,10 @@ impl EloraApp {
 
             // Note icon picker button
             let note_icon = self.notes[note_idx].icon.clone();
-            let icon_glyph = note_icon.as_deref().and_then(tabler_glyph).unwrap_or(icon::PLUS);
+            let icon_glyph = note_icon
+                .as_deref()
+                .and_then(tabler_glyph)
+                .unwrap_or(icon::PLUS);
             let icon_tooltip = match note_icon.as_deref() {
                 Some(name) => format!("Note icon: {name} (click to change)"),
                 None => "Add an icon to this note".to_string(),
@@ -2173,7 +2203,11 @@ impl EloraApp {
             if ui
                 .add(
                     egui::Button::new(RichText::new(icon_glyph).size(13.0).color(
-                        if note_icon.is_some() { p.accent } else { p.fg_secondary },
+                        if note_icon.is_some() {
+                            p.accent
+                        } else {
+                            p.fg_secondary
+                        },
                     ))
                     .frame(self.icon_picker_open),
                 )
@@ -2182,6 +2216,7 @@ impl EloraApp {
             {
                 self.icon_picker_for_body = false;
                 self.icon_picker_open = !self.icon_picker_open;
+                self.icon_picker_note_id = Some(self.notes[note_idx].id.clone());
             }
 
             ui.label(RichText::new("·").color(p.fg_muted));
@@ -2442,9 +2477,7 @@ impl EloraApp {
                             if ui
                                 .add(
                                     egui::Button::new(
-                                        RichText::new(format!("#{tag}"))
-                                            .size(11.5)
-                                            .color(p.accent),
+                                        RichText::new(format!("#{tag}")).size(11.5).color(p.accent),
                                     )
                                     .frame(false),
                                 )
@@ -2453,8 +2486,8 @@ impl EloraApp {
                             {
                                 tag_to_filter = Some(tag.clone());
                             }
-                            if is_explicit {
-                                if ui
+                            if is_explicit
+                                && ui
                                     .add(
                                         egui::Button::new(
                                             RichText::new(icon::X).size(10.5).color(p.fg_muted),
@@ -2463,9 +2496,8 @@ impl EloraApp {
                                     )
                                     .on_hover_text("Remove tag")
                                     .clicked()
-                                {
-                                    tag_to_remove = Some(tag.clone());
-                                }
+                            {
+                                tag_to_remove = Some(tag.clone());
                             }
                         });
                     });
@@ -2534,7 +2566,11 @@ impl EloraApp {
                         EditorFormatOp::ChecklistItem,
                     ),
                     (icon::QUOTE, "Blockquote", EditorFormatOp::Blockquote),
-                    (icon::LINK, "Wrap in [[Wiki Link]]", EditorFormatOp::WikiLink),
+                    (
+                        icon::LINK,
+                        "Wrap in [[Wiki Link]]",
+                        EditorFormatOp::WikiLink,
+                    ),
                     (
                         icon::CLEAR_FORMATTING,
                         "Clear formatting on selection",
@@ -2559,7 +2595,9 @@ impl EloraApp {
                 if ui
                     .add(
                         egui::Button::new(
-                            RichText::new(icon::SPARKLES).size(13.5).color(p.fg_secondary),
+                            RichText::new(icon::SPARKLES)
+                                .size(13.5)
+                                .color(p.fg_secondary),
                         )
                         .fill(p.bg_elevated)
                         .corner_radius(CornerRadius::same(5)),
@@ -2569,6 +2607,7 @@ impl EloraApp {
                 {
                     self.icon_picker_for_body = true;
                     self.icon_picker_open = true;
+                    self.icon_picker_note_id = Some(self.notes[note_idx].id.clone());
                     self.icon_search.clear();
                 }
 
@@ -2577,17 +2616,22 @@ impl EloraApp {
                 ui.add_space(2.0);
 
                 // Text color: color picker + apply button wraps selection in {color:#HEX}...{/color}
-                ui.color_edit_button_srgb(&mut self.text_color_rgb)
-                    .on_hover_text("Pick text color");
+                if ui
+                    .color_edit_button_srgb(&mut self.text_color_rgb)
+                    .on_hover_text("Pick text color")
+                    .changed()
+                {
+                    self.persist_settings();
+                }
                 if ui
                     .add(
-                        egui::Button::new(
-                            RichText::new("A Text Color").size(12.0).color(Color32::from_rgb(
+                        egui::Button::new(RichText::new("A Text Color").size(12.0).color(
+                            Color32::from_rgb(
                                 self.text_color_rgb[0],
                                 self.text_color_rgb[1],
                                 self.text_color_rgb[2],
-                            )),
-                        )
+                            ),
+                        ))
                         .fill(p.bg_elevated)
                         .corner_radius(CornerRadius::same(6)),
                     )
@@ -2643,7 +2687,10 @@ impl EloraApp {
                         ui,
                         *rgb,
                         is_sel,
-                        &format!("{name} ({}) — click to highlight selection", rgb_to_hex(*rgb)),
+                        &format!(
+                            "{name} ({}) — click to highlight selection",
+                            rgb_to_hex(*rgb)
+                        ),
                     )
                     .clicked()
                     {
@@ -2954,11 +3001,7 @@ fn render_note_card(
                 if note.pinned {
                     ui.label(RichText::new(icon::PINNED).size(13.0).color(p.pin_color));
                 } else {
-                    ui.label(
-                        RichText::new(icon::FILE_TEXT)
-                            .size(13.0)
-                            .color(p.fg_muted),
-                    );
+                    ui.label(RichText::new(icon::FILE_TEXT).size(13.0).color(p.fg_muted));
                 }
                 ui.label(
                     RichText::new(note.display_title())
@@ -2984,12 +3027,9 @@ fn render_note_card(
                 );
                 if total_tasks > 0 {
                     ui.label(
-                        RichText::new(format!(
-                            "{} {done_tasks}/{total_tasks}",
-                            icon::LIST_CHECK
-                        ))
-                        .size(11.0)
-                        .color(p.fg_muted),
+                        RichText::new(format!("{} {done_tasks}/{total_tasks}", icon::LIST_CHECK))
+                            .size(11.0)
+                            .color(p.fg_muted),
                     );
                 }
                 for tag in tags.iter().take(3) {
@@ -3119,43 +3159,19 @@ fn render_markdown_preview(
         } else if let Some(h1) = trimmed_start.strip_prefix("# ") {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
-                render_inline_spans_ui(
-                    ui,
-                    h1,
-                    21.5,
-                    p,
-                    is_dark,
-                    p.fg_primary,
-                    clicked_wiki_link,
-                );
+                render_inline_spans_ui(ui, h1, 21.5, p, is_dark, p.fg_primary, clicked_wiki_link);
             });
             ui.add_space(2.0);
         } else if let Some(h2) = trimmed_start.strip_prefix("## ") {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
-                render_inline_spans_ui(
-                    ui,
-                    h2,
-                    18.0,
-                    p,
-                    is_dark,
-                    p.fg_primary,
-                    clicked_wiki_link,
-                );
+                render_inline_spans_ui(ui, h2, 18.0, p, is_dark, p.fg_primary, clicked_wiki_link);
             });
             ui.add_space(2.0);
         } else if let Some(h3) = trimmed_start.strip_prefix("### ") {
             ui.add_space(2.0);
             ui.horizontal_wrapped(|ui| {
-                render_inline_spans_ui(
-                    ui,
-                    h3,
-                    16.0,
-                    p,
-                    is_dark,
-                    p.fg_secondary,
-                    clicked_wiki_link,
-                );
+                render_inline_spans_ui(ui, h3, 16.0, p, is_dark, p.fg_secondary, clicked_wiki_link);
             });
         } else if let Some(quote) = trimmed_start.strip_prefix("> ") {
             Frame::new()
@@ -3186,9 +3202,7 @@ fn render_markdown_preview(
                 if ui
                     .add(
                         egui::Button::new(
-                            RichText::new(icon::SQUARE_CHECK)
-                                .color(p.accent)
-                                .size(15.5),
+                            RichText::new(icon::SQUARE_CHECK).color(p.accent).size(15.5),
                         )
                         .frame(false),
                     )
@@ -3212,9 +3226,7 @@ fn render_markdown_preview(
                 if ui
                     .add(
                         egui::Button::new(
-                            RichText::new(icon::SQUARE)
-                                .color(p.fg_secondary)
-                                .size(15.5),
+                            RichText::new(icon::SQUARE).color(p.fg_secondary).size(15.5),
                         )
                         .frame(false),
                     )
@@ -3224,15 +3236,7 @@ fn render_markdown_preview(
                     *toggled_task_idx = Some(this_idx);
                 }
                 ui.add_space(4.0);
-                render_inline_spans_ui(
-                    ui,
-                    todo,
-                    14.5,
-                    p,
-                    is_dark,
-                    p.fg_primary,
-                    clicked_wiki_link,
-                );
+                render_inline_spans_ui(ui, todo, 14.5, p, is_dark, p.fg_primary, clicked_wiki_link);
             });
         } else if let Some(bullet) = trimmed_start
             .strip_prefix("- ")

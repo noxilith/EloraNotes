@@ -9,11 +9,22 @@ mod theme;
 
 use app::EloraApp;
 use std::path::PathBuf;
-use storage::NoteStorage;
+use storage::{migrate_legacy_notes, NoteStorage};
 
 fn main() -> eframe::Result<()> {
-    let notes_dir = parse_cli_dir().unwrap_or_else(NoteStorage::default_notes_dir);
+    let cli_dir = parse_cli_dir();
+    let uses_default_dir = cli_dir.is_none();
+    let notes_dir = cli_dir.unwrap_or_else(NoteStorage::default_notes_dir);
     let storage = NoteStorage::new(notes_dir).expect("Failed to initialize EloraNotes directory");
+    if uses_default_dir {
+        let copied = migrate_legacy_notes(storage.root_dir());
+        if copied > 0 {
+            eprintln!(
+                "EloraNotes: copied {copied} file(s) from the old notes folder into {}",
+                storage.root_dir().display()
+            );
+        }
+    }
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

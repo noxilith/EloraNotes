@@ -6,6 +6,7 @@ A calm, minimalistic cross-platform desktop notes application written in **Rust*
 
 ## Features
 
+- **Note Icons & Text Color**: Pick a Tabler icon for each note from the header, or insert one at the cursor from the formatting bar. Color selected text with the **A Text Color** button, which saves it as `{color:#RRGGBB}…{/color}`.
 - **Bundled Tabler Icons**: Crisp outline glyphs from the Tabler Icons font embedded directly into the binary (`assets/tabler-icons.ttf`) across navigation, search, tags, checklists, formatting actions, and the command palette.
 - **Plain Markdown on Disk**: Every note is stored as a portable `.md` file with lightweight YAML frontmatter (`title`, `pinned`, `trashed`, `tags`, `created_at`, `updated_at`).
 - **Command Palette & Quick Switcher (`Ctrl+K`)**: Fuzzy-jump to any note, create notes from templates, switch color themes, change sort order, or toggle views without leaving the keyboard.
@@ -38,7 +39,7 @@ Pass a custom notes folder via `--dir` or `ELORA_NOTES_DIR`:
 elora --dir ~/Notes
 ```
 
-By default, notes are saved in `~/Documents/EloraNotes`.
+By default, notes are saved in `~/.config/eloranotes`. Notes and settings from the older default folders (`~/eloranotes`, `~/.EloraNotes`, `~/Documents/EloraNotes`) are copied there automatically on first launch. The old folders are left untouched. Files that already exist in the new folder are not overwritten.
 
 ## Matugen Theme (Wallpaper Colors)
 

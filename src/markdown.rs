@@ -2,8 +2,7 @@ use crate::icons::icon;
 use crate::theme::Palette;
 use egui::{
     text::{LayoutJob, TextFormat},
-    Color32, CornerRadius, FontFamily, FontId, Margin, RichText, Sense, Stroke, Ui,
-    Vec2,
+    Color32, CornerRadius, FontFamily, FontId, Margin, RichText, Sense, Stroke, Ui, Vec2,
 };
 
 /// Preset glow highlight colors available in the toolbar and right-click menu.
@@ -11,9 +10,7 @@ pub const HIGHLIGHT_PRESETS: &[(&str, [u8; 3])] = &[
     ("Amber Glow", [255, 196, 77]),
     ("Emerald Glow", [82, 224, 150]),
     ("Cyan Glow", [78, 205, 255]),
-    ("Violet Glow", [188, 132, 255]),
     ("Rose Glow", [255, 112, 150]),
-    ("Coral Glow", [255, 142, 94]),
 ];
 
 /// Converts an RGB `[u8; 3]` color to `#RRGGBB` hex string.
@@ -250,7 +247,7 @@ pub fn parse_inline_spans(input: &str) -> Vec<InlineSpan> {
                     .next_back()
                     .is_some_and(|c| c.is_whitespace() || c == '(' || c == '[');
             if prev_ok {
-                let after_hash = &rest[1..];
+                let after_hash = rest.strip_prefix('#').unwrap_or(rest);
                 if let Some(first_ch) = after_hash.chars().next() {
                     if first_ch.is_alphabetic() {
                         let tag_len: usize = after_hash
@@ -308,7 +305,12 @@ pub fn render_inline_spans_ui(
                 bold_label(ui, &s, font_size + 0.5, p.fg_primary);
             }
             InlineSpan::Italic(s) => {
-                ui.label(RichText::new(s).italics().size(font_size).color(default_color));
+                ui.label(
+                    RichText::new(s)
+                        .italics()
+                        .size(font_size)
+                        .color(default_color),
+                );
             }
             InlineSpan::BoldItalic(s) => {
                 bold_label(ui, &s, font_size + 0.5, p.fg_primary);
@@ -351,7 +353,14 @@ pub fn render_inline_spans_ui(
             }
             InlineSpan::Highlight { text, color } => {
                 let glow_col = color.unwrap_or(Color32::from_rgb(255, 196, 77));
-                render_glowing_highlight(ui, &text, font_size, glow_col, p.bg_canvas, p.glow_strength);
+                render_glowing_highlight(
+                    ui,
+                    &text,
+                    font_size,
+                    glow_col,
+                    p.bg_canvas,
+                    p.glow_strength,
+                );
             }
             InlineSpan::Tag(tag) => {
                 ui.label(RichText::new(tag).size(font_size).color(p.accent));
@@ -442,8 +451,18 @@ fn paint_soft_glow(painter: &egui::Painter, text_rect: egui::Rect, color: Color3
         }
         v
     };
-    let xs = axis(text_rect.left(), text_rect.right(), outer.left(), outer.right());
-    let ys = axis(text_rect.top(), text_rect.bottom(), outer.top(), outer.bottom());
+    let xs = axis(
+        text_rect.left(),
+        text_rect.right(),
+        outer.left(),
+        outer.right(),
+    );
+    let ys = axis(
+        text_rect.top(),
+        text_rect.bottom(),
+        outer.top(),
+        outer.bottom(),
+    );
 
     let mut mesh = egui::Mesh::default();
     for &y in &ys {
@@ -518,12 +537,8 @@ pub fn build_editor_layout_job(
     let h3_font = FontId::new(16.0, FontFamily::Proportional);
     let mono_font = FontId::new(13.5, FontFamily::Monospace);
 
-    let syntax_dim = Color32::from_rgba_unmultiplied(
-        p.fg_muted.r(),
-        p.fg_muted.g(),
-        p.fg_muted.b(),
-        140,
-    );
+    let syntax_dim =
+        Color32::from_rgba_unmultiplied(p.fg_muted.r(), p.fg_muted.g(), p.fg_muted.b(), 140);
 
     let lines: Vec<&str> = text.split('\n').collect();
     for (line_i, line) in lines.iter().enumerate() {
@@ -1052,11 +1067,7 @@ pub fn wrap_selection(
 
 /// Applies a colored glowing highlight `=={#RRGGBB}text==` to the selected character range.
 /// If the selection is already highlighted (`==...==`), updates its color or unwraps if identical.
-pub fn apply_highlight_selection(
-    text: &mut String,
-    range: Option<(usize, usize)>,
-    rgb: [u8; 3],
-) {
+pub fn apply_highlight_selection(text: &mut String, range: Option<(usize, usize)>, rgb: [u8; 3]) {
     let hex = rgb_to_hex(rgb);
     let prefix = format!("=={{{hex}}}");
     let suffix = "==";
@@ -1188,7 +1199,9 @@ fn inline_to_html(line: &str) -> String {
             InlineSpan::BoldItalic(t) => {
                 out.push_str(&format!("<strong><em>{}</em></strong>", html_escape(&t)))
             }
-            InlineSpan::Strikethrough(t) => out.push_str(&format!("<del>{}</del>", html_escape(&t))),
+            InlineSpan::Strikethrough(t) => {
+                out.push_str(&format!("<del>{}</del>", html_escape(&t)))
+            }
             InlineSpan::Underline(t) => out.push_str(&format!("<u>{}</u>", html_escape(&t))),
             InlineSpan::Code(t) => out.push_str(&format!("<code>{}</code>", html_escape(&t))),
             InlineSpan::Highlight { text, .. } => {
@@ -1277,7 +1290,11 @@ pub fn markdown_to_html(title: &str, body: &str) -> String {
             continue;
         }
 
-        if let Some(item) = trimmed.strip_prefix("- [ ] ").or_else(|| trimmed.strip_prefix("- [x] ")).or_else(|| trimmed.strip_prefix("- [X] ")) {
+        if let Some(item) = trimmed
+            .strip_prefix("- [ ] ")
+            .or_else(|| trimmed.strip_prefix("- [x] "))
+            .or_else(|| trimmed.strip_prefix("- [X] "))
+        {
             flush_para(&mut out, &mut para);
             if !list_open {
                 out.push_str("<ul class=\"tasks\">\n");
@@ -1292,7 +1309,10 @@ pub fn markdown_to_html(title: &str, body: &str) -> String {
             continue;
         }
 
-        if let Some(item) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+        if let Some(item) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
             flush_para(&mut out, &mut para);
             if !list_open {
                 out.push_str("<ul>\n");
@@ -1385,7 +1405,10 @@ mod tests {
                 InlineSpan::Plain(" b".to_string()),
             ]
         );
-        assert_eq!(strip_all_inline_markers("{color:#00FF00}green{/color}"), "green");
+        assert_eq!(
+            strip_all_inline_markers("{color:#00FF00}green{/color}"),
+            "green"
+        );
         // An unterminated or invalid marker stays plain text.
         assert_eq!(
             parse_inline_spans("{color:#FF0000}open"),

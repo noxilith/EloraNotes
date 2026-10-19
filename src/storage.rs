@@ -100,6 +100,8 @@ pub struct AppSettings {
     pub show_formatting_bar: bool,
     #[serde(default = "default_highlight_rgb")]
     pub highlight_rgb: [u8; 3],
+    #[serde(default = "default_text_color_rgb")]
+    pub text_color_rgb: [u8; 3],
     #[serde(default = "default_font_size")]
     pub font_size: f32,
     #[serde(default = "default_glow_strength")]
@@ -110,6 +112,10 @@ pub struct AppSettings {
 
 fn default_highlight_rgb() -> [u8; 3] {
     [255, 196, 77]
+}
+
+fn default_text_color_rgb() -> [u8; 3] {
+    [78, 205, 255]
 }
 
 fn default_font_size() -> f32 {
@@ -127,6 +133,7 @@ impl Default for AppSettings {
             sort_order: SortOrder::UpdatedDesc,
             show_formatting_bar: true,
             highlight_rgb: default_highlight_rgb(),
+            text_color_rgb: default_text_color_rgb(),
             font_size: default_font_size(),
             glow_strength: default_glow_strength(),
             colors: Default::default(),
@@ -586,9 +593,16 @@ impl Note {
             end += 1;
         }
 
-        let flat = self.body[start..end].split_whitespace().collect::<Vec<_>>().join(" ");
+        let flat = self.body[start..end]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         let prefix = if start > 0 { "\u{2026}" } else { "" };
-        let suffix = if end < self.body.len() { "\u{2026}" } else { "" };
+        let suffix = if end < self.body.len() {
+            "\u{2026}"
+        } else {
+            ""
+        };
         Some(format!("{prefix}{flat}{suffix}"))
     }
 }
@@ -637,11 +651,7 @@ pub fn extract_wiki_links(body: &str) -> Vec<String> {
             if let Some(end) = after_open.find("]]") {
                 let raw_target = after_open[..end].trim();
                 // Support [[Note Title|Alias]] syntax by taking the part before `|`
-                let target = raw_target
-                    .split('|')
-                    .next()
-                    .unwrap_or(raw_target)
-                    .trim();
+                let target = raw_target.split('|').next().unwrap_or(raw_target).trim();
                 if !target.is_empty() && !target.contains('\n') {
                     links.insert(target.to_string());
                 }
@@ -675,7 +685,10 @@ pub fn extract_inline_tags(body: &str) -> Vec<String> {
                 continue;
             }
             let word = word.trim_matches(|c: char| {
-                matches!(c, ',' | '.' | ';' | ':' | '(' | ')' | '[' | ']' | '"' | '\'')
+                matches!(
+                    c,
+                    ',' | '.' | ';' | ':' | '(' | ')' | '[' | ']' | '"' | '\''
+                )
             });
             if let Some(rest) = word.strip_prefix('#') {
                 if rest.is_empty() || rest.starts_with('#') {
@@ -777,6 +790,51 @@ fn generate_unique_id(title: &str, dir: &Path, now: DateTime<Utc>) -> String {
         }
     }
     format!("note-{}", now.timestamp_millis())
+}
+
+/// Copies Markdown notes and settings from earlier default folders into `target`.
+/// Existing files in `target` are never overwritten and the old folders are left intact.
+/// Returns the number of files copied.
+pub fn migrate_legacy_notes(target: &Path) -> usize {
+    let Some(home) = dirs::home_dir() else {
+        return 0;
+    };
+    let legacy_dirs = [
+        home.join("eloranotes"),
+        home.join(".EloraNotes"),
+        home.join("Documents").join("EloraNotes"),
+    ];
+    migrate_from_dirs(target, &legacy_dirs)
+}
+
+fn migrate_from_dirs(target: &Path, legacy_dirs: &[PathBuf]) -> usize {
+    let mut copied = 0;
+    for legacy in legacy_dirs {
+        if !legacy.is_dir() || legacy == target {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(legacy) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_note = path.extension().is_some_and(|ext| ext == "md");
+            let is_settings = path
+                .file_name()
+                .is_some_and(|name| name == ".elora-settings.json");
+            if !(is_note || is_settings) || !path.is_file() {
+                continue;
+            }
+            let dest = target.join(entry.file_name());
+            if dest.exists() {
+                continue;
+            }
+            if fs::copy(&path, &dest).is_ok() {
+                copied += 1;
+            }
+        }
+    }
+    copied
 }
 
 pub struct NoteStorage {
@@ -963,6 +1021,30 @@ pub fn sort_notes(notes: &mut [Note], order: SortOrder) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_migrate_copies_missing_files_without_overwriting() {
+        let base = env::temp_dir().join(format!(
+            "elora_migrate_test_{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let legacy = base.join("old");
+        let target = base.join("new");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(legacy.join("a.md"), "old a").unwrap();
+        fs::write(legacy.join("b.md"), "old b").unwrap();
+        fs::write(legacy.join("notes.txt"), "ignored").unwrap();
+        fs::write(target.join("a.md"), "new a").unwrap();
+
+        let copied = migrate_from_dirs(&target, &[legacy.clone(), base.join("missing")]);
+
+        assert_eq!(copied, 1);
+        assert_eq!(fs::read_to_string(target.join("a.md")).unwrap(), "new a");
+        assert_eq!(fs::read_to_string(target.join("b.md")).unwrap(), "old b");
+        assert!(!target.join("notes.txt").exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn test_note_icon_round_trip() {
         let dir = std::path::Path::new("/tmp");
