@@ -796,13 +796,10 @@ impl NoteStorage {
                 return p;
             }
         }
-        if let Some(doc_dir) = dirs::document_dir() {
-            return doc_dir.join("EloraNotes");
-        }
         if let Some(home_dir) = dirs::home_dir() {
-            return home_dir.join("EloraNotes");
+            return home_dir.join(".config").join("eloranotes");
         }
-        PathBuf::from("notes")
+        PathBuf::from(".config/eloranotes")
     }
 
     pub fn root_dir(&self) -> &Path {
