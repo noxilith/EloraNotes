@@ -6,31 +6,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum SortOrder {
-    UpdatedDesc,
-    CreatedDesc,
-    TitleAsc,
-}
-
-impl SortOrder {
-    pub fn next(self) -> Self {
-        match self {
-            Self::UpdatedDesc => Self::CreatedDesc,
-            Self::CreatedDesc => Self::TitleAsc,
-            Self::TitleAsc => Self::UpdatedDesc,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::UpdatedDesc => "Modified",
-            Self::CreatedDesc => "Created",
-            Self::TitleAsc => "Title A–Z",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum NoteTemplate {
     Blank,
     DailyJournal,
@@ -96,7 +71,6 @@ impl NoteTemplate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub theme_name: String,
-    pub sort_order: SortOrder,
     pub show_formatting_bar: bool,
     #[serde(default = "default_highlight_rgb")]
     pub highlight_rgb: [u8; 3],
@@ -108,6 +82,9 @@ pub struct AppSettings {
     pub glow_strength: f32,
     #[serde(default)]
     pub colors: crate::theme::ColorOverrides,
+    /// Folders the user folded shut in the sidebar.
+    #[serde(default)]
+    pub collapsed_folders: Vec<String>,
 }
 
 fn default_highlight_rgb() -> [u8; 3] {
@@ -130,13 +107,13 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             theme_name: "Obsidian".to_string(),
-            sort_order: SortOrder::UpdatedDesc,
             show_formatting_bar: true,
             highlight_rgb: default_highlight_rgb(),
             text_color_rgb: default_text_color_rgb(),
             font_size: default_font_size(),
             glow_strength: default_glow_strength(),
             colors: Default::default(),
+            collapsed_folders: Vec::new(),
         }
     }
 }
@@ -152,6 +129,8 @@ pub struct Note {
     pub explicit_tags: Vec<String>,
     /// Optional Tabler icon name (e.g. `flare`), stored in frontmatter
     pub icon: Option<String>,
+    /// Optional folder the note is filed under, stored in frontmatter.
+    pub folder: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub file_path: PathBuf,
@@ -172,6 +151,7 @@ impl Note {
             trashed: false,
             explicit_tags: Vec::new(),
             icon: None,
+            folder: None,
             created_at: now,
             updated_at: now,
             file_path,
@@ -380,7 +360,12 @@ impl Note {
 
     /// Serializes the note into Markdown with YAML frontmatter.
     pub fn to_markdown(&self) -> String {
-        let escaped_title = self.title.replace('\\', "\\\\").replace('"', "\\\"");
+        let escaped_title = escape_yaml_string(&self.title);
+        let folder_line = self
+            .folder
+            .as_ref()
+            .map(|f| format!("folder: \"{}\"\n", escape_yaml_string(f)))
+            .unwrap_or_default();
         let tags_serialized = if self.explicit_tags.is_empty() {
             "[]".to_string()
         } else {
@@ -394,11 +379,12 @@ impl Note {
         };
 
         format!(
-            "---\ntitle: \"{}\"\npinned: {}\ntrashed: {}\ntags: {}\n{}created_at: {}\nupdated_at: {}\n---\n{}",
+            "---\ntitle: \"{}\"\npinned: {}\ntrashed: {}\ntags: {}\n{}{}created_at: {}\nupdated_at: {}\n---\n{}",
             escaped_title,
             self.pinned,
             self.trashed,
             tags_serialized,
+            folder_line,
             self.icon
                 .as_ref()
                 .map(|i| format!("icon: {i}\n"))
@@ -422,6 +408,7 @@ impl Note {
             let mut trashed = false;
             let mut explicit_tags = Vec::new();
             let mut icon = None;
+            let mut folder = None;
             let mut created_at = fallback_time;
             let mut updated_at = fallback_time;
 
@@ -442,6 +429,9 @@ impl Note {
                         }
                         "tags" => {
                             explicit_tags = parse_yaml_tags(val);
+                        }
+                        "folder" => {
+                            folder = normalize_folder(&unquote_yaml_string(val));
                         }
                         "icon" => {
                             let name: String = val
@@ -474,6 +464,7 @@ impl Note {
                 trashed,
                 explicit_tags,
                 icon,
+                folder,
                 created_at,
                 updated_at,
                 file_path,
@@ -506,6 +497,7 @@ impl Note {
                 trashed: false,
                 explicit_tags: Vec::new(),
                 icon: None,
+                folder: None,
                 created_at: fallback_time,
                 updated_at: fallback_time,
                 file_path,
@@ -881,7 +873,7 @@ impl NoteStorage {
         }
     }
 
-    pub fn load_all(&self, sort_order: SortOrder) -> io::Result<Vec<Note>> {
+    pub fn load_all(&self) -> io::Result<Vec<Note>> {
         let mut notes = Vec::new();
         if !self.root_dir.exists() {
             fs::create_dir_all(&self.root_dir)?;
@@ -907,7 +899,7 @@ impl NoteStorage {
             notes = self.seed_starter_notes()?;
         }
 
-        sort_notes(&mut notes, sort_order);
+        sort_notes(&mut notes);
         Ok(notes)
     }
 
@@ -1001,22 +993,26 @@ impl NoteStorage {
     }
 }
 
-/// Sorts notes with Pinned notes first (among non-trashed notes), then according to `SortOrder`.
-pub fn sort_notes(notes: &mut [Note], order: SortOrder) {
+/// Sorts notes with Trash last, Pinned first, and everything else newest-edited first.
+pub fn sort_notes(notes: &mut [Note]) {
     notes.sort_by(|a, b| {
         a.trashed
             .cmp(&b.trashed)
             .then_with(|| b.pinned.cmp(&a.pinned))
-            .then_with(|| match order {
-                SortOrder::UpdatedDesc => b.updated_at.cmp(&a.updated_at),
-                SortOrder::CreatedDesc => b.created_at.cmp(&a.created_at),
-                SortOrder::TitleAsc => a
-                    .display_title()
-                    .to_lowercase()
-                    .cmp(&b.display_title().to_lowercase()),
-            })
+            .then_with(|| b.updated_at.cmp(&a.updated_at))
             .then_with(|| a.title.cmp(&b.title))
     });
+}
+
+/// Trims a folder name and collapses inner whitespace. Returns `None` for a blank name.
+pub fn normalize_folder(name: &str) -> Option<String> {
+    let cleaned = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// Escapes a value for a quoted YAML scalar.
+fn escape_yaml_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 #[cfg(test)]
@@ -1060,6 +1056,28 @@ mod tests {
         assert!(!md.contains("icon:"));
         let parsed = Note::from_markdown(note.id.clone(), &md, note.file_path.clone());
         assert_eq!(parsed.icon, None);
+    }
+
+    #[test]
+    fn test_note_folder_round_trip() {
+        let dir = temp_test_dir("folder_roundtrip");
+        let mut note = Note::new("Filed note", "body", &dir);
+        note.folder = normalize_folder("  Client   Work ");
+        assert_eq!(note.folder.as_deref(), Some("Client Work"));
+
+        let md = note.to_markdown();
+        assert!(md.contains("\nfolder: \"Client Work\"\n"), "{md}");
+        let parsed = Note::from_markdown(note.id.clone(), &md, note.file_path.clone());
+        assert_eq!(parsed.folder.as_deref(), Some("Client Work"));
+
+        note.folder = None;
+        let md = note.to_markdown();
+        assert!(!md.contains("folder:"), "{md}");
+        let parsed = Note::from_markdown(note.id.clone(), &md, note.file_path.clone());
+        assert_eq!(parsed.folder, None);
+
+        assert_eq!(normalize_folder("   "), None);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     use super::*;
@@ -1226,7 +1244,7 @@ And a number #123 should be ignored, while #valid_tag is kept.";
         let dir = temp_test_dir("storage");
         let storage = NoteStorage::new(dir.clone()).unwrap();
 
-        let notes = storage.load_all(SortOrder::UpdatedDesc).unwrap();
+        let notes = storage.load_all().unwrap();
         assert_eq!(notes.len(), 3);
         assert!(notes[0].pinned);
 
@@ -1234,14 +1252,14 @@ And a number #123 should be ignored, while #valid_tag is kept.";
         custom.pinned = true;
         storage.save_note(&custom).unwrap();
 
-        let reloaded = storage.load_all(SortOrder::UpdatedDesc).unwrap();
+        let reloaded = storage.load_all().unwrap();
         assert_eq!(reloaded.len(), 4);
         assert!(reloaded
             .iter()
             .any(|n| n.title == "Pinned Top Note" && n.pinned));
 
         storage.delete_note(&custom).unwrap();
-        let after_delete = storage.load_all(SortOrder::UpdatedDesc).unwrap();
+        let after_delete = storage.load_all().unwrap();
         assert_eq!(after_delete.len(), 3);
 
         let _ = fs::remove_dir_all(&dir);
@@ -1260,13 +1278,13 @@ And a number #123 should be ignored, while #valid_tag is kept.";
         fs::write(src.join("notes.txt"), "ignored").unwrap();
 
         assert_eq!(storage.import_markdown_dir(&src).unwrap(), 1);
-        let notes = storage.load_all(SortOrder::UpdatedDesc).unwrap();
+        let notes = storage.load_all().unwrap();
         let imported = notes.iter().find(|n| n.title == "Ideas").unwrap();
         assert!(imported.body.contains("Body with [[Other]]"));
 
         // Importing again adds a second copy instead of overwriting the first.
         assert_eq!(storage.import_markdown_dir(&src).unwrap(), 1);
-        let again = storage.load_all(SortOrder::UpdatedDesc).unwrap();
+        let again = storage.load_all().unwrap();
         assert_eq!(again.iter().filter(|n| n.title == "Ideas").count(), 2);
 
         let _ = fs::remove_dir_all(&root);

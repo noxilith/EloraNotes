@@ -6,8 +6,8 @@ use crate::markdown::{
     wrap_selection, HIGHLIGHT_PRESETS,
 };
 use crate::storage::{
-    extract_wiki_links, fuzzy_subsequence, normalize_tag, sort_notes, AppSettings, Note,
-    NoteStorage, NoteTemplate, SortOrder,
+    extract_wiki_links, fuzzy_subsequence, normalize_folder, normalize_tag, sort_notes,
+    AppSettings, Note, NoteStorage, NoteTemplate,
 };
 use crate::theme::{ColorOverrides, Palette, ThemeMode};
 use chrono::{Local, Utc};
@@ -15,9 +15,13 @@ use egui::{
     Align, Align2, Color32, CornerRadius, FontFamily, FontId, Frame, Id, Key, Layout, Margin, Pos2,
     RichText, ScrollArea, Sense, Stroke, TextEdit, TextStyle, Ui, Vec2,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::f32::consts::TAU;
 use std::time::{Duration, Instant};
+
+/// The sidebar keeps this width instead of being drag-resizable, so the note list
+/// and the editor stop shifting around while the window is resized.
+const SIDEBAR_WIDTH: f32 = 305.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditorViewMode {
@@ -52,8 +56,11 @@ pub struct EloraApp {
     search_query: String,
     active_tag: Option<String>,
     sidebar_section: SidebarSection,
-    sort_order: SortOrder,
     new_tag_input: String,
+    /// Folder names folded shut in the sidebar.
+    collapsed_folders: BTreeSet<String>,
+    /// Text buffer for the "new folder" field in the sidebar folder controls.
+    new_folder_input: String,
     theme: ThemeMode,
     focus_mode: bool,
     view_mode: EditorViewMode,
@@ -122,7 +129,6 @@ enum PaletteCommand {
     SetViewMode(EditorViewMode),
     TogglePinSelected,
     SetTheme(ThemeMode),
-    CycleSortOrder,
     ToggleFormattingBar,
     CopyNoteMarkdown,
     ExportNoteHtml,
@@ -191,8 +197,7 @@ impl EloraApp {
             settings.glow_strength,
         );
 
-        let sort_order = settings.sort_order;
-        let notes = storage.load_all(sort_order).unwrap_or_default();
+        let notes = storage.load_all().unwrap_or_default();
         let selected_id = notes.iter().find(|n| !n.trashed).map(|n| n.id.clone());
 
         Self {
@@ -202,8 +207,9 @@ impl EloraApp {
             search_query: String::new(),
             active_tag: None,
             sidebar_section: SidebarSection::AllNotes,
-            sort_order,
             new_tag_input: String::new(),
+            collapsed_folders: settings.collapsed_folders.iter().cloned().collect(),
+            new_folder_input: String::new(),
             theme,
             focus_mode: false,
             view_mode: EditorViewMode::Split,
@@ -236,13 +242,13 @@ impl EloraApp {
     fn persist_settings(&self) {
         let settings = AppSettings {
             theme_name: self.theme.name().to_string(),
-            sort_order: self.sort_order,
             show_formatting_bar: self.show_formatting_bar,
             highlight_rgb: self.highlight_rgb,
             text_color_rgb: self.text_color_rgb,
             font_size: self.font_size,
             glow_strength: self.glow_strength,
             colors: self.colors,
+            collapsed_folders: self.collapsed_folders.iter().cloned().collect(),
         };
         self.storage.save_settings(&settings);
     }
@@ -361,7 +367,18 @@ impl EloraApp {
     }
 
     fn resort(&mut self) {
-        sort_notes(&mut self.notes, self.sort_order);
+        sort_notes(&mut self.notes);
+    }
+
+    /// Every folder currently used by a live note, alphabetically.
+    fn all_folders(&self) -> Vec<String> {
+        let mut folders: BTreeSet<String> = BTreeSet::new();
+        for note in self.notes.iter().filter(|n| !n.trashed) {
+            if let Some(folder) = &note.folder {
+                folders.insert(folder.clone());
+            }
+        }
+        folders.into_iter().collect()
     }
 
     fn all_tags_with_counts(&self) -> Vec<(String, usize)> {
@@ -548,7 +565,7 @@ impl EloraApp {
                 ));
             }
             Ok(count) => {
-                self.notes = self.storage.load_all(self.sort_order).unwrap_or_default();
+                self.notes = self.storage.load_all().unwrap_or_default();
                 self.status_message = Some(format!("Imported {count} note(s)"));
             }
             Err(e) => self.status_message = Some(format!("Import failed: {e}")),
@@ -604,6 +621,14 @@ impl EloraApp {
         }
         if self.sidebar_section == SidebarSection::Pinned {
             note.pinned = true;
+        }
+        // A new note joins the folder of the note that was open.
+        if note.folder.is_none() {
+            note.folder = self
+                .selected_id
+                .as_ref()
+                .and_then(|id| self.notes.iter().find(|n| &n.id == id))
+                .and_then(|n| n.folder.clone());
         }
         if self.sidebar_section == SidebarSection::Trash {
             self.sidebar_section = SidebarSection::AllNotes;
@@ -797,12 +822,6 @@ impl EloraApp {
                 self.apply_look(ctx);
                 self.persist_settings();
                 self.status_message = Some(format!("Theme: {}", self.theme.name()));
-            }
-            PaletteCommand::CycleSortOrder => {
-                self.sort_order = self.sort_order.next();
-                self.resort();
-                self.persist_settings();
-                self.status_message = Some(format!("Sorted by {}", self.sort_order.label()));
             }
             PaletteCommand::ToggleFormattingBar => {
                 self.show_formatting_bar = !self.show_formatting_bar;
@@ -1063,12 +1082,6 @@ impl EloraApp {
                 "Show Note Graph",
                 "",
                 PaletteCommand::ToggleGraph,
-            ),
-            (
-                icon::ARROWS_SORT,
-                "Cycle Note Sort Order (Modified / Created / Title)",
-                "",
-                PaletteCommand::CycleSortOrder,
             ),
             (
                 icon::HEADING,
@@ -1551,29 +1564,6 @@ impl EloraApp {
                 self.sidebar_section = SidebarSection::Trash;
                 self.select_first_visible();
             }
-
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new(format!(
-                                "{} {}",
-                                icon::ARROWS_SORT,
-                                self.sort_order.label()
-                            ))
-                            .size(11.0)
-                            .color(p.fg_muted),
-                        )
-                        .frame(false),
-                    )
-                    .on_hover_text("Change sort order")
-                    .clicked()
-                {
-                    self.sort_order = self.sort_order.next();
-                    self.resort();
-                    self.persist_settings();
-                }
-            });
         });
 
         let all_tags = self.all_tags_with_counts();
@@ -1630,82 +1620,114 @@ impl EloraApp {
             .copied()
             .filter(|&i| self.notes[i].pinned && !self.notes[i].trashed)
             .collect();
-        let unpinned_indices: Vec<usize> = filtered
-            .iter()
-            .copied()
-            .filter(|&i| !self.notes[i].pinned || self.notes[i].trashed)
-            .collect();
 
-        let mut clicked_note_id: Option<String> = None;
-        let mut clicked_tag: Option<String> = None;
+        // Unpinned live notes are grouped by folder; trashed notes are listed flat.
+        let mut folder_groups: Vec<(String, Vec<usize>)> = Vec::new();
+        let mut unfiled: Vec<usize> = Vec::new();
+        let mut trashed_indices: Vec<usize> = Vec::new();
+        for &i in &filtered {
+            let note = &self.notes[i];
+            if note.trashed {
+                trashed_indices.push(i);
+            } else if note.pinned {
+                // Already listed in the pinned section above.
+            } else if let Some(folder) = &note.folder {
+                match folder_groups.iter_mut().find(|(name, _)| name == folder) {
+                    Some((_, list)) => list.push(i),
+                    None => folder_groups.push((folder.clone(), vec![i])),
+                }
+            } else {
+                unfiled.push(i);
+            }
+        }
+        folder_groups.sort_by_key(|(name, _)| name.to_lowercase());
+
+        // Filtering a folder should reveal its matches instead of hiding them.
+        let folders_open = !self.search_query.trim().is_empty() || self.active_tag.is_some();
+        let has_folders = !folder_groups.is_empty();
+
+        let mut picked = CardSelection::default();
+        let mut toggled_folder: Option<String> = None;
 
         ScrollArea::vertical()
             .id_salt("notes_sidebar_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if !pinned_indices.is_empty() {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(icon::PINNED).size(11.0).color(p.pin_color));
-                        ui.label(
-                            RichText::new("PINNED")
-                                .size(10.5)
-                                .strong()
-                                .color(p.fg_muted),
-                        );
-                    });
-                    ui.add_space(2.0);
-                    for idx in &pinned_indices {
-                        let note = &self.notes[*idx];
-                        let is_selected = self.selected_id.as_deref() == Some(note.id.as_str());
-                        if let Some(action) =
-                            render_note_card(ui, note, is_selected, p, &self.search_query)
-                        {
-                            match action {
-                                CardAction::SelectNote(id) => clicked_note_id = Some(id),
-                                CardAction::FilterTag(t) => clicked_tag = Some(t),
-                            }
-                        }
-                        ui.add_space(4.0);
+                    section_heading(ui, icon::PINNED, "PINNED", p.pin_color);
+                    render_note_rows(
+                        ui,
+                        &self.notes,
+                        &pinned_indices,
+                        self.selected_id.as_deref(),
+                        p,
+                        &self.search_query,
+                        &mut picked,
+                    );
+                    ui.add_space(4.0);
+                }
+
+                for (name, indices) in &folder_groups {
+                    let collapsed = !folders_open && self.collapsed_folders.contains(name);
+                    if folder_header(ui, name, indices.len(), collapsed, p).clicked() {
+                        toggled_folder = Some(name.clone());
                     }
-                    if !unpinned_indices.is_empty() {
-                        ui.add_space(6.0);
+                    if !collapsed {
+                        ui.add_space(2.0);
+                        render_note_rows(
+                            ui,
+                            &self.notes,
+                            indices,
+                            self.selected_id.as_deref(),
+                            p,
+                            &self.search_query,
+                            &mut picked,
+                        );
+                        ui.add_space(3.0);
                     }
                 }
 
-                if !unpinned_indices.is_empty() {
-                    if !pinned_indices.is_empty() {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(icon::NOTES).size(11.0).color(p.fg_muted));
-                            ui.label(
-                                RichText::new("ALL NOTES")
-                                    .size(10.5)
-                                    .strong()
-                                    .color(p.fg_muted),
-                            );
-                        });
-                        ui.add_space(2.0);
+                if !unfiled.is_empty() {
+                    if has_folders || !pinned_indices.is_empty() {
+                        section_heading(ui, icon::NOTES, "ALL NOTES", p.fg_muted);
                     }
-                    for idx in &unpinned_indices {
-                        let note = &self.notes[*idx];
-                        let is_selected = self.selected_id.as_deref() == Some(note.id.as_str());
-                        if let Some(action) =
-                            render_note_card(ui, note, is_selected, p, &self.search_query)
-                        {
-                            match action {
-                                CardAction::SelectNote(id) => clicked_note_id = Some(id),
-                                CardAction::FilterTag(t) => clicked_tag = Some(t),
-                            }
-                        }
-                        ui.add_space(4.0);
-                    }
+                    render_note_rows(
+                        ui,
+                        &self.notes,
+                        &unfiled,
+                        self.selected_id.as_deref(),
+                        p,
+                        &self.search_query,
+                        &mut picked,
+                    );
+                }
+
+                if !trashed_indices.is_empty() {
+                    section_heading(ui, icon::TRASH, "TRASH", p.fg_muted);
+                    render_note_rows(
+                        ui,
+                        &self.notes,
+                        &trashed_indices,
+                        self.selected_id.as_deref(),
+                        p,
+                        &self.search_query,
+                        &mut picked,
+                    );
                 }
             });
 
-        if let Some(id) = clicked_note_id {
+        if let Some(folder) = toggled_folder {
+            if !self.collapsed_folders.remove(&folder) {
+                self.collapsed_folders.insert(folder);
+            }
+            self.persist_settings();
+        }
+
+        if let Some(id) = picked.note_id.take() {
             self.selected_id = Some(id);
             self.confirm_delete_id = None;
         }
-        if let Some(tag) = clicked_tag {
+        if let Some(tag) = picked.tag.take() {
             if self.active_tag.as_deref() == Some(tag.as_str()) {
                 self.active_tag = None;
             } else {
@@ -2163,6 +2185,7 @@ impl EloraApp {
         let mut action_restore_trash = false;
         let mut action_perm_delete = false;
         let mut queued_format_op: Option<EditorFormatOp> = None;
+        let mut folder_choice: Option<Option<String>> = None;
 
         let is_trashed = self.notes[note_idx].trashed;
 
@@ -2217,6 +2240,21 @@ impl EloraApp {
                 self.icon_picker_for_body = false;
                 self.icon_picker_open = !self.icon_picker_open;
                 self.icon_picker_note_id = Some(self.notes[note_idx].id.clone());
+            }
+
+            ui.label(RichText::new("·").color(p.fg_muted));
+
+            // Folder chooser: file this note under a folder, or start a new one.
+            let current_folder = self.notes[note_idx].folder.clone();
+            let folders = self.all_folders();
+            if let Some(choice) = folder_menu_ui(
+                ui,
+                p,
+                current_folder.as_deref(),
+                &folders,
+                &mut self.new_folder_input,
+            ) {
+                folder_choice = Some(choice);
             }
 
             ui.label(RichText::new("·").color(p.fg_muted));
@@ -2405,6 +2443,20 @@ impl EloraApp {
                 }
             });
         });
+
+        if let Some(choice) = folder_choice {
+            self.notes[note_idx].folder = choice.clone();
+            self.notes[note_idx].updated_at = Utc::now();
+            needs_save = true;
+            match choice {
+                Some(name) => {
+                    // Filing a note into a folded folder should reveal it.
+                    self.collapsed_folders.remove(&name);
+                    self.status_message = Some(format!("Filed under {name}"));
+                }
+                None => self.status_message = Some("Removed from folder".to_string()),
+            }
+        }
 
         let inserting = self.icon_picker_for_body;
         if let Some(choice) = self.render_icon_picker(ui.ctx(), p, note_idx) {
@@ -2709,7 +2761,6 @@ impl EloraApp {
         let mut clicked_wiki_link: Option<String> = None;
         let mut clicked_backlink_id: Option<String> = None;
         let mut toggled_task_idx: Option<usize> = None;
-        let is_dark = self.theme.is_dark();
 
         match self.view_mode {
             EditorViewMode::Edit => {
@@ -2739,7 +2790,6 @@ impl EloraApp {
                             ui,
                             &body_snapshot,
                             p,
-                            is_dark,
                             &mut clicked_wiki_link,
                             &mut toggled_task_idx,
                         );
@@ -2774,7 +2824,6 @@ impl EloraApp {
                                     ui,
                                     &body_snapshot,
                                     p,
-                                    is_dark,
                                     &mut clicked_wiki_link,
                                     &mut toggled_task_idx,
                                 );
@@ -2881,9 +2930,8 @@ impl eframe::App for EloraApp {
 
         if !self.focus_mode {
             egui::SidePanel::left("elora_sidebar")
-                .resizable(true)
-                .default_width(305.0)
-                .width_range(240.0..=450.0)
+                .resizable(false)
+                .exact_width(SIDEBAR_WIDTH)
                 .frame(
                     Frame::new()
                         .fill(p.bg_sidebar)
@@ -2971,6 +3019,84 @@ fn filter_chip(
     )
 }
 
+/// A small all-caps heading above a group of note cards.
+fn section_heading(ui: &mut Ui, glyph: &str, label: &str, color: Color32) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(glyph).size(11.0).color(color));
+        ui.label(RichText::new(label).size(10.5).strong().color(color));
+    });
+    ui.add_space(2.0);
+}
+
+/// A collapsible folder row: chevron, folder icon, name and note count.
+fn folder_header(
+    ui: &mut Ui,
+    name: &str,
+    count: usize,
+    collapsed: bool,
+    p: &Palette,
+) -> egui::Response {
+    let chevron = if collapsed {
+        icon::CHEVRON_RIGHT
+    } else {
+        icon::CHEVRON_DOWN
+    };
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(6.0, 2.0);
+        let resp = ui
+            .add(
+                egui::Button::new(
+                    RichText::new(format!("{chevron} {} {name}", icon::FOLDER))
+                        .size(11.5)
+                        .color(p.fg_secondary),
+                )
+                .frame(false),
+            )
+            .on_hover_text(if collapsed {
+                "Expand folder"
+            } else {
+                "Collapse folder"
+            });
+        ui.label(
+            RichText::new(count.to_string())
+                .size(10.5)
+                .color(p.fg_muted),
+        );
+        resp
+    })
+    .inner
+}
+
+/// What the user clicked in the note list this frame.
+#[derive(Default)]
+struct CardSelection {
+    note_id: Option<String>,
+    tag: Option<String>,
+}
+
+/// Renders the given note indices as cards, recording any click in `picked`.
+fn render_note_rows(
+    ui: &mut Ui,
+    notes: &[Note],
+    indices: &[usize],
+    selected_id: Option<&str>,
+    p: &Palette,
+    query: &str,
+    picked: &mut CardSelection,
+) {
+    for &idx in indices {
+        let note = &notes[idx];
+        let is_selected = selected_id == Some(note.id.as_str());
+        if let Some(action) = render_note_card(ui, note, is_selected, p, query) {
+            match action {
+                CardAction::SelectNote(id) => picked.note_id = Some(id),
+                CardAction::FilterTag(t) => picked.tag = Some(t),
+            }
+        }
+        ui.add_space(3.0);
+    }
+}
+
 fn render_note_card(
     ui: &mut Ui,
     note: &Note,
@@ -2994,30 +3120,42 @@ fn render_note_card(
         .fill(bg)
         .stroke(stroke)
         .corner_radius(CornerRadius::same(7))
-        .inner_margin(Margin::symmetric(10, 8))
+        .inner_margin(Margin::symmetric(10, 6))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 2.0;
             ui.horizontal(|ui| {
-                if note.pinned {
-                    ui.label(RichText::new(icon::PINNED).size(13.0).color(p.pin_color));
-                } else {
-                    ui.label(RichText::new(icon::FILE_TEXT).size(13.0).color(p.fg_muted));
-                }
+                // A note's own icon wins; pinned notes fall back to a pin, then a file glyph.
+                let (glyph, color) = note
+                    .icon
+                    .as_deref()
+                    .and_then(tabler_glyph)
+                    .map(|g| (g, p.accent))
+                    .unwrap_or_else(|| {
+                        if note.pinned {
+                            (icon::PINNED, p.pin_color)
+                        } else {
+                            (icon::FILE_TEXT, p.fg_muted)
+                        }
+                    });
+                ui.label(RichText::new(glyph).size(13.0).color(color));
                 ui.label(
                     RichText::new(note.display_title())
                         .strong()
-                        .size(14.0)
+                        .size(13.5)
                         .color(p.fg_primary),
                 );
             });
 
-            ui.add_space(2.0);
             let excerpt = note.body_snippet(query).unwrap_or_else(|| note.snippet());
-            ui.label(RichText::new(excerpt).size(12.0).color(p.fg_secondary));
+            ui.add(
+                egui::Label::new(RichText::new(excerpt).size(11.5).color(p.fg_secondary))
+                    .truncate(),
+            );
 
             let tags = note.all_tags();
             let (done_tasks, total_tasks) = note.task_progress();
-            ui.add_space(4.0);
+            ui.add_space(2.0);
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(6.0, 2.0);
                 ui.label(
@@ -3098,13 +3236,88 @@ fn render_backlinks_footer(
     });
 }
 
+/// Folder dropdown shown in the note header. Files the note under an existing folder,
+/// removes it from its folder, or names a brand new one.
+///
+/// Returns `Some(None)` for "No folder", `Some(Some(name))` for a chosen or freshly
+/// created folder, and `None` when nothing was picked.
+///
+/// The popup closes only on clicks *outside* it (egui's default closes on any click), because
+/// otherwise clicking into the "New folder" field dismissed the menu before a name could be typed.
+fn folder_menu_ui(
+    ui: &mut Ui,
+    p: &Palette,
+    current_folder: Option<&str>,
+    folders: &[String],
+    new_folder_input: &mut String,
+) -> Option<Option<String>> {
+    let mut choice: Option<Option<String>> = None;
+    let folder_label = current_folder.unwrap_or("No folder");
+
+    egui::ComboBox::from_id_salt("note_folder_choice")
+        .selected_text(
+            RichText::new(format!("{} {folder_label}", icon::FOLDER))
+                .size(12.0)
+                .color(if current_folder.is_some() {
+                    p.accent
+                } else {
+                    p.fg_secondary
+                }),
+        )
+        .width(148.0)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show_ui(ui, |ui| {
+            if ui
+                .selectable_label(current_folder.is_none(), "No folder")
+                .clicked()
+            {
+                choice = Some(None);
+                ui.memory_mut(|mem| mem.close_popup());
+            }
+            for folder in folders {
+                let selected = current_folder == Some(folder.as_str());
+                if ui
+                    .selectable_label(selected, format!("{} {folder}", icon::FOLDER))
+                    .clicked()
+                {
+                    choice = Some(Some(folder.clone()));
+                    ui.memory_mut(|mem| mem.close_popup());
+                }
+            }
+            ui.separator();
+            let mut submit = false;
+            ui.horizontal(|ui| {
+                let field = ui.add(
+                    TextEdit::singleline(new_folder_input)
+                        .id(Id::new("new_folder_name_field"))
+                        .hint_text("New folder…")
+                        .desired_width(108.0),
+                );
+                if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    submit = true;
+                }
+                if ui.button("Add").clicked() {
+                    submit = true;
+                }
+            });
+            if submit {
+                if let Some(name) = normalize_folder(new_folder_input) {
+                    choice = Some(Some(name));
+                    new_folder_input.clear();
+                    ui.memory_mut(|mem| mem.close_popup());
+                }
+            }
+        });
+
+    choice
+}
+
 /// Interactive Markdown Preview renderer with full multi-word inline formatting,
 /// glowing highlights, clickable checkboxes, and `[[Wiki Links]]`.
 fn render_markdown_preview(
     ui: &mut Ui,
     markdown: &str,
     p: &Palette,
-    is_dark: bool,
     clicked_wiki_link: &mut Option<String>,
     toggled_task_idx: &mut Option<usize>,
 ) {
@@ -3159,19 +3372,19 @@ fn render_markdown_preview(
         } else if let Some(h1) = trimmed_start.strip_prefix("# ") {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
-                render_inline_spans_ui(ui, h1, 21.5, p, is_dark, p.fg_primary, clicked_wiki_link);
+                render_inline_spans_ui(ui, h1, 21.5, p, p.fg_primary, clicked_wiki_link, true);
             });
             ui.add_space(2.0);
         } else if let Some(h2) = trimmed_start.strip_prefix("## ") {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
-                render_inline_spans_ui(ui, h2, 18.0, p, is_dark, p.fg_primary, clicked_wiki_link);
+                render_inline_spans_ui(ui, h2, 18.0, p, p.fg_primary, clicked_wiki_link, true);
             });
             ui.add_space(2.0);
         } else if let Some(h3) = trimmed_start.strip_prefix("### ") {
             ui.add_space(2.0);
             ui.horizontal_wrapped(|ui| {
-                render_inline_spans_ui(ui, h3, 16.0, p, is_dark, p.fg_secondary, clicked_wiki_link);
+                render_inline_spans_ui(ui, h3, 16.0, p, p.fg_secondary, clicked_wiki_link, true);
             });
         } else if let Some(quote) = trimmed_start.strip_prefix("> ") {
             Frame::new()
@@ -3186,9 +3399,9 @@ fn render_markdown_preview(
                             quote,
                             14.5,
                             p,
-                            is_dark,
                             p.fg_secondary,
                             clicked_wiki_link,
+                            false,
                         );
                     });
                 });
@@ -3236,7 +3449,7 @@ fn render_markdown_preview(
                     *toggled_task_idx = Some(this_idx);
                 }
                 ui.add_space(4.0);
-                render_inline_spans_ui(ui, todo, 14.5, p, is_dark, p.fg_primary, clicked_wiki_link);
+                render_inline_spans_ui(ui, todo, 14.5, p, p.fg_primary, clicked_wiki_link, false);
             });
         } else if let Some(bullet) = trimmed_start
             .strip_prefix("- ")
@@ -3245,15 +3458,7 @@ fn render_markdown_preview(
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("•").color(p.accent).size(15.0));
                 ui.add_space(5.0);
-                render_inline_spans_ui(
-                    ui,
-                    bullet,
-                    14.5,
-                    p,
-                    is_dark,
-                    p.fg_primary,
-                    clicked_wiki_link,
-                );
+                render_inline_spans_ui(ui, bullet, 14.5, p, p.fg_primary, clicked_wiki_link, false);
             });
         } else {
             ui.horizontal_wrapped(|ui| {
@@ -3262,11 +3467,127 @@ fn render_markdown_preview(
                     trimmed_start,
                     14.5,
                     p,
-                    is_dark,
                     p.fg_primary,
                     clicked_wiki_link,
+                    false,
                 );
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drives the header folder dropdown the way a person does: open it, click into the
+    /// "New folder" field, type a name, press Enter.
+    struct FolderMenuHarness {
+        ctx: egui::Context,
+        palette: Palette,
+        folders: Vec<String>,
+        input: String,
+        choice: Option<Option<String>>,
+        combo_id: Option<Id>,
+    }
+
+    impl FolderMenuHarness {
+        fn new() -> Self {
+            let ctx = egui::Context::default();
+            install_tabler_icons(&ctx);
+            Self {
+                ctx,
+                palette: ThemeMode::Obsidian.palette(),
+                folders: Vec::new(),
+                input: String::new(),
+                choice: None,
+                combo_id: None,
+            }
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 480.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let p = self.palette;
+            let folders = self.folders.clone();
+            let input = &mut self.input;
+            let choice = &mut self.choice;
+            let combo_id = &mut self.combo_id;
+            let _ = self.ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    *combo_id = Some(ui.make_persistent_id(Id::new("note_folder_choice")));
+                    *choice = folder_menu_ui(ui, &p, None, &folders, input);
+                });
+            });
+        }
+
+        fn combo_id(&self) -> Id {
+            self.combo_id.expect("combo box should have been laid out")
+        }
+
+        fn click(&mut self, pos: egui::Pos2) {
+            for pressed in [true, false] {
+                self.frame(vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_folder_menu_click_into_new_folder_field_keeps_menu_open() {
+        let mut h = FolderMenuHarness::new();
+        h.frame(vec![]);
+
+        // Open the menu the way clicking the combo box does.
+        let widget_id = h.combo_id();
+        let button_rect = h.ctx.read_response(widget_id).expect("combo button").rect;
+        h.click(button_rect.center());
+        assert!(
+            egui::ComboBox::is_open(&h.ctx, widget_id),
+            "clicking the combo box should open the folder menu"
+        );
+        h.frame(vec![]);
+
+        let field_rect = h
+            .ctx
+            .read_response(Id::new("new_folder_name_field"))
+            .expect("new-folder field should be laid out while the menu is open")
+            .rect;
+        h.click(field_rect.center());
+
+        assert!(
+            egui::ComboBox::is_open(&h.ctx, widget_id),
+            "clicking the new-folder field must not close the folder menu"
+        );
+
+        // Type a name and confirm it: the note is filed under the new folder.
+        h.frame(vec![egui::Event::Text("Research".to_string())]);
+        h.frame(vec![egui::Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+
+        assert_eq!(h.choice, Some(Some("Research".to_string())));
+        assert!(h.input.is_empty(), "the field should reset after use");
+        assert!(
+            !egui::ComboBox::is_open(&h.ctx, widget_id),
+            "picking a folder should close the folder menu"
+        );
     }
 }

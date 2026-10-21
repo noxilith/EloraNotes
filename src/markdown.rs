@@ -48,6 +48,35 @@ pub fn luminous_text_color(base: Color32, is_dark_theme: bool) -> Color32 {
     }
 }
 
+/// The default glow tint used by a bare `==highlight==`.
+pub const DEFAULT_HIGHLIGHT_COLOR: Color32 = Color32::from_rgb(255, 196, 77);
+
+/// Every style a run of text can carry at once. Markers nest, so a run may be bold *and*
+/// highlighted, italic *and* underlined, and so on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SpanStyle {
+    pub bold: bool,
+    pub italic: bool,
+    pub strikethrough: bool,
+    pub underline: bool,
+    /// Explicit text color from `{color:#RRGGBB}…{/color}`.
+    pub color: Option<Color32>,
+    /// Glow tint from `=={#RRGGBB}…==`, or [`DEFAULT_HIGHLIGHT_COLOR`] for a bare `==…==`.
+    pub highlight: Option<Color32>,
+}
+
+impl SpanStyle {
+    /// How many styles are applied. Single-style runs keep their simple span variants.
+    fn layers(self) -> usize {
+        usize::from(self.bold)
+            + usize::from(self.italic)
+            + usize::from(self.strikethrough)
+            + usize::from(self.underline)
+            + usize::from(self.color.is_some())
+            + usize::from(self.highlight.is_some())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InlineSpan {
     Plain(String),
@@ -60,6 +89,11 @@ pub enum InlineSpan {
     Highlight {
         text: String,
         color: Option<Color32>,
+    },
+    /// Text carrying more than one style at once, e.g. `**==bold glow==**`.
+    Styled {
+        text: String,
+        style: SpanStyle,
     },
     Colored {
         text: String,
@@ -82,17 +116,20 @@ pub enum InlineSpan {
 /// - `` `inline code` ``
 /// - `[[Wiki Link]]` and `[[Target|Display]]`
 /// - `#tag` tokens
+///
+/// Markers nest, so `**==bold inside a glow==**` and `==**glow bold**==` both come out as one
+/// run that carries both styles.
 pub fn parse_inline_spans(input: &str) -> Vec<InlineSpan> {
     let mut spans = Vec::new();
+    parse_into(input, SpanStyle::default(), &mut spans);
+    spans
+}
+
+/// Scans `input`, layering every marker it meets onto `style`.
+fn parse_into(input: &str, style: SpanStyle, spans: &mut Vec<InlineSpan>) {
     let mut plain_buf = String::new();
     let mut idx = 0;
     let len = input.len();
-
-    let flush_plain = |buf: &mut String, out: &mut Vec<InlineSpan>| {
-        if !buf.is_empty() {
-            out.push(InlineSpan::Plain(std::mem::take(buf)));
-        }
-    };
 
     while idx < len {
         let rest = &input[idx..];
@@ -101,7 +138,7 @@ pub fn parse_inline_spans(input: &str) -> Vec<InlineSpan> {
         if let Some(after) = rest.strip_prefix('`') {
             if let Some(end) = after.find('`') {
                 if end > 0 {
-                    flush_plain(&mut plain_buf, &mut spans);
+                    flush_plain(&mut plain_buf, style, spans);
                     spans.push(InlineSpan::Code(after[..end].to_string()));
                     idx += 1 + end + 1;
                     continue;
@@ -114,7 +151,7 @@ pub fn parse_inline_spans(input: &str) -> Vec<InlineSpan> {
             if let Some(end) = after.find("]]") {
                 let inner = after[..end].trim();
                 if !inner.is_empty() {
-                    flush_plain(&mut plain_buf, &mut spans);
+                    flush_plain(&mut plain_buf, style, spans);
                     let (target, display) = if let Some((t, a)) = inner.split_once('|') {
                         (t.trim().to_string(), a.trim().to_string())
                     } else {
@@ -127,18 +164,19 @@ pub fn parse_inline_spans(input: &str) -> Vec<InlineSpan> {
             }
         }
 
-        // 3a. Text color: {color:#RRGGBB}text{/color}
+        // 3. Text color: {color:#RRGGBB}text{/color}
         if let Some(after) = rest.strip_prefix("{color:#") {
             if after.len() >= 7 && after.as_bytes()[6] == b'}' {
                 if let Some(color) = parse_hex_color(&after[..6]) {
                     let content = &after[7..];
                     if let Some(end) = content.find("{/color}") {
                         if end > 0 {
-                            flush_plain(&mut plain_buf, &mut spans);
-                            spans.push(InlineSpan::Colored {
-                                text: content[..end].to_string(),
-                                color,
-                            });
+                            flush_plain(&mut plain_buf, style, spans);
+                            let inner_style = SpanStyle {
+                                color: Some(color),
+                                ..style
+                            };
+                            parse_into(&content[..end], inner_style, spans);
                             idx += "{color:#".len() + 7 + end + "{/color}".len();
                             continue;
                         }
@@ -147,25 +185,27 @@ pub fn parse_inline_spans(input: &str) -> Vec<InlineSpan> {
             }
         }
 
-        // 3. Highlight: =={#RRGGBB}text== or ==text==
+        // 4. Highlight: =={#RRGGBB}text== or ==text==
         if let Some(after) = rest.strip_prefix("==") {
             if !after.starts_with('=') {
                 if let Some(end) = after.find("==") {
                     if end > 0 {
                         let inner = &after[..end];
-                        flush_plain(&mut plain_buf, &mut spans);
+                        flush_plain(&mut plain_buf, style, spans);
                         let (color, text) = if let Some(after_brace) = inner.strip_prefix("{#") {
                             if after_brace.len() >= 7 && after_brace.as_bytes()[6] == b'}' {
-                                let hex = &after_brace[..6];
-                                let col = parse_hex_color(hex);
-                                (col, after_brace[7..].to_string())
+                                (parse_hex_color(&after_brace[..6]), &after_brace[7..])
                             } else {
-                                (None, inner.to_string())
+                                (None, inner)
                             }
                         } else {
-                            (None, inner.to_string())
+                            (None, inner)
                         };
-                        spans.push(InlineSpan::Highlight { text, color });
+                        let inner_style = SpanStyle {
+                            highlight: Some(color.unwrap_or(DEFAULT_HIGHLIGHT_COLOR)),
+                            ..style
+                        };
+                        parse_into(text, inner_style, spans);
                         idx += 2 + end + 2;
                         continue;
                     }
@@ -173,25 +213,34 @@ pub fn parse_inline_spans(input: &str) -> Vec<InlineSpan> {
             }
         }
 
-        // 4. Bold + Italic: ***text***
+        // 5. Bold + Italic: ***text***
         if let Some(after) = rest.strip_prefix("***") {
             if let Some(end) = after.find("***") {
                 if end > 0 {
-                    flush_plain(&mut plain_buf, &mut spans);
-                    spans.push(InlineSpan::BoldItalic(after[..end].to_string()));
+                    flush_plain(&mut plain_buf, style, spans);
+                    let inner_style = SpanStyle {
+                        bold: true,
+                        italic: true,
+                        ..style
+                    };
+                    parse_into(&after[..end], inner_style, spans);
                     idx += 3 + end + 3;
                     continue;
                 }
             }
         }
 
-        // 5. Bold: **text**
+        // 6. Bold: **text**
         if let Some(after) = rest.strip_prefix("**") {
             if !after.starts_with('*') {
                 if let Some(end) = after.find("**") {
                     if end > 0 {
-                        flush_plain(&mut plain_buf, &mut spans);
-                        spans.push(InlineSpan::Bold(after[..end].to_string()));
+                        flush_plain(&mut plain_buf, style, spans);
+                        let inner_style = SpanStyle {
+                            bold: true,
+                            ..style
+                        };
+                        parse_into(&after[..end], inner_style, spans);
                         idx += 2 + end + 2;
                         continue;
                     }
@@ -199,25 +248,33 @@ pub fn parse_inline_spans(input: &str) -> Vec<InlineSpan> {
             }
         }
 
-        // 6. Strikethrough: ~~text~~
+        // 7. Strikethrough: ~~text~~
         if let Some(after) = rest.strip_prefix("~~") {
             if let Some(end) = after.find("~~") {
                 if end > 0 {
-                    flush_plain(&mut plain_buf, &mut spans);
-                    spans.push(InlineSpan::Strikethrough(after[..end].to_string()));
+                    flush_plain(&mut plain_buf, style, spans);
+                    let inner_style = SpanStyle {
+                        strikethrough: true,
+                        ..style
+                    };
+                    parse_into(&after[..end], inner_style, spans);
                     idx += 2 + end + 2;
                     continue;
                 }
             }
         }
 
-        // 7. Underline: __text__
+        // 8. Underline: __text__
         if let Some(after) = rest.strip_prefix("__") {
             if !after.starts_with('_') {
                 if let Some(end) = after.find("__") {
                     if end > 0 {
-                        flush_plain(&mut plain_buf, &mut spans);
-                        spans.push(InlineSpan::Underline(after[..end].to_string()));
+                        flush_plain(&mut plain_buf, style, spans);
+                        let inner_style = SpanStyle {
+                            underline: true,
+                            ..style
+                        };
+                        parse_into(&after[..end], inner_style, spans);
                         idx += 2 + end + 2;
                         continue;
                     }
@@ -225,13 +282,17 @@ pub fn parse_inline_spans(input: &str) -> Vec<InlineSpan> {
             }
         }
 
-        // 8. Italic: *text*
+        // 9. Italic: *text*
         if let Some(after) = rest.strip_prefix('*') {
             if !after.starts_with('*') && !after.starts_with(' ') {
                 if let Some(end) = after.find('*') {
                     if end > 0 && !after[..end].ends_with(' ') {
-                        flush_plain(&mut plain_buf, &mut spans);
-                        spans.push(InlineSpan::Italic(after[..end].to_string()));
+                        flush_plain(&mut plain_buf, style, spans);
+                        let inner_style = SpanStyle {
+                            italic: true,
+                            ..style
+                        };
+                        parse_into(&after[..end], inner_style, spans);
                         idx += 1 + end + 1;
                         continue;
                     }
@@ -239,7 +300,7 @@ pub fn parse_inline_spans(input: &str) -> Vec<InlineSpan> {
             }
         }
 
-        // 9. Inline #tag (must be preceded by start-of-line or whitespace)
+        // 10. Inline #tag (must be preceded by start-of-line or whitespace)
         if rest.starts_with('#') {
             let prev_ok = idx == 0
                 || input[..idx]
@@ -258,7 +319,7 @@ pub fn parse_inline_spans(input: &str) -> Vec<InlineSpan> {
                             .map(|c| c.len_utf8())
                             .sum();
                         if tag_len > 0 {
-                            flush_plain(&mut plain_buf, &mut spans);
+                            flush_plain(&mut plain_buf, style, spans);
                             let tag_str = &rest[..1 + tag_len];
                             spans.push(InlineSpan::Tag(tag_str.to_string()));
                             idx += 1 + tag_len;
@@ -278,20 +339,50 @@ pub fn parse_inline_spans(input: &str) -> Vec<InlineSpan> {
         }
     }
 
-    flush_plain(&mut plain_buf, &mut spans);
-    spans
+    flush_plain(&mut plain_buf, style, spans);
+}
+
+/// Pushes the buffered plain text as a span that keeps the styles collected so far.
+fn flush_plain(buf: &mut String, style: SpanStyle, spans: &mut Vec<InlineSpan>) {
+    if buf.is_empty() {
+        return;
+    }
+    spans.push(styled_span(std::mem::take(buf), style));
+}
+
+/// Turns text plus its accumulated style into the narrowest span variant that fits.
+fn styled_span(text: String, style: SpanStyle) -> InlineSpan {
+    match style.layers() {
+        0 => InlineSpan::Plain(text),
+        1 if style.bold => InlineSpan::Bold(text),
+        1 if style.italic => InlineSpan::Italic(text),
+        1 if style.strikethrough => InlineSpan::Strikethrough(text),
+        1 if style.underline => InlineSpan::Underline(text),
+        1 if style.color.is_some() => InlineSpan::Colored {
+            text,
+            color: style.color.unwrap_or(Color32::WHITE),
+        },
+        1 => InlineSpan::Highlight {
+            text,
+            color: style.highlight.filter(|c| *c != DEFAULT_HIGHLIGHT_COLOR),
+        },
+        2 if style.bold && style.italic => InlineSpan::BoldItalic(text),
+        _ => InlineSpan::Styled { text, style },
+    }
 }
 
 /// Renders parsed inline spans inside a `horizontal_wrapped` UI row, including glowing highlights
 /// and clickable `[[Wiki Links]]`.
+/// `bold` marks the line as a heading: its text is drawn in the bold face, and inline markers
+/// still stack on top of that.
 pub fn render_inline_spans_ui(
     ui: &mut Ui,
     text: &str,
     font_size: f32,
     p: &Palette,
-    _is_dark: bool,
     default_color: Color32,
     clicked_wiki_link: &mut Option<String>,
+    bold: bool,
 ) {
     let spans = parse_inline_spans(text);
     ui.spacing_mut().item_spacing.x = 0.0;
@@ -299,40 +390,84 @@ pub fn render_inline_spans_ui(
     for span in spans {
         match span {
             InlineSpan::Plain(s) => {
-                ui.label(RichText::new(s).size(font_size).color(default_color));
+                if bold {
+                    bold_label(ui, &s, font_size, default_color);
+                } else {
+                    ui.label(RichText::new(s).size(font_size).color(default_color));
+                }
             }
             InlineSpan::Bold(s) => {
                 bold_label(ui, &s, font_size + 0.5, p.fg_primary);
             }
             InlineSpan::Italic(s) => {
-                ui.label(
-                    RichText::new(s)
-                        .italics()
-                        .size(font_size)
-                        .color(default_color),
-                );
+                ui.label(styled_rich_text(
+                    &s,
+                    SpanStyle {
+                        italic: true,
+                        bold,
+                        ..Default::default()
+                    },
+                    font_size,
+                    default_color,
+                ));
             }
             InlineSpan::BoldItalic(s) => {
                 bold_label(ui, &s, font_size + 0.5, p.fg_primary);
             }
             InlineSpan::Strikethrough(s) => {
-                ui.label(
-                    RichText::new(s)
-                        .strikethrough()
-                        .size(font_size)
-                        .color(p.fg_muted),
-                );
+                ui.label(styled_rich_text(
+                    &s,
+                    SpanStyle {
+                        strikethrough: true,
+                        bold,
+                        ..Default::default()
+                    },
+                    font_size,
+                    p.fg_muted,
+                ));
             }
             InlineSpan::Underline(s) => {
-                ui.label(
-                    RichText::new(s)
-                        .underline()
-                        .size(font_size)
-                        .color(p.fg_primary),
-                );
+                ui.label(styled_rich_text(
+                    &s,
+                    SpanStyle {
+                        underline: true,
+                        bold,
+                        ..Default::default()
+                    },
+                    font_size,
+                    p.fg_primary,
+                ));
             }
             InlineSpan::Colored { text, color } => {
-                ui.label(RichText::new(text).size(font_size).color(color));
+                ui.label(styled_rich_text(
+                    &text,
+                    SpanStyle {
+                        color: Some(color),
+                        bold,
+                        ..Default::default()
+                    },
+                    font_size,
+                    color,
+                ));
+            }
+            InlineSpan::Styled { text, style } => {
+                let style = SpanStyle {
+                    bold: style.bold || bold,
+                    ..style
+                };
+                if let Some(glow) = style.highlight {
+                    render_glowing_highlight(
+                        ui,
+                        &text,
+                        font_size,
+                        glow,
+                        p.bg_canvas,
+                        p.glow_strength,
+                        style,
+                    );
+                } else {
+                    ui.label(styled_rich_text(&text, style, font_size, default_color));
+                }
             }
             InlineSpan::Code(s) => {
                 ui.add_space(2.0);
@@ -352,7 +487,7 @@ pub fn render_inline_spans_ui(
                 ui.add_space(2.0);
             }
             InlineSpan::Highlight { text, color } => {
-                let glow_col = color.unwrap_or(Color32::from_rgb(255, 196, 77));
+                let glow_col = color.unwrap_or(DEFAULT_HIGHLIGHT_COLOR);
                 render_glowing_highlight(
                     ui,
                     &text,
@@ -360,6 +495,10 @@ pub fn render_inline_spans_ui(
                     glow_col,
                     p.bg_canvas,
                     p.glow_strength,
+                    SpanStyle {
+                        bold,
+                        ..Default::default()
+                    },
                 );
             }
             InlineSpan::Tag(tag) => {
@@ -388,7 +527,69 @@ pub fn render_inline_spans_ui(
     }
 }
 
-/// Draws a multi-layer neon/ambient glowing highlight pill behind the text and renders luminous text on top.
+/// Builds a one-section layout job so the same text can be bold, italic, struck through,
+/// underlined and colored at once.
+fn styled_layout_job(text: &str, font_size: f32, style: SpanStyle, color: Color32) -> LayoutJob {
+    let family = if style.bold {
+        crate::icons::bold_family()
+    } else {
+        FontFamily::Proportional
+    };
+    let stroke = Stroke::new(1.0_f32, color);
+    let mut job = LayoutJob::default();
+    job.append(
+        text,
+        0.0,
+        TextFormat {
+            font_id: FontId::new(font_size, family),
+            color,
+            italics: style.italic,
+            underline: if style.underline {
+                stroke
+            } else {
+                Stroke::NONE
+            },
+            strikethrough: if style.strikethrough {
+                stroke
+            } else {
+                Stroke::NONE
+            },
+            ..Default::default()
+        },
+    );
+    job
+}
+
+/// A `RichText` carrying the flags of `style`, used for text that has no glow pill.
+fn styled_rich_text(
+    text: &str,
+    style: SpanStyle,
+    font_size: f32,
+    default_color: Color32,
+) -> RichText {
+    let color = style.color.unwrap_or(default_color);
+    let family = if style.bold {
+        crate::icons::bold_family()
+    } else {
+        FontFamily::Proportional
+    };
+    let mut rt = RichText::new(text.to_string())
+        .font(FontId::new(font_size, family))
+        .color(color);
+    if style.italic {
+        rt = rt.italics();
+    }
+    if style.strikethrough {
+        rt = rt.strikethrough();
+    }
+    if style.underline {
+        rt = rt.underline();
+    }
+    rt
+}
+
+/// Draws a multi-layer neon/ambient glowing highlight pill behind the text and renders luminous
+/// text on top, keeping any other styles the run carries (bold face, italics, strike, underline).
 pub fn render_glowing_highlight(
     ui: &mut Ui,
     text: &str,
@@ -396,6 +597,7 @@ pub fn render_glowing_highlight(
     glow_color: Color32,
     bg: Color32,
     glow_strength: f32,
+    style: SpanStyle,
 ) {
     let strength = glow_strength.clamp(0.0, 1.0);
 
@@ -407,11 +609,11 @@ pub fn render_glowing_highlight(
     } else {
         mix_color(glow_color, Color32::BLACK, 0.45)
     };
+    let text_col = style.color.unwrap_or(text_col);
 
-    let font_id = FontId::new(font_size, FontFamily::Proportional);
     let galley = ui
         .painter()
-        .layout_no_wrap(text.to_string(), font_id, text_col);
+        .layout_job(styled_layout_job(text, font_size, style, text_col));
 
     // Reserve only the text's own line box, so the highlight never adds height to the line.
     // The glow is painted outward from this box without taking up layout space.
@@ -1146,6 +1348,7 @@ pub fn strip_all_inline_markers(s: &str) -> String {
                 out.push_str(&text)
             }
             InlineSpan::WikiLink { display, .. } => out.push_str(&display),
+            InlineSpan::Styled { text, .. } => out.push_str(&text),
         }
     }
     out
@@ -1189,6 +1392,36 @@ fn html_escape(s: &str) -> String {
     out
 }
 
+/// Renders a run that carries several styles as nested HTML tags.
+fn styled_to_html(text: &str, style: SpanStyle) -> String {
+    let mut out = html_escape(text);
+    if style.bold {
+        out = format!("<strong>{out}</strong>");
+    }
+    if style.italic {
+        out = format!("<em>{out}</em>");
+    }
+    if style.underline {
+        out = format!("<u>{out}</u>");
+    }
+    if style.strikethrough {
+        out = format!("<del>{out}</del>");
+    }
+    if let Some(glow) = style.highlight {
+        out = format!(
+            "<mark style=\"background-color:{};border-radius:3px;padding:0 2px\">{out}</mark>",
+            rgb_to_hex([glow.r(), glow.g(), glow.b()])
+        );
+    }
+    if let Some(color) = style.color {
+        out = format!(
+            "<span style=\"color:{}\">{out}</span>",
+            rgb_to_hex([color.r(), color.g(), color.b()])
+        );
+    }
+    out
+}
+
 fn inline_to_html(line: &str) -> String {
     let mut out = String::new();
     for span in parse_inline_spans(line) {
@@ -1206,6 +1439,9 @@ fn inline_to_html(line: &str) -> String {
             InlineSpan::Code(t) => out.push_str(&format!("<code>{}</code>", html_escape(&t))),
             InlineSpan::Highlight { text, .. } => {
                 out.push_str(&format!("<mark>{}</mark>", html_escape(&text)))
+            }
+            InlineSpan::Styled { text, style } => {
+                out.push_str(&styled_to_html(&text, style));
             }
             InlineSpan::Colored { text, color } => out.push_str(&format!(
                 "<span style=\"color:{}\">{}</span>",
@@ -1414,6 +1650,75 @@ mod tests {
             parse_inline_spans("{color:#FF0000}open"),
             vec![InlineSpan::Plain("{color:#FF0000}open".to_string())]
         );
+    }
+
+    #[test]
+    fn test_stacked_inline_styles() {
+        // Bold and a glow highlight stack, whichever marker comes first.
+        for line in ["**==glow bold==**", "==**glow bold**=="] {
+            let spans = parse_inline_spans(line);
+            assert_eq!(spans.len(), 1, "{line}: {spans:?}");
+            match &spans[0] {
+                InlineSpan::Styled { text, style } => {
+                    assert_eq!(text, "glow bold");
+                    assert!(style.bold, "{line} should stay bold: {style:?}");
+                    assert!(style.highlight.is_some(), "{line} should stay lit");
+                }
+                other => panic!("expected one stacked span for {line}, got {other:?}"),
+            }
+        }
+
+        // Three layers at once: bold italic inside a custom highlight.
+        let spans = parse_inline_spans("***=={#4ECDFF}neon==***");
+        match &spans[0] {
+            InlineSpan::Styled { text, style } => {
+                assert_eq!(text, "neon");
+                assert!(style.bold && style.italic);
+                assert_eq!(style.highlight, Some(Color32::from_rgb(0x4E, 0xCD, 0xFF)));
+            }
+            other => panic!("expected a three-layer span, got {other:?}"),
+        }
+
+        // Text color on the outside, bold on the inside.
+        let spans = parse_inline_spans("{color:#FF0000}**red**{/color}");
+        match &spans[0] {
+            InlineSpan::Styled { text, style } => {
+                assert_eq!(text, "red");
+                assert!(style.bold);
+                assert_eq!(style.color, Some(Color32::from_rgb(255, 0, 0)));
+            }
+            other => panic!("expected color + bold, got {other:?}"),
+        }
+
+        // Strikethrough inside bold, with plain text around it.
+        let spans = parse_inline_spans("a **~~gone~~** b");
+        assert_eq!(spans.first(), Some(&InlineSpan::Plain("a ".to_string())));
+        assert_eq!(spans.last(), Some(&InlineSpan::Plain(" b".to_string())));
+        match &spans[1] {
+            InlineSpan::Styled { text, style } => {
+                assert_eq!(text, "gone");
+                assert!(style.bold && style.strikethrough);
+            }
+            other => panic!("expected bold + strike, got {other:?}"),
+        }
+
+        // A single marker still yields the simple variant.
+        assert_eq!(
+            parse_inline_spans("**x**"),
+            vec![InlineSpan::Bold("x".to_string())]
+        );
+        assert_eq!(
+            parse_inline_spans("==x=="),
+            vec![InlineSpan::Highlight {
+                text: "x".to_string(),
+                color: None,
+            }]
+        );
+
+        // Stacked styles survive the HTML export.
+        let html = markdown_to_html("t", "**==lit and bold==**");
+        assert!(html.contains("<strong>"), "{html}");
+        assert!(html.contains("<mark"), "{html}");
     }
 
     #[test]
