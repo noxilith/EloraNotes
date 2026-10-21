@@ -26,7 +26,16 @@ fn main() -> eframe::Result<()> {
         }
     }
 
+    // On Wayland a synchronized swap waits for a frame callback that the compositor
+    // stops sending while the surface is hidden (another workspace, fullscreen app on
+    // top). The UI thread then blocks inside eglSwapBuffers and the window stays frozen
+    // until it is shown again. Presenting without waiting avoids that deadlock; egui's
+    // reactive repaint scheduling already paces the UI. X11 and the other platforms keep
+    // vsync so they stay tear-free.
+    let vsync = std::env::var_os("WAYLAND_DISPLAY").is_none();
+
     let native_options = eframe::NativeOptions {
+        vsync,
         viewport: egui::ViewportBuilder::default()
             .with_title("EloraNotes")
             .with_app_id("elora-notes")
