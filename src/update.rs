@@ -143,16 +143,32 @@ pub fn install_kind() -> InstallKind {
     #[cfg(windows)]
     {
         if let Ok(exe) = std::env::current_exe() {
-            if exe
-                .parent()
-                .map(|dir| dir.join("unins000.exe").exists())
-                .unwrap_or(false)
-            {
+            if exe.parent().map(installed_by_setup).unwrap_or(false) {
                 return InstallKind::WindowsSetup;
             }
         }
     }
     InstallKind::Portable
+}
+
+/// Inno Setup drops an uninstaller next to the app it installed (`unins000.exe`, or
+/// `unins001.exe` if that name was taken), which is how an installed copy tells itself apart
+/// from the portable `.exe`.
+#[cfg(any(windows, test))]
+fn looks_like_inno_uninstaller(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.starts_with("unins") && name.ends_with(".exe")
+}
+
+#[cfg(windows)]
+fn installed_by_setup(dir: &Path) -> bool {
+    fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .any(|entry| looks_like_inno_uninstaller(&entry.file_name().to_string_lossy()))
+        })
+        .unwrap_or(false)
 }
 
 /// `0.6.1`, `v0.6.1` and `0.6.1-beta.1` all parse as `(0, 6, 1)`.
@@ -864,6 +880,14 @@ mod tests {
             .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn test_inno_uninstaller_names_are_recognised() {
+        assert!(looks_like_inno_uninstaller("unins000.exe"));
+        assert!(looks_like_inno_uninstaller("UNINS001.EXE"));
+        assert!(!looks_like_inno_uninstaller("elora.exe"));
+        assert!(!looks_like_inno_uninstaller("unins000.dat"));
     }
 
     #[test]
