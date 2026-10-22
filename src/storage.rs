@@ -791,10 +791,11 @@ pub fn migrate_legacy_notes(target: &Path) -> usize {
     let Some(home) = dirs::home_dir() else {
         return 0;
     };
+    // `~/.config/eloranotes` is where every release up to 0.7.0 kept notes, so it comes first.
     let legacy_dirs = [
+        home.join(".config").join("eloranotes"),
         home.join("eloranotes"),
         home.join(".EloraNotes"),
-        home.join("Documents").join("EloraNotes"),
     ];
     migrate_from_dirs(target, &legacy_dirs)
 }
@@ -829,6 +830,18 @@ fn migrate_from_dirs(target: &Path, legacy_dirs: &[PathBuf]) -> usize {
     copied
 }
 
+/// `Documents/EloraNotes` under the user's home. Documents is used because every install
+/// format can reach it — a Flatpak exposes the real folder, not a sandboxed copy — so notes
+/// and settings are the same ones whichever build of the app you open. The settings file
+/// (`.elora-settings.json`) lives in this folder too.
+fn default_notes_dir_for(documents: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+    match (documents, home) {
+        (Some(documents), _) => documents.join("EloraNotes"),
+        (None, Some(home)) => home.join("Documents").join("EloraNotes"),
+        (None, None) => PathBuf::from("EloraNotes"),
+    }
+}
+
 pub struct NoteStorage {
     root_dir: PathBuf,
 }
@@ -846,10 +859,7 @@ impl NoteStorage {
                 return p;
             }
         }
-        if let Some(home_dir) = dirs::home_dir() {
-            return home_dir.join(".config").join("eloranotes");
-        }
-        PathBuf::from(".config/eloranotes")
+        default_notes_dir_for(dirs::document_dir(), dirs::home_dir())
     }
 
     pub fn root_dir(&self) -> &Path {
@@ -1289,5 +1299,41 @@ And a number #123 should be ignored, while #valid_tag is kept.";
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&src);
+    }
+
+    #[test]
+    fn test_default_notes_dir_is_documents_eloranotes() {
+        assert_eq!(
+            default_notes_dir_for(
+                Some(PathBuf::from("/home/me/Documents")),
+                Some(PathBuf::from("/home/me")),
+            ),
+            PathBuf::from("/home/me/Documents/EloraNotes")
+        );
+        // No Documents entry at all: fall back to <home>/Documents rather than giving up.
+        assert_eq!(
+            default_notes_dir_for(None, Some(PathBuf::from("/home/me"))),
+            PathBuf::from("/home/me/Documents/EloraNotes")
+        );
+    }
+
+    #[test]
+    fn test_settings_and_notes_from_the_old_config_folder_are_copied() {
+        let root = std::env::temp_dir().join("elora-migrate-test");
+        let target = root.join("Documents/EloraNotes");
+        let legacy = root.join(".config/eloranotes");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("Old.md"), "---\ntitle: Old\n---\nbody").unwrap();
+        fs::write(legacy.join(".elora-settings.json"), "{}").unwrap();
+
+        assert_eq!(migrate_from_dirs(&target, std::slice::from_ref(&legacy)), 2);
+        assert!(target.join("Old.md").is_file());
+        assert!(target.join(".elora-settings.json").is_file());
+        // The old folder is left alone.
+        assert!(legacy.join("Old.md").is_file());
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

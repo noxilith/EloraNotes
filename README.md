@@ -76,6 +76,7 @@ The builds are not notarised, so the first launch needs **right-click → Open**
 ### Uninstalling
 
 - **Linux (Flatpak):** `flatpak uninstall io.github.noxilith.EloraNotes`
+  (your notes stay in `~/Documents/EloraNotes`)
 - **Linux (AppImage/tarball):** delete the file
 - **Windows:** Settings → Apps → Installed apps → EloraNotes → Uninstall
 - **macOS:** drag `EloraNotes.app` from Applications to the Trash
@@ -90,7 +91,7 @@ On launch the app compares its version with the latest GitHub release and, when 
 - **Windows setup** — the new setup program runs silently over the old install, so shortcuts and the uninstall entry stay correct; the app restarts itself afterwards.
 - **macOS app bundle** — the new `EloraNotes.app` replaces the old one (which is moved aside and cleaned up on the next launch) and reopens.
 - **Portable exe / tarball binary** — only the executable is replaced, so it has to live in a writable folder.
-- **Flatpak** — the app never modifies its own files. The prompt names the command instead: `flatpak update io.github.noxilith.EloraNotes`.
+- **Flatpak** — the app never modifies its own files. The prompt names the command that installs the new bundle over the old one: `flatpak install --reinstall ./EloraNotes-<version>-linux-x86_64.flatpak`.
 
 ## Running From Source
 
@@ -112,7 +113,7 @@ Pass a custom notes folder via `--dir` or `ELORA_NOTES_DIR`:
 elora --dir ~/Notes
 ```
 
-By default, notes are saved in `~/.config/eloranotes`. Notes and settings from the older default folders (`~/eloranotes`, `~/.EloraNotes`, `~/Documents/EloraNotes`) are copied there automatically on first launch. The old folders are left untouched. Files that already exist in the new folder are not overwritten.
+By default, notes and the settings file (`.elora-settings.json`) live in `Documents/EloraNotes` — `C:\Users\<you>\Documents\EloraNotes` on Windows. That folder is used by every install format, including the Flatpak, so the same notes open whichever build you launch. Notes and settings from the older default folders (`~/.config/eloranotes`, `~/eloranotes`, `~/.EloraNotes`) are copied there automatically on first launch. The old folders are left untouched. Files that already exist in the new folder are not overwritten.
 
 ## Matugen Theme (Wallpaper Colors)
 

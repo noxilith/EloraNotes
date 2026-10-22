@@ -521,7 +521,7 @@ impl EloraApp {
                         );
                         ui.label(
                             RichText::new(format!(
-                                "This copy was installed with {manager}, which updates it itself. Run this in a terminal:"
+                                "This copy was installed with {manager}, which owns its own files. Install the new bundle over it, in the folder where you saved it:"
                             ))
                             .size(11.5)
                             .color(p.fg_muted),
@@ -529,8 +529,7 @@ impl EloraApp {
                         ui.add_space(4.0);
                         ui.label(
                             RichText::new(format!(
-                                "flatpak update {}",
-                                update::FLATPAK_APP_ID
+                                "flatpak install --reinstall ./EloraNotes-{version}-linux-x86_64.flatpak"
                             ))
                             .size(11.5)
                             .monospace(),

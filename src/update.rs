@@ -27,9 +27,6 @@ const MAX_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024;
 
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Flatpak application ID; the bundle in the release and the store entry both use it.
-pub const FLATPAK_APP_ID: &str = "io.github.noxilith.EloraNotes";
-
 /// One downloadable file attached to a release.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Asset {

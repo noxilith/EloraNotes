@@ -21,8 +21,6 @@
 
   <rect x="48" y="48" width="928" height="928" rx="212" fill="url(#tile)"/>
   <rect x="48" y="48" width="928" height="928" rx="212" fill="url(#glow)"/>
-  <rect x="49.5" y="49.5" width="925" height="925" rx="210.5" fill="none"
-        stroke="#ffffff" stroke-opacity="0.07" stroke-width="3"/>
 
   <!-- The feather, scaled from its 24x24 canvas to ~54% of the tile. -->
   <g transform="translate(240 240) scale(22.66)" fill="none" stroke="#9fe0a6"

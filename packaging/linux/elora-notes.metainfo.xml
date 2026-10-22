@@ -25,6 +25,14 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.7.1" date="2026-10-22">
+      <description>
+        <p>
+          Notes and settings now live in Documents/EloraNotes on every platform, which the
+          Flatpak shares with other installs instead of keeping a private copy.
+        </p>
+      </description>
+    </release>
     <release version="0.7.0" date="2026-10-22">
       <description>
         <p>
