@@ -1857,8 +1857,12 @@ impl EloraApp {
         let pinned_count = self.notes.iter().filter(|n| !n.trashed && n.pinned).count();
         let trash_count = self.notes.iter().filter(|n| n.trashed).count();
 
-        ui.horizontal_wrapped(|ui| {
+        // One row that never wraps: Notes and Pinned keep their counts at the smaller pill
+        // size, and the glyph-only trash button sits to the right of Pinned instead of
+        // dropping onto a second line.
+        ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
+            ui.spacing_mut().button_padding = Vec2::new(6.0, 3.0);
             if nav_pill(
                 ui,
                 icon::NOTES,
@@ -1889,14 +1893,13 @@ impl EloraApp {
             }
 
             if (trash_count > 0 || self.sidebar_section == SidebarSection::Trash)
-                && nav_pill(
+                && nav_icon_pill(
                     ui,
                     icon::TRASH,
-                    "Trash",
-                    trash_count,
                     self.sidebar_section == SidebarSection::Trash,
                     p,
                 )
+                .on_hover_text(format!("Trash ({trash_count})"))
                 .clicked()
             {
                 self.sidebar_section = SidebarSection::Trash;
@@ -3456,6 +3459,9 @@ enum CardAction {
     FilterTag(String),
 }
 
+/// A section pill in the sidebar: glyph, label and count on one line. The pills are drawn at a
+/// slightly smaller size than the rest of the sidebar so all three sections, including the
+/// glyph-only trash button, fit across a 210 px sidebar without wrapping.
 fn nav_pill(
     ui: &mut Ui,
     glyph: &str,
@@ -3464,13 +3470,33 @@ fn nav_pill(
     active: bool,
     p: &Palette,
 ) -> egui::Response {
-    let text = format!("{glyph} {label} ({count})");
     let fg = if active { p.accent } else { p.fg_secondary };
     let bg = if active { p.accent_soft } else { p.bg_elevated };
     let border = if active { p.accent } else { p.border };
 
+    pill_button(
+        ui,
+        RichText::new(format!("{glyph} {label} ({count})"))
+            .size(11.0)
+            .color(fg),
+        bg,
+        border,
+    )
+}
+
+/// Trash is the quietest section, so it gets a glyph-only button that still fits beside the
+/// two labelled pills.
+fn nav_icon_pill(ui: &mut Ui, glyph: &str, active: bool, p: &Palette) -> egui::Response {
+    let fg = if active { p.accent } else { p.fg_secondary };
+    let bg = if active { p.accent_soft } else { p.bg_elevated };
+    let border = if active { p.accent } else { p.border };
+
+    pill_button(ui, RichText::new(glyph).size(11.5).color(fg), bg, border)
+}
+
+fn pill_button(ui: &mut Ui, text: RichText, bg: Color32, border: Color32) -> egui::Response {
     ui.add(
-        egui::Button::new(RichText::new(text).size(11.5).color(fg))
+        egui::Button::new(text)
             .fill(bg)
             .stroke(Stroke::new(1.0_f32, border))
             .corner_radius(CornerRadius::same(8)),

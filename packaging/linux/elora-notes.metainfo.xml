@@ -25,6 +25,14 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.7.2" date="2026-10-22">
+      <description>
+        <p>
+          The sidebar's Notes, Pinned and Trash sections share one row again, with Trash
+          reduced to its glyph.
+        </p>
+      </description>
+    </release>
     <release version="0.7.1" date="2026-10-22">
       <description>
         <p>
