@@ -17,8 +17,12 @@ finish-args:
   - --device=dri
   # The app checks GitHub for new releases and the update notice should work here too.
   - --share=network
-  # Notes live in the user's own documents by default; allow the picker to see them.
+  # Notes live in the user's own documents by default, so the sandbox has to show the real
+  # folder. `xdg-documents` is empty on systems without an XDG user-dirs file (a plain NixOS
+  # install, for one), which would leave the app staring at a throwaway home directory, so the
+  # folder the app actually defaults to is granted by name as well.
   - --filesystem=xdg-documents
+  - --filesystem=~/Documents
   - --filesystem=xdg-download
   # The launcher runs the app from a writable copy here so in-app updates are possible at all;
   # /app itself stays read-only.

@@ -25,6 +25,16 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.7.7" date="2026-10-22">
+      <description>
+        <p>
+          The Flatpak now includes the home Documents folder by name, because the XDG
+          documents directory points at nothing on systems without a user-dirs file, which
+          left the app with an empty, temporary home instead of the notes in
+          Documents/EloraNotes.
+        </p>
+      </description>
+    </release>
     <release version="0.7.6" date="2026-10-22">
       <description>
         <p>
