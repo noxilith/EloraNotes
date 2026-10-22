@@ -20,8 +20,12 @@ use std::f32::consts::TAU;
 use std::time::{Duration, Instant};
 
 /// The sidebar keeps this width instead of being drag-resizable, so the note list
-/// and the editor stop shifting around while the window is resized.
-const SIDEBAR_WIDTH: f32 = 305.0;
+/// and the editor stop shifting around while the window is resized. It only has to fit
+/// the logo, title and New button now that the other actions live in the footer.
+const SIDEBAR_WIDTH: f32 = 210.0;
+
+/// Height kept free at the bottom of the sidebar for the footer action row.
+const SIDEBAR_FOOTER_HEIGHT: f32 = 34.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditorViewMode {
@@ -1402,76 +1406,6 @@ impl EloraApp {
                 if new_btn.clicked() {
                     self.create_note_from_template(NoteTemplate::Blank);
                 }
-
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new(icon::CALENDAR_EVENT)
-                                .size(15.0)
-                                .color(p.fg_secondary),
-                        )
-                        .frame(false),
-                    )
-                    .on_hover_text("Open Today's Daily Note (Ctrl+D)")
-                    .clicked()
-                {
-                    self.open_or_create_daily_note();
-                }
-
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new(icon::COMMAND)
-                                .size(15.0)
-                                .color(p.fg_secondary),
-                        )
-                        .frame(false),
-                    )
-                    .on_hover_text("Command Palette & Quick Switcher (Ctrl+K)")
-                    .clicked()
-                {
-                    self.command_palette_open = true;
-                    self.command_palette_query.clear();
-                    self.focus_palette_next_frame = true;
-                }
-
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new(icon::SETTINGS)
-                                .size(15.0)
-                                .color(p.fg_secondary),
-                        )
-                        .frame(false),
-                    )
-                    .on_hover_text("Settings (Ctrl+,)")
-                    .clicked()
-                {
-                    self.show_settings = true;
-                }
-
-                let theme_glyph = if self.theme.is_dark() {
-                    icon::SUN
-                } else {
-                    icon::MOON
-                };
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new(theme_glyph).size(15.0).color(p.fg_secondary),
-                        )
-                        .frame(false),
-                    )
-                    .on_hover_text(format!(
-                        "Theme: {} (Click to cycle Obsidian / Paper / Nordic / Matcha)",
-                        self.theme.name()
-                    ))
-                    .clicked()
-                {
-                    self.theme = self.theme.next();
-                    self.apply_look(ui.ctx());
-                    self.persist_settings();
-                }
             });
         });
 
@@ -1486,13 +1420,15 @@ impl EloraApp {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(icon::SEARCH).color(p.fg_muted).size(14.5));
-                    let resp = ui.add(
-                        TextEdit::singleline(&mut self.search_query)
-                            .id(search_id)
-                            .hint_text("Search notes or #tags… (Ctrl+F)")
-                            .frame(false)
-                            .desired_width(f32::INFINITY),
-                    );
+                    let resp = ui
+                        .add(
+                            TextEdit::singleline(&mut self.search_query)
+                                .id(search_id)
+                                .hint_text("Search notes…")
+                                .frame(false)
+                                .desired_width(f32::INFINITY),
+                        )
+                        .on_hover_text("Search notes or #tags (Ctrl+F)");
                     if self.focus_search_next_frame {
                         resp.request_focus();
                         self.focus_search_next_frame = false;
@@ -1519,7 +1455,7 @@ impl EloraApp {
         let pinned_count = self.notes.iter().filter(|n| !n.trashed && n.pinned).count();
         let trash_count = self.notes.iter().filter(|n| n.trashed).count();
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
             if nav_pill(
                 ui,
@@ -1569,19 +1505,9 @@ impl EloraApp {
         let all_tags = self.all_tags_with_counts();
         if !all_tags.is_empty() && self.sidebar_section != SidebarSection::Trash {
             ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = Vec2::new(5.0, 4.0);
-                for (tag, count) in all_tags {
-                    let is_active = self.active_tag.as_deref() == Some(tag.as_str());
-                    let label = format!("{} {tag}", icon::HASH);
-                    if filter_chip(ui, &label, count, is_active, p).clicked() {
-                        if is_active {
-                            self.active_tag = None;
-                        } else {
-                            self.active_tag = Some(tag);
-                        }
-                    }
-                }
+            ui.scope(|ui| {
+                ui.set_max_width((ui.available_width() - 6.0).max(80.0));
+                tag_filter_menu(ui, p, &all_tags, &mut self.active_tag);
             });
         }
 
@@ -1589,6 +1515,92 @@ impl EloraApp {
         ui.separator();
         ui.add_space(4.0);
 
+        // Reserve room for the footer so the note list never scrolls under it.
+        let list_height = (ui.available_height() - SIDEBAR_FOOTER_HEIGHT).max(80.0);
+        self.render_sidebar_notes(ui, p, list_height);
+
+        ui.add_space(2.0);
+        ui.separator();
+        ui.add_space(3.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let theme_glyph = if self.theme.is_dark() {
+                    icon::SUN
+                } else {
+                    icon::MOON
+                };
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(theme_glyph).size(15.0).color(p.fg_secondary),
+                        )
+                        .frame(false),
+                    )
+                    .on_hover_text(format!(
+                        "Theme: {} (Click to cycle Obsidian / Paper / Nordic / Matcha)",
+                        self.theme.name()
+                    ))
+                    .clicked()
+                {
+                    self.theme = self.theme.next();
+                    self.apply_look(ui.ctx());
+                    self.persist_settings();
+                }
+
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(icon::SETTINGS)
+                                .size(15.0)
+                                .color(p.fg_secondary),
+                        )
+                        .frame(false),
+                    )
+                    .on_hover_text("Settings (Ctrl+,)")
+                    .clicked()
+                {
+                    self.show_settings = true;
+                }
+
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(icon::COMMAND)
+                                .size(15.0)
+                                .color(p.fg_secondary),
+                        )
+                        .frame(false),
+                    )
+                    .on_hover_text("Command Palette & Quick Switcher (Ctrl+K)")
+                    .clicked()
+                {
+                    self.command_palette_open = true;
+                    self.command_palette_query.clear();
+                    self.focus_palette_next_frame = true;
+                }
+
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(icon::CALENDAR_EVENT)
+                                .size(15.0)
+                                .color(p.fg_secondary),
+                        )
+                        .frame(false),
+                    )
+                    .on_hover_text("Open Today's Daily Note (Ctrl+D)")
+                    .clicked()
+                {
+                    self.open_or_create_daily_note();
+                }
+            });
+        });
+        ui.add_space(2.0);
+    }
+
+    /// The scrollable note list: pinned notes, folder groups, unfiled notes, then trash.
+    fn render_sidebar_notes(&mut self, ui: &mut Ui, p: &Palette, max_height: f32) {
         let filtered = self.filtered_indices();
         if filtered.is_empty() {
             ui.add_space(28.0);
@@ -1651,6 +1663,7 @@ impl EloraApp {
 
         ScrollArea::vertical()
             .id_salt("notes_sidebar_scroll")
+            .max_height(max_height)
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if !pinned_indices.is_empty() {
@@ -2877,6 +2890,16 @@ impl EloraApp {
 }
 
 impl eframe::App for EloraApp {
+    /// eframe clears the window with a translucent near-black by default, which shows up as a
+    /// lighter strip wherever the panels have not painted yet. Clear with the theme's canvas
+    /// colour instead so such places are indistinguishable from the note background.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        self.theme
+            .palette_with(&self.colors, self.glow_strength)
+            .bg_canvas
+            .to_normalized_gamma_f32()
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_shortcuts(ctx);
         self.settings_window(ctx);
@@ -2929,25 +2952,45 @@ impl eframe::App for EloraApp {
             });
 
         if !self.focus_mode {
-            egui::SidePanel::left("elora_sidebar")
+            let sidebar = egui::SidePanel::left("elora_sidebar")
                 .resizable(false)
                 .exact_width(SIDEBAR_WIDTH)
+                // The divider is painted inside the panel below instead of as a frame stroke:
+                // a stroke straddles the panel boundary, which at fractional display scales
+                // leaves a canvas-coloured pixel between the fill and the line.
                 .frame(
                     Frame::new()
                         .fill(p.bg_sidebar)
-                        .stroke(Stroke::new(1.0_f32, p.border))
                         .inner_margin(Margin::symmetric(12, 10)),
                 )
                 .show(ctx, |ui| {
                     self.render_sidebar(ui, &p);
                 });
+            let rect = sidebar.response.rect;
+            let ppp = ctx.pixels_per_point();
+            let right = (rect.right() * ppp).round() / ppp;
+            ctx.layer_painter(egui::LayerId::background()).rect_filled(
+                egui::Rect::from_min_max(
+                    Pos2::new(right - 1.0 / ppp, rect.top()),
+                    Pos2::new(right, rect.bottom()),
+                ),
+                0.0,
+                p.border,
+            );
         }
 
         egui::CentralPanel::default()
             .frame(
                 Frame::new()
                     .fill(p.bg_canvas)
-                    .inner_margin(Margin::symmetric(28, 18)),
+                    // Keep the note area close to the sidebar: a wide left inset reads as an
+                    // empty gap between the note list and the note itself.
+                    .inner_margin(Margin {
+                        left: 0,
+                        right: 28,
+                        top: 18,
+                        bottom: 18,
+                    }),
             )
             .show(ctx, |ui| {
                 let max_width = if self.focus_mode {
@@ -2999,24 +3042,65 @@ fn nav_pill(
     )
 }
 
-fn filter_chip(
+/// One dropdown that holds every tag filter. A wrapping row of tag chips grew with each new
+/// tag, pushing the note list down and changing the sidebar's height as notes were edited.
+/// This keeps the row at a single line no matter how many tags exist.
+fn tag_filter_menu(
     ui: &mut Ui,
-    label: &str,
-    count: usize,
-    active: bool,
     p: &Palette,
-) -> egui::Response {
-    let text = format!("{label} ({count})");
+    tags: &[(String, usize)],
+    active_tag: &mut Option<String>,
+) {
+    let active = active_tag.is_some();
+    let label = match active_tag.as_deref() {
+        Some(tag) => format!("{} {}", icon::HASH, short_tag(tag, 16)),
+        None => format!("{} Filter", icon::ADJUSTMENTS),
+    };
     let fg = if active { p.accent } else { p.fg_secondary };
-    let bg = if active { p.accent_soft } else { p.bg_elevated };
-    let border = if active { p.accent } else { p.border };
 
-    ui.add(
-        egui::Button::new(RichText::new(text).size(11.0).color(fg))
-            .fill(bg)
-            .stroke(Stroke::new(1.0_f32, border))
-            .corner_radius(CornerRadius::same(12)),
-    )
+    egui::ComboBox::from_id_salt("sidebar_tag_filter")
+        .selected_text(RichText::new(label).size(11.0).color(fg))
+        .width(ui.available_width())
+        // Keep the menu open while the list is scrolled; a click inside simply picks a tag.
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show_ui(ui, |ui| {
+            let mut picked: Option<Option<String>> = None;
+            if ui
+                .selectable_label(!active, RichText::new("All notes").size(11.5))
+                .clicked()
+            {
+                picked = Some(None);
+            }
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .max_height(260.0)
+                .show(ui, |ui| {
+                    for (tag, count) in tags {
+                        let selected = active_tag.as_deref() == Some(tag.as_str());
+                        let text = format!("{} {tag}  ({count})", icon::HASH);
+                        if ui
+                            .selectable_label(selected, RichText::new(text).size(11.5))
+                            .clicked()
+                        {
+                            picked = Some(if selected { None } else { Some(tag.clone()) });
+                        }
+                    }
+                });
+            if let Some(choice) = picked {
+                *active_tag = choice;
+                ui.memory_mut(|mem| mem.close_popup());
+            }
+        });
+}
+
+/// A long tag is elided so the filter button always stays inside the sidebar width.
+fn short_tag(tag: &str, max_chars: usize) -> String {
+    if tag.chars().count() <= max_chars {
+        return tag.to_string();
+    }
+    let mut elided: String = tag.chars().take(max_chars.saturating_sub(1)).collect();
+    elided.push('…');
+    elided
 }
 
 /// A small all-caps heading above a group of note cards.
@@ -3122,6 +3206,8 @@ fn render_note_card(
         .corner_radius(CornerRadius::same(7))
         .inner_margin(Margin::symmetric(10, 6))
         .show(ui, |ui| {
+            // Inside the frame `available_width` already excludes the frame's own margins,
+            // so the card fills the list exactly instead of leaving a strip on its right.
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 2.0;
             ui.horizontal(|ui| {
