@@ -40,9 +40,27 @@ stage="$work/src"
 mkdir -p "$stage"
 cp "$manifest_src" "$stage/"
 install -m755 "$binary" "$stage/elora"
+# Read by the launcher to decide whether an installed copy is out of date.
+printf '%s\n' "$version" > "$stage/version"
 install -m755 packaging/flatpak/elora-launcher.sh "$stage/elora-launcher"
 install -m644 packaging/linux/$app_id.desktop "$stage/$app_id.desktop"
-install -m644 packaging/linux/elora-notes.metainfo.xml "$stage/elora-notes.metainfo.xml"
+# Software centres and `flatpak info` read the version from the newest AppStream <release>
+# entry, and the repository only gets that entry once the release notes are written. Derive it
+# here instead, so an installed bundle always reports the version it was built from.
+today=$(date -u +%Y-%m-%d)
+if grep -q "<release version=\"$version\"" packaging/linux/elora-notes.metainfo.xml; then
+  install -m644 packaging/linux/elora-notes.metainfo.xml "$stage/elora-notes.metainfo.xml"
+else
+  awk -v version="$version" -v date="$today" '
+    { print }
+    !added && /<releases>/ {
+      printf "    <release version=\"%s\" date=\"%s\">\n", version, date
+      printf "      <description>\n        <p>See the release notes for %s on GitHub.</p>\n      </description>\n", version
+      print "    </release>"
+      added = 1
+    }
+  ' packaging/linux/elora-notes.metainfo.xml > "$stage/elora-notes.metainfo.xml"
+fi
 install -m644 assets/icons/elora-notes-256.png "$stage/$app_id-256.png"
 install -m644 assets/icons/elora-notes-512.png "$stage/$app_id-512.png"
 

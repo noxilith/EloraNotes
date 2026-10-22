@@ -43,17 +43,17 @@ Every release ships an installer and a portable build per platform.
 The Flatpak is the installable build: it appears in your app menu and updates itself from this repository's releases like every other build.
 
 ```bash
-flatpak install --user ./EloraNotes-0.7.4-linux-x86_64.flatpak
+flatpak install --user ./EloraNotes-<version>-linux-x86_64.flatpak
 flatpak run io.github.noxilith.EloraNotes
 ```
 
-The bundle is self-hosted rather than published to Flathub, so there is no remote for `flatpak update` to pull from — that command will always say there is nothing to do. Updates arrive through the app's own **Update and restart** instead (the sandbox ships a launcher that runs a writable copy of the binary in `~/.local/share/EloraNotes`). To move to a newer bundle by hand anyway, download it and run the same `flatpak install --user` command again.
+The bundle is self-hosted rather than published to Flathub, so there is no remote for `flatpak update` to pull from — that command will always say there is nothing to do. Updates arrive through the app's own **Update and restart** instead (the sandbox ships a launcher that runs a writable copy of the binary in `~/.local/share/EloraNotes`). To move to a newer bundle by hand anyway, download it and run the same `flatpak install --user` command again; the launcher swaps the writable copy for the one in the new bundle, so the version you install is the version that runs.
 
 The AppImage is the portable build — a single file you can keep anywhere:
 
 ```bash
-chmod +x EloraNotes-0.7.0-linux-x86_64.AppImage
-./EloraNotes-0.7.0-linux-x86_64.AppImage
+chmod +x EloraNotes-<version>-linux-x86_64.AppImage
+./EloraNotes-<version>-linux-x86_64.AppImage
 ```
 
 The tarball holds the bare `elora` binary for people who prefer to place it on their `PATH`:

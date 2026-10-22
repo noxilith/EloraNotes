@@ -28,6 +28,9 @@ modules:
     buildsystem: simple
     build-commands:
       - install -Dm755 elora /app/lib/eloranotes/elora
+      # The launcher compares this with the copy it last installed, so a newer bundle replaces
+      # the copy the sandbox starts instead of being ignored.
+      - install -Dm644 version /app/lib/eloranotes/version
       - install -Dm755 elora-launcher /app/bin/elora
       - install -Dm644 io.github.noxilith.EloraNotes.desktop
         /app/share/applications/io.github.noxilith.EloraNotes.desktop
@@ -40,6 +43,8 @@ modules:
     sources:
       - type: file
         path: elora
+      - type: file
+        path: version
       - type: file
         path: elora-launcher
       - type: file
