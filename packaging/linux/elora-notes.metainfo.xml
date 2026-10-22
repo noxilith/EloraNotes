@@ -25,6 +25,14 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.7.4" date="2026-10-22">
+      <description>
+        <p>
+          The Flatpak now updates itself like every other build, and Settings gained an
+          Updates section that checks on demand and installs the result.
+        </p>
+      </description>
+    </release>
     <release version="0.7.3" date="2026-10-22">
       <description>
         <p>
