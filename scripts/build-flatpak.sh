@@ -47,7 +47,10 @@ install -m644 assets/icons/elora-notes-512.png "$stage/$app_id-512.png"
 repo="$work/repo"
 build="$work/build"
 # --disable-rofiles-fuse keeps this working inside CI containers without /dev/fuse.
-flatpak-builder --force-clean --disable-rofiles-fuse --repo="$repo" "$build" "$stage/$app_id.yml"
+# flatpak-builder insists that its state directory lives on the same filesystem as the build
+# directory, and /tmp is a separate one on CI runners.
+flatpak-builder --force-clean --disable-rofiles-fuse \
+  --state-dir="$work/state" --repo="$repo" "$build" "$stage/$app_id.yml"
 
 mkdir -p "$outdir"
 bundle="$outdir/EloraNotes-$version-linux-x86_64.flatpak"
