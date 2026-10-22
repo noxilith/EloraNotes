@@ -120,6 +120,9 @@ pub struct EloraApp {
     /// Result channel for the update check and download running on worker threads.
     update_rx: Option<Receiver<UpdateEvent>>,
     update_state: UpdateState,
+    /// True while the check was started from Settings: the result belongs in that window
+    /// rather than in a popup over the notes.
+    quiet_update: bool,
 }
 
 /// Messages from the update worker threads to the UI.
@@ -133,6 +136,8 @@ enum UpdateEvent {
 enum UpdateState {
     Idle,
     Checking,
+    /// A check started from Settings found nothing newer.
+    UpToDate,
     Available(UpdateOffer),
     Downloading(Release),
     /// A newer release exists but a package manager owns this copy, so there is nothing to
@@ -288,8 +293,9 @@ impl EloraApp {
             status_until: 0.0,
             update_rx: None,
             update_state: UpdateState::Idle,
+            quiet_update: false,
         };
-        app.start_update_check(&cc.egui_ctx);
+        app.start_update_check(&cc.egui_ctx, false);
         app
     }
 
@@ -360,12 +366,14 @@ impl EloraApp {
         ctx.request_repaint_after(Duration::from_secs_f32(remaining as f32));
     }
 
-    /// Kicks off the launch-time version check on a worker thread so the first frame does not
-    /// wait for GitHub.
-    fn start_update_check(&mut self, ctx: &egui::Context) {
+    /// Kicks off a version check on a worker thread so the frame does not wait for GitHub.
+    /// `quiet` is set when Settings asked for it: the outcome is reported there instead of in a
+    /// popup, and "already current" is worth saying because the user asked.
+    fn start_update_check(&mut self, ctx: &egui::Context, quiet: bool) {
         update::cleanup_stale_updates();
         let (tx, rx) = mpsc::channel();
         self.update_rx = Some(rx);
+        self.quiet_update = quiet;
         self.update_state = UpdateState::Checking;
         let ctx = ctx.clone();
         std::thread::spawn(move || {
@@ -424,10 +432,22 @@ impl EloraApp {
                     self.update_state = UpdateState::Available(offer);
                 }
                 // Offline, rate-limited, already current, or no binary for this platform:
-                // there is nothing worth interrupting the user for.
-                UpdateEvent::Checked(_) => {
+                // there is nothing worth interrupting the user for unless they asked.
+                UpdateEvent::Checked(Ok(None)) => {
                     self.update_rx = None;
-                    self.update_state = UpdateState::Idle;
+                    self.update_state = if self.quiet_update {
+                        UpdateState::UpToDate
+                    } else {
+                        UpdateState::Idle
+                    };
+                }
+                UpdateEvent::Checked(Err(error)) => {
+                    self.update_rx = None;
+                    self.update_state = if self.quiet_update {
+                        UpdateState::Error(error)
+                    } else {
+                        UpdateState::Idle
+                    };
                 }
                 UpdateEvent::Staged(Ok(staged)) => {
                     self.update_rx = None;
@@ -449,7 +469,10 @@ impl EloraApp {
     fn update_window(&mut self, ctx: &egui::Context, p: &Palette) {
         let state = self.update_state.clone();
         match state {
-            UpdateState::Idle | UpdateState::Checking => {}
+            UpdateState::Idle | UpdateState::UpToDate | UpdateState::Checking => {}
+            // A check from Settings keeps its result in that window, so nothing pops up over the
+            // note the user is reading.
+            UpdateState::Available(_) if self.quiet_update => {}
             UpdateState::Available(offer) => match offer {
                 UpdateOffer::SelfUpdate(release) => {
                     let mut choice = None;
@@ -754,6 +777,10 @@ impl EloraApp {
                             });
                         ui.separator();
 
+                        ui.label(RichText::new("Updates").strong());
+                        self.update_settings_row(ui, &defaults);
+                        ui.separator();
+
                         if ui
                             .button(format!("{}  Reset all settings to defaults", icon::RESTORE))
                             .clicked()
@@ -776,6 +803,124 @@ impl EloraApp {
         if changed {
             self.apply_look(ctx);
             self.persist_settings();
+        }
+    }
+
+    /// The update section of Settings: what is running, what the last check found, and the one
+    /// button that acts on it. Everything the launch prompt can do is reachable from here too.
+    fn update_settings_row(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let ctx = ui.ctx().clone();
+        let mut check = false;
+        let mut install: Option<Release> = None;
+
+        ui.label(
+            RichText::new(format!(
+                "You are running EloraNotes {}.",
+                update::CURRENT_VERSION
+            ))
+            .size(11.5)
+            .color(p.fg_muted),
+        );
+
+        match self.update_state.clone() {
+            UpdateState::Checking => {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(12.0));
+                    ui.label(RichText::new("Checking for updates…").size(11.5));
+                });
+            }
+            UpdateState::Downloading(release) => {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(12.0));
+                    ui.label(RichText::new(format!("Downloading {}…", release.version)).size(11.5));
+                });
+                ui.label(
+                    RichText::new("EloraNotes restarts itself when the download finishes.")
+                        .size(11.0)
+                        .color(p.fg_muted),
+                );
+            }
+            UpdateState::Available(UpdateOffer::SelfUpdate(release)) => {
+                ui.label(
+                    RichText::new(format!("EloraNotes {} is available.", release.version))
+                        .size(12.0)
+                        .strong(),
+                );
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(format!("{}  Update and restart", icon::DOWNLOAD))
+                                .size(12.0),
+                        )
+                        .fill(p.accent),
+                    )
+                    .clicked()
+                {
+                    install = Some(release);
+                }
+            }
+            UpdateState::Available(UpdateOffer::Managed { version, manager })
+            | UpdateState::Managed { version, manager } => {
+                ui.label(
+                    RichText::new(format!("EloraNotes {version} is available."))
+                        .size(12.0)
+                        .strong(),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "This copy was installed with {manager}, which owns its own files."
+                    ))
+                    .size(11.0)
+                    .color(p.fg_muted),
+                );
+                let command = format!(
+                    "flatpak install --reinstall ./EloraNotes-{version}-linux-x86_64.flatpak"
+                );
+                ui.label(RichText::new(&command).size(11.0).monospace());
+                if ui
+                    .small_button(format!("{}  Copy command", icon::COPY))
+                    .clicked()
+                {
+                    ui.ctx().copy_text(command);
+                    self.status_message = Some("Copied the update command".to_string());
+                }
+            }
+            UpdateState::UpToDate => {
+                ui.label(
+                    RichText::new(format!("{}  You're up to date.", icon::CHECK))
+                        .size(11.5)
+                        .color(p.fg_secondary),
+                );
+                if ui
+                    .small_button(format!("{}  Check again", icon::REFRESH))
+                    .clicked()
+                {
+                    check = true;
+                }
+            }
+            UpdateState::Error(message) => {
+                ui.label(RichText::new(message).size(11.5).color(p.danger));
+                if ui
+                    .small_button(format!("{}  Try again", icon::REFRESH))
+                    .clicked()
+                {
+                    check = true;
+                }
+            }
+            UpdateState::Idle => {
+                if ui
+                    .button(format!("{}  Check for updates", icon::REFRESH))
+                    .clicked()
+                {
+                    check = true;
+                }
+            }
+        }
+
+        if check {
+            self.start_update_check(&ctx, true);
+        } else if let Some(release) = install {
+            self.start_update_download(&ctx, release);
         }
     }
 

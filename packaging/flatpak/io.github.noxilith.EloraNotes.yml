@@ -20,11 +20,15 @@ finish-args:
   # Notes live in the user's own documents by default; allow the picker to see them.
   - --filesystem=xdg-documents
   - --filesystem=xdg-download
+  # The launcher runs the app from a writable copy here so in-app updates are possible at all;
+  # /app itself stays read-only.
+  - --filesystem=xdg-data/EloraNotes:create
 modules:
   - name: eloranotes
     buildsystem: simple
     build-commands:
-      - install -Dm755 elora /app/bin/elora
+      - install -Dm755 elora /app/lib/eloranotes/elora
+      - install -Dm755 elora-launcher /app/bin/elora
       - install -Dm644 io.github.noxilith.EloraNotes.desktop
         /app/share/applications/io.github.noxilith.EloraNotes.desktop
       - install -Dm644 elora-notes.metainfo.xml
@@ -36,6 +40,8 @@ modules:
     sources:
       - type: file
         path: elora
+      - type: file
+        path: elora-launcher
       - type: file
         path: io.github.noxilith.EloraNotes.desktop
       - type: file

@@ -3,8 +3,9 @@
 #
 #   scripts/build-flatpak.sh 0.7.0 [target/release/elora] [dist]
 #
-# Unlike the AppImage, a Flatpak is installed and updated by Flatpak itself, which is why the
-# app never replaces its own files when it finds itself inside the sandbox.
+# The bundle installs a launcher plus a read-only copy of the binary; the launcher runs the app
+# from $XDG_DATA_HOME/EloraNotes, which the sandbox keeps writable, so the app can still replace
+# itself when it updates.
 #
 # Requires flatpak-builder and the org.freedesktop Platform/Sdk for the runtime named in the
 # manifest:
@@ -39,6 +40,7 @@ stage="$work/src"
 mkdir -p "$stage"
 cp "$manifest_src" "$stage/"
 install -m755 "$binary" "$stage/elora"
+install -m755 packaging/flatpak/elora-launcher.sh "$stage/elora-launcher"
 install -m644 packaging/linux/$app_id.desktop "$stage/$app_id.desktop"
 install -m644 packaging/linux/elora-notes.metainfo.xml "$stage/elora-notes.metainfo.xml"
 install -m644 assets/icons/elora-notes-256.png "$stage/$app_id-256.png"

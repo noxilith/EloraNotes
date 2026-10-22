@@ -16,7 +16,7 @@ A calm, minimalistic cross-platform desktop notes application written in **Rust*
 - **Stackable Inline Formatting**: Markers nest, so `**==bold inside a glow==**`, `==**glow then bold**==`, `***==triple stack==***` and `{color:#4ECDFF}**colored bold**{/color}` each render as one run carrying several styles at once. Headings are drawn in the bold face and can carry highlights and text colors too.
 - **Collapsible Folders**: File any note into a folder from the header's folder menu (or type a new folder name there). Folders group the sidebar, show their note count, and fold shut with a click so the list takes less room. Fold state is remembered between runs. New notes join the folder of the note you had open.
 - **Compact Sidebar with One Filter Menu**: The sidebar is a fixed, narrow panel — only the accent **New** button shares the logo row, while the daily note, command palette and settings actions sit in a footer row at the bottom. The notes folder path and keyboard shortcuts are listed in Settings. Every tag filter lives in a single **Filter** dropdown with counts, so a growing tag list never pushes the note list down.
-- **Updates Itself from GitHub Releases**: On launch EloraNotes asks GitHub for the latest release. If one is newer it offers to download it, starts the downloaded build once to confirm it runs on this machine, then installs it the way this copy was installed and restarts. "Later" dismisses the prompt for that run, and a failed check (for example while offline) stays silent. A Flatpak copy is never touched by the updater; it points at `flatpak update` instead.
+- **Updates Itself from GitHub Releases**: On launch EloraNotes asks GitHub for the latest release. If one is newer it offers to download it, starts the downloaded build once to confirm it runs on this machine, then installs it the way this copy was installed and restarts. **Settings → Updates** has the same thing on demand: check, then **Update and restart**. "Later" dismisses the launch prompt for that run, and a failed launch-time check (for example while offline) stays silent.
 - **Plain Markdown on Disk**: Every note is stored as a portable `.md` file with lightweight YAML frontmatter (`title`, `folder`, `pinned`, `trashed`, `tags`, `icon`, `created_at`, `updated_at`).
 - **Command Palette & Quick Switcher (`Ctrl+K`)**: Fuzzy-jump to any note, create notes from templates, switch color themes, or toggle views without leaving the keyboard.
 - **Bi-Directional `[[Wiki Links]]` & Backlinks**: Reference other notes with `[[Note Title]]` or `[[Note Title|Alias]]`. Click any wiki-link in Preview/Split mode to jump to that note (or create it on the fly), and see all referencing notes in the **Linked from** footer.
@@ -40,12 +40,14 @@ Every release ships an installer and a portable build per platform.
 
 ### Linux
 
-The Flatpak is the installable build: it appears in your app menu and is updated by Flatpak itself.
+The Flatpak is the installable build: it appears in your app menu and updates itself from this repository's releases like every other build.
 
 ```bash
-flatpak install --user ./EloraNotes-0.7.0-linux-x86_64.flatpak
+flatpak install --user ./EloraNotes-0.7.4-linux-x86_64.flatpak
 flatpak run io.github.noxilith.EloraNotes
 ```
+
+The bundle is self-hosted rather than published to Flathub, so there is no remote for `flatpak update` to pull from — that command will always say there is nothing to do. Updates arrive through the app's own **Update and restart** instead (the sandbox ships a launcher that runs a writable copy of the binary in `~/.local/share/EloraNotes`). To move to a newer bundle by hand anyway, download it and run the same `flatpak install --user` command again.
 
 The AppImage is the portable build — a single file you can keep anywhere:
 
@@ -76,7 +78,8 @@ The builds are not notarised, so the first launch needs **right-click → Open**
 ### Uninstalling
 
 - **Linux (Flatpak):** `flatpak uninstall io.github.noxilith.EloraNotes`
-  (your notes stay in `~/Documents/EloraNotes`)
+  (your notes stay in `~/Documents/EloraNotes`; the updatable copy of the app lives in
+  `~/.local/share/EloraNotes` and can be deleted once the bundle is gone)
 - **Linux (AppImage/tarball):** delete the file
 - **Windows:** Settings → Apps → Installed apps → EloraNotes → Uninstall
 - **macOS:** drag `EloraNotes.app` from Applications to the Trash
@@ -91,7 +94,9 @@ On launch the app compares its version with the latest GitHub release and, when 
 - **Windows setup** — the new setup program runs silently over the old install, so shortcuts and the uninstall entry stay correct; the app restarts itself afterwards.
 - **macOS app bundle** — the new `EloraNotes.app` replaces the old one (which is moved aside and cleaned up on the next launch) and reopens.
 - **Portable exe / tarball binary** — only the executable is replaced, so it has to live in a writable folder.
-- **Flatpak** — the app never modifies its own files. The prompt names the command that installs the new bundle over the old one: `flatpak install --reinstall ./EloraNotes-<version>-linux-x86_64.flatpak`.
+- **Flatpak** — the bundle's launcher runs a copy of the app from `~/.local/share/EloraNotes`, which the sandbox keeps writable, so the update replaces that binary and restarts exactly like the portable build. The bundle itself (the sandbox and its icons) stays as installed; `flatpak update` has nothing to fetch because this bundle has no remote.
+
+**Settings → Updates** shows the version you are running, checks on demand and installs the result, so an update never has to wait for the next launch.
 
 ## Running From Source
 

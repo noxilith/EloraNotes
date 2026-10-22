@@ -4,7 +4,10 @@
 //! There are five shapes, and each one is replaced differently:
 //!
 //! * **AppImage** — the whole image file is swapped for the new image and started again.
-//! * **Flatpak** — the sandbox owns the files, so the app only points at `flatpak update`.
+//! * **Flatpak** — the bundle only ships a launcher and a read-only copy under `/app`; the app
+//!   runs from `~/.local/share/EloraNotes`, which the sandbox keeps writable, and replaces that
+//!   copy like a portable build. A copy still running straight from `/app` cannot touch itself,
+//!   so for that one the app points at `flatpak update` instead.
 //! * **Windows setup** (the Inno Setup wizard) — the new setup runs silently over the old
 //!   install, which keeps shortcuts and the uninstall entry up to date.
 //! * **macOS `.app`** — the downloaded bundle replaces the old one, which is renamed aside.
@@ -63,7 +66,7 @@ pub enum UpdateOffer {
 pub enum InstallKind {
     /// Running from an AppImage; `$APPIMAGE` points at the image file.
     AppImage(PathBuf),
-    /// Inside the Flatpak sandbox, where the runtime owns every file.
+    /// Inside the Flatpak sandbox running the read-only `/app` copy, which it cannot replace.
     Flatpak,
     /// Running from `EloraNotes.app/Contents/MacOS/elora`.
     MacBundle(PathBuf),
@@ -117,6 +120,19 @@ fn running_from_appdir() -> bool {
     )
 }
 
+/// True when Flatpak owns the running binary.
+///
+/// The bundle's launcher runs the app from `~/.local/share/EloraNotes`, which the sandbox keeps
+/// writable, so that copy replaces itself like a portable build. Only a binary still living in
+/// the read-only `/app` tree has to be updated by Flatpak itself.
+#[cfg(any(target_os = "linux", test))]
+fn flatpak_owns(exe: Option<PathBuf>) -> bool {
+    match exe {
+        Some(exe) => exe.starts_with("/app"),
+        None => true,
+    }
+}
+
 /// Detects how this copy was installed. Keeping the detection in one place means the asset
 /// picker and the installer cannot disagree about what they are dealing with.
 pub fn install_kind() -> InstallKind {
@@ -127,7 +143,9 @@ pub fn install_kind() -> InstallKind {
                 return InstallKind::AppImage(image);
             }
         }
-        if Path::new("/.flatpak-info").exists() || std::env::var_os("FLATPAK_ID").is_some() {
+        let sandboxed =
+            Path::new("/.flatpak-info").exists() || std::env::var_os("FLATPAK_ID").is_some();
+        if sandboxed && flatpak_owns(std::env::current_exe().ok()) {
             return InstallKind::Flatpak;
         }
     }
@@ -903,6 +921,16 @@ mod tests {
             None,
             Some(PathBuf::from("/usr/local/bin/elora"))
         ));
+    }
+
+    #[test]
+    fn test_only_the_sandbox_copy_belongs_to_flatpak() {
+        assert!(flatpak_owns(Some(PathBuf::from("/app/bin/elora"))));
+        assert!(!flatpak_owns(Some(PathBuf::from(
+            "/home/me/.local/share/EloraNotes/elora"
+        ))));
+        // Without a resolvable executable there is no writable copy to replace.
+        assert!(flatpak_owns(None));
     }
 
     #[test]
