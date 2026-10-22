@@ -1,6 +1,6 @@
 [package]
 name = "elora-notes"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "EloraNotes — A calm, minimalistic cross-platform Markdown notes desktop app"
 authors = ["EloraNotes"]
@@ -22,3 +22,9 @@ chrono = { version = "0.4", features = ["serde"] }
 dirs = "6.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+ureq = { version = "2", default-features = false, features = ["tls"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
+
+[target."cfg(unix)".dependencies]
+flate2 = "1"
+tar = "0.4"

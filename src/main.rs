@@ -6,6 +6,7 @@ mod icons;
 mod markdown;
 mod storage;
 mod theme;
+mod update;
 
 use app::EloraApp;
 use std::path::PathBuf;
@@ -34,13 +35,21 @@ fn main() -> eframe::Result<()> {
     // vsync so they stay tear-free.
     let vsync = std::env::var_os("WAYLAND_DISPLAY").is_none();
 
+    let viewport = egui::ViewportBuilder::default()
+        .with_title("EloraNotes")
+        .with_app_id("elora-notes")
+        .with_inner_size([1060.0, 700.0])
+        .with_min_inner_size([640.0, 420.0]);
+    // Windows and macOS take the taskbar icon from the running window; the Linux builds also
+    // install a .desktop file and hicolor icons, which is what compositors look up by app id.
+    let viewport = match window_icon() {
+        Some(icon) => viewport.with_icon(icon),
+        None => viewport,
+    };
+
     let native_options = eframe::NativeOptions {
         vsync,
-        viewport: egui::ViewportBuilder::default()
-            .with_title("EloraNotes")
-            .with_app_id("elora-notes")
-            .with_inner_size([1060.0, 700.0])
-            .with_min_inner_size([640.0, 420.0]),
+        viewport,
         ..Default::default()
     };
 
@@ -49,6 +58,27 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(|cc| Ok(Box::new(EloraApp::new(cc, storage)))),
     )
+}
+
+/// The EloraNotes mark, generated into `assets/icons/` by `scripts/make-icons.py` and
+/// embedded as raw RGBA so the app needs no image decoder at runtime.
+#[cfg(has_window_icon)]
+fn window_icon() -> Option<egui::IconData> {
+    const EDGE: usize = 256;
+    const RGBA: &[u8] = include_bytes!("../assets/icons/window-icon-256.rgba");
+    if RGBA.len() != EDGE * EDGE * 4 {
+        return None;
+    }
+    Some(egui::IconData {
+        rgba: RGBA.to_vec(),
+        width: EDGE as u32,
+        height: EDGE as u32,
+    })
+}
+
+#[cfg(not(has_window_icon))]
+fn window_icon() -> Option<egui::IconData> {
+    None
 }
 
 fn parse_cli_dir() -> Option<PathBuf> {

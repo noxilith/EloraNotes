@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=EloraNotes
+GenericName=Markdown Notes
+Comment=A calm, minimalistic Markdown notes app
+Exec=elora %f
+Icon=io.github.noxilith.EloraNotes
+Terminal=false
+Categories=Office;
+Keywords=notes;markdown;editor;writing;
+StartupWMClass=elora-notes
+MimeType=text/markdown;

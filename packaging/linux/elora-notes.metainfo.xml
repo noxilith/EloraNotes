@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.noxilith.EloraNotes</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>EloraNotes</name>
+  <summary>A calm, minimalistic Markdown notes app</summary>
+  <developer id="io.github.noxilith">
+    <name>noxilith</name>
+  </developer>
+  <description>
+    <p>
+      EloraNotes is a quiet, keyboard-friendly home for Markdown notes: folders, tags,
+      wiki links and backlinks, a command palette, split editing with a live preview,
+      and a soft glow highlight for the text that matters.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.noxilith.EloraNotes.desktop</launchable>
+  <url type="homepage">https://github.com/noxilith/EloraNotes</url>
+  <url type="bugtracker">https://github.com/noxilith/EloraNotes/issues</url>
+  <url type="vcs-browser">https://github.com/noxilith/EloraNotes</url>
+  <content_rating type="oars-1.1" />
+  <categories>
+    <category>Office</category>
+    <category>Utility</category>
+  </categories>
+  <releases>
+    <release version="0.7.0" date="2026-10-22">
+      <description>
+        <p>
+          Packaging for every platform: AppImage, Flatpak, a Windows setup wizard,
+          a macOS app bundle and portable builds, plus an in-app updater that
+          understands each one.
+        </p>
+      </description>
+    </release>
+  </releases>
+</component>

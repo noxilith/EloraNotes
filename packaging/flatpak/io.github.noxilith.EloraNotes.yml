@@ -1,0 +1,46 @@
+# Flatpak manifest for the prebuilt release binary.
+#
+# The binary is built by the release workflow (inside an Ubuntu 22.04 container for a wide
+# glibc range) and this manifest only installs it, so no Rust toolchain is pulled into the
+# sandbox. `flatpak-builder` is run from the repository root after
+# `scripts/build-flatpak.sh` has staged the binary and icons next to this file.
+app-id: io.github.noxilith.EloraNotes
+runtime: org.freedesktop.Platform
+runtime-version: "25.08"
+sdk: org.freedesktop.Sdk
+command: elora
+finish-args:
+  # Wayland first, X11 as a fallback for older desktops.
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  - --device=dri
+  # The app checks GitHub for new releases and the update notice should work here too.
+  - --share=network
+  # Notes live in the user's own documents by default; allow the picker to see them.
+  - --filesystem=xdg-documents
+  - --filesystem=xdg-download
+modules:
+  - name: eloranotes
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 elora /app/bin/elora
+      - install -Dm644 io.github.noxilith.EloraNotes.desktop
+        /app/share/applications/io.github.noxilith.EloraNotes.desktop
+      - install -Dm644 elora-notes.metainfo.xml
+        /app/share/metainfo/io.github.noxilith.EloraNotes.metainfo.xml
+      - install -Dm644 io.github.noxilith.EloraNotes-256.png
+        /app/share/icons/hicolor/256x256/apps/io.github.noxilith.EloraNotes.png
+      - install -Dm644 io.github.noxilith.EloraNotes-512.png
+        /app/share/icons/hicolor/512x512/apps/io.github.noxilith.EloraNotes.png
+    sources:
+      - type: file
+        path: elora
+      - type: file
+        path: io.github.noxilith.EloraNotes.desktop
+      - type: file
+        path: elora-notes.metainfo.xml
+      - type: file
+        path: io.github.noxilith.EloraNotes-256.png
+      - type: file
+        path: io.github.noxilith.EloraNotes-512.png

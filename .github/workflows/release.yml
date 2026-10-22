@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to build and attach binaries to (e.g. v0.1.0)"
+        description: "Release tag to build and attach binaries to (e.g. v0.7.0)"
         required: true
         type: string
   push:
@@ -15,56 +15,167 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            name: linux-x86_64
-          - os: windows-latest
-            name: windows-x86_64
-          - os: macos-latest
-            name: macos-arm64
-    runs-on: ${{ matrix.os }}
+  linux:
+    name: Linux (AppImage + portable tarball)
+    # An old Ubuntu keeps the binary's glibc requirement low, so the AppImage and tarball run
+    # on distributions that are a few years behind as well.
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Linux system libraries
-        if: runner.os == 'Linux'
+      - name: Install system libraries
         run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libgl-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl file pkg-config zlib1g-dev \
+            libxkbcommon-dev libwayland-dev libgl-dev libx11-dev libxcursor-dev \
+            libxi-dev libxrandr-dev
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve version
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
 
       - name: Build release binary
         run: cargo build --release --locked
 
-      - name: Package Linux and macOS binaries
-        if: runner.os != 'Windows'
+      - name: Package portable tarball
         run: |
           mkdir -p dist
-          tar -C target/release -czf dist/elora-notes-${{ matrix.name }}.tar.gz elora
+          tar -C target/release -czf "dist/EloraNotes-$VERSION-linux-x86_64.tar.gz" elora
 
-      - name: Package Windows binary
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          mkdir -p dist
-          cp target/release/elora.exe dist/elora-notes-${{ matrix.name }}.exe
+      - name: Build AppImage
+        run: scripts/build-appimage.sh "$VERSION"
+
+      - name: Show what will be published
+        run: ls -l dist
 
       - uses: actions/upload-artifact@v4
         with:
-          name: elora-notes-${{ matrix.name }}
-          path: dist/*
+          name: linux
+          path: |
+            dist/EloraNotes-*-linux-x86_64.tar.gz
+            dist/EloraNotes-*-linux-x86_64.AppImage
 
-  attach:
-    needs: build
+  flatpak:
+    name: Linux (Flatpak installer)
     runs-on: ubuntu-latest
+    needs: linux
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux
+          path: dist
+
+      - name: Resolve version
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+
+      - name: Restore the release binary
+        run: |
+          mkdir -p target/release
+          tar -C target/release -xzf "dist/EloraNotes-$VERSION-linux-x86_64.tar.gz"
+
+      - name: Install flatpak and the freedesktop runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+          sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+          sudo flatpak install --noninteractive -y flathub \
+            org.freedesktop.Platform//25.08 org.freedesktop.Sdk//25.08
+
+      - name: Build the bundle
+        run: scripts/build-flatpak.sh "$VERSION"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flatpak
+          path: dist/EloraNotes-*-linux-x86_64.flatpak
+
+  windows:
+    name: Windows (setup wizard + portable exe)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve version
+        shell: bash
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package portable exe
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/elora.exe "dist/EloraNotes-$VERSION-windows-x86_64-portable.exe"
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build the setup wizard
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
+            "/DAppVersion=$env:VERSION" `
+            "packaging\windows\elora-notes.iss"
+
+      - name: Show what will be published
+        shell: bash
+        run: ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/EloraNotes-*-windows-x86_64-*.exe
+
+  macos:
+    name: macOS (dmg + portable app)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve version
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package app bundle, zip and dmg
+        run: |
+          chmod +x scripts/build-macos-app.sh
+          scripts/build-macos-app.sh "$VERSION"
+
+      - name: Show what will be published
+        run: ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: |
+            dist/EloraNotes-*-macos-arm64.zip
+            dist/EloraNotes-*-macos-arm64.dmg
+
+  attach:
+    name: Attach to the release
+    runs-on: ubuntu-latest
+    needs: [linux, flatpak, windows, macos]
+    steps:
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -74,6 +185,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag || github.ref_name }}
+          REPO: ${{ github.repository }}
         run: |
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --generate-notes
-          gh release upload "$TAG" dist/* --clobber
+          gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 \
+            || gh release create "$TAG" --repo "$REPO" --title "EloraNotes ${TAG#v}" \
+                 --notes "EloraNotes ${TAG#v} — AppImage, Flatpak, Windows setup wizard, macOS disk image and portable builds for every platform."
+          gh release upload "$TAG" dist/* --repo "$REPO" --clobber

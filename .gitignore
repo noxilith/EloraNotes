@@ -24,3 +24,9 @@ Thumbs.db
 # Local configuration
 config.local.toml
 
+
+# Packaging tools downloaded on demand
+/.tools/
+
+# Release artifacts
+/dist/

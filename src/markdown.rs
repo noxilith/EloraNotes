@@ -371,6 +371,24 @@ fn styled_span(text: String, style: SpanStyle) -> InlineSpan {
     }
 }
 
+/// Starts a new line in a wrapping row when `width` does not fit at the end of the current one.
+///
+/// `horizontal_wrapped` breaks lines from the width a widget reports up front. A chip that sizes
+/// itself from the space left on the line therefore shrinks into that space (or overhangs it)
+/// instead of moving down, so chips are measured here and the line is broken before them.
+fn break_line_if_needed(ui: &mut Ui, width: f32) {
+    // Neither `available_width` nor `available_size_before_wrap` reports the space left on the
+    // line in a wrapping layout: both return the whole row. Measure from the cursor instead.
+    let row = ui.max_rect();
+    let cursor = ui.cursor().min.x;
+    let remaining = (row.right() - cursor).max(0.0);
+    // Only break when the line already has something on it; a chip wider than the whole row
+    // cannot be placed by starting a new line either.
+    if width > remaining && cursor > row.left() + 0.5 {
+        ui.add_space(remaining);
+    }
+}
+
 /// Renders parsed inline spans inside a `horizontal_wrapped` UI row, including glowing highlights
 /// and clickable `[[Wiki Links]]`.
 /// `bold` marks the line as a heading: its text is drawn in the bold face, and inline markers
@@ -470,6 +488,17 @@ pub fn render_inline_spans_ui(
                 }
             }
             InlineSpan::Code(s) => {
+                // A chip is a nested frame, and a wrapping row cannot move one to the next
+                // line. At the end of a line it used to be given the few remaining pixels as
+                // its width, so its label wrapped one character per row and the chip spilled
+                // out of the pane as a vertical stripe. Measure it first and break the line.
+                let code_width = ui.fonts(|fonts| {
+                    fonts
+                        .layout_no_wrap(s.clone(), FontId::monospace(font_size - 1.0), p.accent)
+                        .size()
+                        .x
+                }) + 14.0;
+                break_line_if_needed(ui, code_width);
                 ui.add_space(2.0);
                 egui::Frame::new()
                     .fill(p.bg_elevated)
@@ -477,11 +506,16 @@ pub fn render_inline_spans_ui(
                     .corner_radius(CornerRadius::same(4))
                     .inner_margin(Margin::symmetric(5, 1))
                     .show(ui, |ui| {
-                        ui.label(
-                            RichText::new(s)
-                                .monospace()
-                                .size(font_size - 1.0)
-                                .color(p.accent),
+                        // `extend` keeps the chip on one line even if it is wider than the
+                        // column, instead of stacking its characters.
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(s)
+                                    .monospace()
+                                    .size(font_size - 1.0)
+                                    .color(p.accent),
+                            )
+                            .extend(),
                         );
                     });
                 ui.add_space(2.0);
@@ -505,6 +539,17 @@ pub fn render_inline_spans_ui(
                 ui.label(RichText::new(tag).size(font_size).color(p.accent));
             }
             InlineSpan::WikiLink { target, display } => {
+                // A link chip is a button, so a wrapping row would keep it on the current line
+                // and let it overhang the pane. Measure it and start a new line when needed.
+                let label = format!("{} {display}", icon::LINK);
+                let chip_width = ui.fonts(|fonts| {
+                    fonts
+                        .layout_no_wrap(label, FontId::proportional(font_size - 0.5), p.accent)
+                        .size()
+                        .x
+                }) + 2.0 * ui.spacing().button_padding.x
+                    + 4.0;
+                break_line_if_needed(ui, chip_width);
                 ui.add_space(2.0);
                 if ui
                     .add(
@@ -614,6 +659,10 @@ pub fn render_glowing_highlight(
     let galley = ui
         .painter()
         .layout_job(styled_layout_job(text, font_size, style, text_col));
+
+    // A highlighted run is laid out by hand, so a wrapping row would not move it to the next
+    // line; break the line first when it does not fit.
+    break_line_if_needed(ui, galley.size().x);
 
     // Reserve only the text's own line box, so the highlight never adds height to the line.
     // The glow is painted outward from this box without taking up layout space.

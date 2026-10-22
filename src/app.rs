@@ -10,6 +10,7 @@ use crate::storage::{
     AppSettings, Note, NoteStorage, NoteTemplate,
 };
 use crate::theme::{ColorOverrides, Palette, ThemeMode};
+use crate::update::{self, Release, UpdateOffer};
 use chrono::{Local, Utc};
 use egui::{
     Align, Align2, Color32, CornerRadius, FontFamily, FontId, Frame, Id, Key, Layout, Margin, Pos2,
@@ -17,6 +18,8 @@ use egui::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::f32::consts::TAU;
+use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 /// The sidebar keeps this width instead of being drag-resizable, so the note list
@@ -26,6 +29,11 @@ const SIDEBAR_WIDTH: f32 = 210.0;
 
 /// Height kept free at the bottom of the sidebar for the footer action row.
 const SIDEBAR_FOOTER_HEIGHT: f32 = 34.0;
+
+/// Smallest gap between the window edge (or the sidebar) and the note column. The column is
+/// centred in wider windows and keeps at least this much air on both sides when it is not,
+/// so resizing never pushes the text against one edge.
+const NOTE_SIDE_MARGIN: f32 = 24.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditorViewMode {
@@ -98,6 +106,35 @@ pub struct EloraApp {
     focus_title_next_frame: bool,
     focus_palette_next_frame: bool,
     status_message: Option<String>,
+    /// Message currently shown in the transient toast, used to detect when a new one arrives.
+    status_shown: Option<String>,
+    /// Context time (seconds) at which the toast disappears.
+    status_until: f64,
+    /// Result channel for the update check and download running on worker threads.
+    update_rx: Option<Receiver<UpdateEvent>>,
+    update_state: UpdateState,
+}
+
+/// Messages from the update worker threads to the UI.
+enum UpdateEvent {
+    Checked(Result<Option<UpdateOffer>, String>),
+    Staged(Result<PathBuf, String>),
+}
+
+/// What the update prompt is currently showing.
+#[derive(Clone)]
+enum UpdateState {
+    Idle,
+    Checking,
+    Available(UpdateOffer),
+    Downloading(Release),
+    /// A newer release exists but a package manager owns this copy, so there is nothing to
+    /// download; the prompt only explains how to get it.
+    Managed {
+        version: String,
+        manager: &'static str,
+    },
+    Error(String),
 }
 
 /// One live note in the graph view. `links` holds indices of the notes it links to.
@@ -204,7 +241,7 @@ impl EloraApp {
         let notes = storage.load_all().unwrap_or_default();
         let selected_id = notes.iter().find(|n| !n.trashed).map(|n| n.id.clone());
 
-        Self {
+        let mut app = Self {
             storage,
             notes,
             selected_id,
@@ -240,7 +277,13 @@ impl EloraApp {
             focus_title_next_frame: false,
             focus_palette_next_frame: false,
             status_message: None,
-        }
+            status_shown: None,
+            status_until: 0.0,
+            update_rx: None,
+            update_state: UpdateState::Idle,
+        };
+        app.start_update_check(&cc.egui_ctx);
+        app
     }
 
     fn persist_settings(&self) {
@@ -262,6 +305,286 @@ impl EloraApp {
             .apply(ctx, &self.colors, self.font_size, self.glow_strength);
     }
 
+    /// Short-lived message in the lower-left corner, replacing the old permanent status bar.
+    /// Import/export results and auto-save errors still need somewhere to appear.
+    fn status_toast(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some(message) = self.status_message.clone() else {
+            return;
+        };
+        let now = ctx.input(|i| i.time);
+        if self.status_shown.as_deref() != Some(message.as_str()) {
+            self.status_shown = Some(message.clone());
+            self.status_until = now + 4.0;
+        }
+        let remaining = self.status_until - now;
+        if remaining <= 0.0 {
+            self.status_message = None;
+            self.status_shown = None;
+            return;
+        }
+
+        let lower = message.to_lowercase();
+        let is_problem =
+            lower.contains("error") || lower.contains("failed") || lower.contains("fail");
+        let toast_left = if self.focus_mode {
+            16.0
+        } else {
+            SIDEBAR_WIDTH + 16.0
+        };
+        egui::Area::new(egui::Id::new("elora_status_toast"))
+            .anchor(egui::Align2::LEFT_BOTTOM, Vec2::new(toast_left, -16.0))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .show(ctx, |ui| {
+                Frame::new()
+                    .fill(p.bg_elevated)
+                    .stroke(Stroke::new(1.0_f32, p.border))
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        let glyph = if is_problem { icon::X } else { icon::CHECK };
+                        ui.label(
+                            RichText::new(format!("{glyph} {message}"))
+                                .size(11.5)
+                                .color(if is_problem { p.danger } else { p.fg_secondary }),
+                        );
+                    });
+            });
+        ctx.request_repaint_after(Duration::from_secs_f32(remaining as f32));
+    }
+
+    /// Kicks off the launch-time version check on a worker thread so the first frame does not
+    /// wait for GitHub.
+    fn start_update_check(&mut self, ctx: &egui::Context) {
+        update::cleanup_stale_updates();
+        let (tx, rx) = mpsc::channel();
+        self.update_rx = Some(rx);
+        self.update_state = UpdateState::Checking;
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = update::check_for_update();
+            let _ = tx.send(UpdateEvent::Checked(result));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Downloads the release asset in the background; the binary is swapped in on the UI
+    /// thread once the file is ready.
+    fn start_update_download(&mut self, ctx: &egui::Context, release: Release) {
+        let (tx, rx) = mpsc::channel();
+        self.update_rx = Some(rx);
+        self.update_state = UpdateState::Downloading(release.clone());
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = update::stage_download(&release);
+            let _ = tx.send(UpdateEvent::Staged(result));
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_update(&mut self) {
+        let was_downloading = matches!(self.update_state, UpdateState::Downloading(_));
+        let mut events = Vec::new();
+        if let Some(rx) = &self.update_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    // Each worker sends one message and then hangs up, so a disconnect is
+                    // only a failure when nothing at all arrived.
+                    Err(TryRecvError::Disconnected) => {
+                        if events.is_empty() {
+                            events.push(if was_downloading {
+                                UpdateEvent::Staged(Err(
+                                    "The update download stopped unexpectedly.".to_string(),
+                                ))
+                            } else {
+                                UpdateEvent::Checked(Err(
+                                    "The update check stopped unexpectedly.".to_string()
+                                ))
+                            });
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        for event in events {
+            match event {
+                UpdateEvent::Checked(Ok(Some(offer))) => {
+                    self.update_rx = None;
+                    self.update_state = UpdateState::Available(offer);
+                }
+                // Offline, rate-limited, already current, or no binary for this platform:
+                // there is nothing worth interrupting the user for.
+                UpdateEvent::Checked(_) => {
+                    self.update_rx = None;
+                    self.update_state = UpdateState::Idle;
+                }
+                UpdateEvent::Staged(Ok(staged)) => {
+                    self.update_rx = None;
+                    match update::install_and_restart(&staged) {
+                        Ok(()) => std::process::exit(0),
+                        Err(error) => self.update_state = UpdateState::Error(error),
+                    }
+                }
+                UpdateEvent::Staged(Err(error)) => {
+                    self.update_rx = None;
+                    self.update_state = UpdateState::Error(error);
+                }
+            }
+        }
+    }
+
+    /// The launch-time prompt: update now (download, swap and restart) or dismiss it for this
+    /// run. Nothing is offered when the check failed or the running build is current.
+    fn update_window(&mut self, ctx: &egui::Context, p: &Palette) {
+        let state = self.update_state.clone();
+        match state {
+            UpdateState::Idle | UpdateState::Checking => {}
+            UpdateState::Available(offer) => match offer {
+                UpdateOffer::SelfUpdate(release) => {
+                    let mut choice = None;
+                    egui::Window::new("Update available")
+                        .id(Id::new("elora_update_window"))
+                        .collapsible(false)
+                        .resizable(false)
+                        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                        .show(ctx, |ui| {
+                            ui.set_min_width(320.0);
+                            ui.label(
+                                RichText::new(format!(
+                                    "EloraNotes {} is available",
+                                    release.version
+                                ))
+                                .size(14.0)
+                                .strong(),
+                            );
+                            ui.label(
+                                RichText::new(format!(
+                                    "You are running {}. Update and restart now?",
+                                    update::CURRENT_VERSION
+                                ))
+                                .size(12.0)
+                                .color(p.fg_secondary),
+                            );
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add(
+                                        egui::Button::new(RichText::new("Update now").size(12.5))
+                                            .fill(p.accent),
+                                    )
+                                    .clicked()
+                                {
+                                    choice = Some(true);
+                                }
+                                if ui.button("Later").clicked() {
+                                    choice = Some(false);
+                                }
+                            });
+                        });
+                    match choice {
+                        Some(true) => self.start_update_download(ctx, release),
+                        Some(false) => self.update_state = UpdateState::Idle,
+                        None => {}
+                    }
+                }
+                // Flatpak owns its own files: offering to replace them would fail after the
+                // download, so the prompt just points at the command that can.
+                UpdateOffer::Managed { version, manager } => {
+                    self.update_state = UpdateState::Managed { version, manager };
+                }
+            },
+            UpdateState::Managed { version, manager } => {
+                let mut dismiss = false;
+                egui::Window::new("Update available")
+                    .id(Id::new("elora_update_window"))
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .show(ctx, |ui| {
+                        ui.set_min_width(320.0);
+                        ui.label(
+                            RichText::new(format!("EloraNotes {version} is available"))
+                                .size(14.0)
+                                .strong(),
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "You are running {}.",
+                                update::CURRENT_VERSION
+                            ))
+                            .size(12.0)
+                            .color(p.fg_secondary),
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "This copy was installed with {manager}, which updates it itself. Run this in a terminal:"
+                            ))
+                            .size(11.5)
+                            .color(p.fg_muted),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "flatpak update {}",
+                                update::FLATPAK_APP_ID
+                            ))
+                            .size(11.5)
+                            .monospace(),
+                        );
+                        ui.add_space(8.0);
+                        if ui.button("Close").clicked() {
+                            dismiss = true;
+                        }
+                    });
+                if dismiss {
+                    self.update_state = UpdateState::Idle;
+                }
+            }
+            UpdateState::Downloading(release) => {
+                egui::Window::new("Updating EloraNotes")
+                    .id(Id::new("elora_update_window"))
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .show(ctx, |ui| {
+                        ui.set_min_width(320.0);
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Spinner::new().size(16.0));
+                            ui.label(format!("Downloading EloraNotes {}…", release.version));
+                        });
+                        ui.label(
+                            RichText::new("EloraNotes restarts itself when the download finishes.")
+                                .size(11.5)
+                                .color(p.fg_muted),
+                        );
+                    });
+            }
+            UpdateState::Error(message) => {
+                let mut dismiss = false;
+                egui::Window::new("Update failed")
+                    .id(Id::new("elora_update_window"))
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .show(ctx, |ui| {
+                        ui.set_min_width(320.0);
+                        ui.label(RichText::new(message).size(12.0).color(p.danger));
+                        ui.add_space(8.0);
+                        if ui.button("Close").clicked() {
+                            dismiss = true;
+                        }
+                    });
+                if dismiss {
+                    self.update_state = UpdateState::Idle;
+                }
+            }
+        }
+    }
+
     /// Settings window: theme, text size, color overrides, glow strength and layout toggles.
     fn settings_window(&mut self, ctx: &egui::Context) {
         if !self.show_settings {
@@ -275,90 +598,170 @@ impl EloraApp {
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
-            .default_width(340.0)
+            .default_width(380.0)
             .show(ctx, |ui| {
-                ui.label(RichText::new("Appearance").strong());
-                ui.horizontal_wrapped(|ui| {
-                    for t in [
-                        ThemeMode::Obsidian,
-                        ThemeMode::Paper,
-                        ThemeMode::Nordic,
-                        ThemeMode::Matcha,
-                        ThemeMode::Sepia,
-                        ThemeMode::Midnight,
-                        ThemeMode::Matugen,
-                    ] {
-                        if ui.selectable_label(self.theme == t, t.name()).clicked() {
-                            self.theme = t;
+                // The window now carries the notes folder and shortcut reference too, so
+                // it must scroll rather than run off the bottom of a short window.
+                let max_height = (ctx.screen_rect().height() - 160.0).max(240.0);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .max_height(max_height)
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Appearance").strong());
+                        ui.horizontal_wrapped(|ui| {
+                            for t in [
+                                ThemeMode::Obsidian,
+                                ThemeMode::Paper,
+                                ThemeMode::Nordic,
+                                ThemeMode::Matcha,
+                                ThemeMode::Sepia,
+                                ThemeMode::Midnight,
+                                ThemeMode::Matugen,
+                            ] {
+                                if ui.selectable_label(self.theme == t, t.name()).clicked() {
+                                    self.theme = t;
+                                    changed = true;
+                                }
+                            }
+                        });
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut self.font_size, 11.0..=22.0)
+                                    .text("Text size"),
+                            )
+                            .changed();
+                        ui.separator();
+
+                        ui.label(RichText::new("Colors").strong());
+                        ui.label("Tick a color to override the theme's default.");
+                        changed |= color_override_row(
+                            ui,
+                            "Background",
+                            &mut self.colors.bg,
+                            defaults.bg_canvas,
+                        );
+                        changed |= color_override_row(
+                            ui,
+                            "Sidebar",
+                            &mut self.colors.sidebar,
+                            defaults.bg_sidebar,
+                        );
+                        changed |= color_override_row(
+                            ui,
+                            "Text",
+                            &mut self.colors.fg,
+                            defaults.fg_primary,
+                        );
+                        changed |= color_override_row(
+                            ui,
+                            "Accent",
+                            &mut self.colors.accent,
+                            defaults.accent,
+                        );
+                        changed |=
+                            color_override_row(ui, "Pin", &mut self.colors.pin, defaults.pin_color);
+                        changed |= color_override_row(
+                            ui,
+                            "Muted text",
+                            &mut self.colors.fg_muted,
+                            defaults.fg_muted,
+                        );
+                        changed |= color_override_row(
+                            ui,
+                            "Borders",
+                            &mut self.colors.border,
+                            defaults.border,
+                        );
+                        changed |= color_override_row(
+                            ui,
+                            "Danger",
+                            &mut self.colors.danger,
+                            defaults.danger,
+                        );
+                        if ui.button("Reset colors to theme").clicked() {
+                            self.colors = Default::default();
                             changed = true;
                         }
-                    }
-                });
-                changed |= ui
-                    .add(egui::Slider::new(&mut self.font_size, 11.0..=22.0).text("Text size"))
-                    .changed();
-                ui.separator();
+                        ui.separator();
 
-                ui.label(RichText::new("Colors").strong());
-                ui.label("Tick a color to override the theme's default.");
-                changed |=
-                    color_override_row(ui, "Background", &mut self.colors.bg, defaults.bg_canvas);
-                changed |= color_override_row(
-                    ui,
-                    "Sidebar",
-                    &mut self.colors.sidebar,
-                    defaults.bg_sidebar,
-                );
-                changed |= color_override_row(ui, "Text", &mut self.colors.fg, defaults.fg_primary);
-                changed |=
-                    color_override_row(ui, "Accent", &mut self.colors.accent, defaults.accent);
-                changed |= color_override_row(ui, "Pin", &mut self.colors.pin, defaults.pin_color);
-                changed |= color_override_row(
-                    ui,
-                    "Muted text",
-                    &mut self.colors.fg_muted,
-                    defaults.fg_muted,
-                );
-                changed |=
-                    color_override_row(ui, "Borders", &mut self.colors.border, defaults.border);
-                changed |=
-                    color_override_row(ui, "Danger", &mut self.colors.danger, defaults.danger);
-                if ui.button("Reset colors to theme").clicked() {
-                    self.colors = Default::default();
-                    changed = true;
-                }
-                ui.separator();
+                        ui.label(RichText::new("Glow highlights").strong());
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut self.glow_strength, 0.0..=1.0)
+                                    .text("Glow strength"),
+                            )
+                            .changed();
+                        ui.horizontal(|ui| {
+                            ui.label("Default glow color");
+                            changed |= ui.color_edit_button_srgb(&mut self.highlight_rgb).changed();
+                        });
+                        ui.separator();
 
-                ui.label(RichText::new("Glow highlights").strong());
-                changed |= ui
-                    .add(
-                        egui::Slider::new(&mut self.glow_strength, 0.0..=1.0).text("Glow strength"),
-                    )
-                    .changed();
-                ui.horizontal(|ui| {
-                    ui.label("Default glow color");
-                    changed |= ui.color_edit_button_srgb(&mut self.highlight_rgb).changed();
-                });
-                ui.separator();
+                        changed |= ui
+                            .checkbox(&mut self.show_formatting_bar, "Show formatting bar")
+                            .changed();
+                        ui.separator();
 
-                changed |= ui
-                    .checkbox(&mut self.show_formatting_bar, "Show formatting bar")
-                    .changed();
-                ui.separator();
+                        ui.label(RichText::new("Notes folder").strong());
+                        let notes_dir = self.storage.root_dir().display().to_string();
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(notes_dir.clone())
+                                    .monospace()
+                                    .size(11.0)
+                                    .color(defaults.fg_muted),
+                            )
+                            .wrap(),
+                        );
+                        if ui
+                            .small_button(format!("{}  Copy path", icon::COPY))
+                            .clicked()
+                        {
+                            ui.ctx().copy_text(notes_dir);
+                            self.status_message = Some("Copied notes folder path".to_string());
+                        }
 
-                if ui
-                    .button(format!("{}  Reset all settings to defaults", icon::RESTORE))
-                    .clicked()
-                {
-                    let d = AppSettings::default();
-                    self.theme = ThemeMode::from_name(&d.theme_name);
-                    self.colors = d.colors;
-                    self.font_size = d.font_size;
-                    self.glow_strength = d.glow_strength;
-                    self.highlight_rgb = d.highlight_rgb;
-                    self.show_formatting_bar = d.show_formatting_bar;
-                    changed = true;
-                }
+                        ui.separator();
+
+                        ui.label(RichText::new("Shortcuts").strong());
+                        egui::Grid::new("elora_settings_shortcuts")
+                            .num_columns(2)
+                            .spacing([14.0, 4.0])
+                            .show(ui, |ui| {
+                                for (keys, action) in [
+                                    ("Right-click selection", "Format / glow highlight"),
+                                    ("Ctrl+B", "Bold"),
+                                    ("Ctrl+Shift+H", "Glow highlight"),
+                                    ("Ctrl+K", "Command palette & quick switcher"),
+                                ] {
+                                    ui.label(
+                                        RichText::new(keys)
+                                            .monospace()
+                                            .size(11.0)
+                                            .color(defaults.fg_secondary),
+                                    );
+                                    ui.label(
+                                        RichText::new(action).size(11.5).color(defaults.fg_muted),
+                                    );
+                                    ui.end_row();
+                                }
+                            });
+                        ui.separator();
+
+                        if ui
+                            .button(format!("{}  Reset all settings to defaults", icon::RESTORE))
+                            .clicked()
+                        {
+                            let d = AppSettings::default();
+                            self.theme = ThemeMode::from_name(&d.theme_name);
+                            self.colors = d.colors;
+                            self.font_size = d.font_size;
+                            self.glow_strength = d.glow_strength;
+                            self.highlight_rgb = d.highlight_rgb;
+                            self.show_formatting_bar = d.show_formatting_bar;
+                            changed = true;
+                        }
+                    });
             });
 
         if !open {
@@ -1525,29 +1928,6 @@ impl EloraApp {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let theme_glyph = if self.theme.is_dark() {
-                    icon::SUN
-                } else {
-                    icon::MOON
-                };
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new(theme_glyph).size(15.0).color(p.fg_secondary),
-                        )
-                        .frame(false),
-                    )
-                    .on_hover_text(format!(
-                        "Theme: {} (Click to cycle Obsidian / Paper / Nordic / Matcha)",
-                        self.theme.name()
-                    ))
-                    .clicked()
-                {
-                    self.theme = self.theme.next();
-                    self.apply_look(ui.ctx());
-                    self.persist_settings();
-                }
-
                 if ui
                     .add(
                         egui::Button::new(
@@ -2204,19 +2584,24 @@ impl EloraApp {
 
         // Top Minimal Action Bar with Tabler Icons
         ui.horizontal(|ui| {
+            // A narrow window cannot hold the labels, the folder picker and every action on
+            // one line, so below this width the buttons drop their text and the stats hide
+            // instead of drawing over each other.
+            let compact = ui.available_width() < 680.0;
             let (focus_icon, focus_label) = if self.focus_mode {
                 (icon::SIDEBAR_EXPAND, "Sidebar")
             } else {
                 (icon::SIDEBAR_COLLAPSE, "Focus")
             };
+            let focus_text = if compact {
+                focus_icon.to_string()
+            } else {
+                format!("{focus_icon} {focus_label}")
+            };
             if ui
                 .add(
-                    egui::Button::new(
-                        RichText::new(format!("{focus_icon} {focus_label}"))
-                            .size(12.5)
-                            .color(p.fg_secondary),
-                    )
-                    .frame(false),
+                    egui::Button::new(RichText::new(focus_text).size(12.5).color(p.fg_secondary))
+                        .frame(false),
                 )
                 .on_hover_text("Toggle distraction-free focus mode (Ctrl+\\)")
                 .clicked()
@@ -2224,7 +2609,9 @@ impl EloraApp {
                 self.focus_mode = !self.focus_mode;
             }
 
-            ui.label(RichText::new("·").color(p.fg_muted));
+            if !compact {
+                ui.label(RichText::new("·").color(p.fg_muted));
+            }
 
             // Note icon picker button
             let note_icon = self.notes[note_idx].icon.clone();
@@ -2255,7 +2642,9 @@ impl EloraApp {
                 self.icon_picker_note_id = Some(self.notes[note_idx].id.clone());
             }
 
-            ui.label(RichText::new("·").color(p.fg_muted));
+            if !compact {
+                ui.label(RichText::new("·").color(p.fg_muted));
+            }
 
             // Folder chooser: file this note under a folder, or start a new one.
             let current_folder = self.notes[note_idx].folder.clone();
@@ -2266,71 +2655,127 @@ impl EloraApp {
                 current_folder.as_deref(),
                 &folders,
                 &mut self.new_folder_input,
+                if compact { 104.0 } else { 148.0 },
             ) {
                 folder_choice = Some(choice);
             }
 
-            ui.label(RichText::new("·").color(p.fg_muted));
-
-            let updated_text = self.notes[note_idx].formatted_updated();
-            let words = self.notes[note_idx].word_count();
-            let chars = self.notes[note_idx].char_count();
-            let read_mins = self.notes[note_idx].reading_time_minutes();
-            let (done_tasks, total_tasks) = self.notes[note_idx].task_progress();
-
-            let mut stats = format!(
-                "{} {}   ·   {} words ({} chars)",
-                icon::CLOCK,
-                updated_text,
-                words,
-                chars
-            );
-            if read_mins > 0 {
-                stats.push_str(&format!(" (~{read_mins}m read)"));
+            if !compact {
+                ui.label(RichText::new("·").color(p.fg_muted));
             }
-            if total_tasks > 0 {
-                stats.push_str(&format!(
-                    "   ·   {} {done_tasks}/{total_tasks}",
-                    icon::LIST_CHECK
-                ));
+
+            // The word count has no room to spare in a narrow window.
+            if !compact {
+                let updated_text = self.notes[note_idx].formatted_updated();
+                let words = self.notes[note_idx].word_count();
+                let chars = self.notes[note_idx].char_count();
+                let read_mins = self.notes[note_idx].reading_time_minutes();
+                let (done_tasks, total_tasks) = self.notes[note_idx].task_progress();
+
+                let mut extras = String::new();
+                if read_mins > 0 {
+                    extras.push_str(&format!(" (~{read_mins}m read)"));
+                }
+                if total_tasks > 0 {
+                    extras.push_str(&format!(
+                        "   ·   {} {done_tasks}/{total_tasks}",
+                        icon::LIST_CHECK
+                    ));
+                }
+                // Width the action buttons on the right take up, including the gap before them.
+                // The stats must stay clear of it: a right-to-left group would otherwise draw
+                // over the end of the text in a narrow window.
+                let reserved = if is_trashed { 440.0 } else { 330.0 };
+                let budget = (ui.available_width() - reserved).max(0.0);
+                let measure = |text: &str| {
+                    ui.fonts(|fonts| {
+                        fonts
+                            .layout_no_wrap(
+                                text.to_owned(),
+                                egui::FontId::proportional(12.0),
+                                p.fg_muted,
+                            )
+                            .size()
+                            .x
+                    })
+                };
+                // Shorter and shorter versions of the same line, tried in order. Truncating
+                // the full one left it ending in "(" the moment the window got a little
+                // narrower, which read like it was running under the buttons.
+                let candidates = [
+                    format!(
+                        "{} {}   ·   {} words ({} chars){extras}",
+                        icon::CLOCK,
+                        updated_text,
+                        words,
+                        chars
+                    ),
+                    format!("{words} words ({chars} chars){extras}"),
+                    format!("{words} words"),
+                ];
+                if budget >= 40.0 {
+                    if let Some(stats) = candidates
+                        .iter()
+                        .find(|text| measure(text) <= budget)
+                        .or_else(|| candidates.last())
+                    {
+                        ui.scope(|ui| {
+                            ui.set_max_width(budget);
+                            ui.add(
+                                egui::Label::new(RichText::new(stats).size(12.0).color(p.fg_muted))
+                                    .truncate(),
+                            );
+                        });
+                    }
+                }
             }
-            ui.label(RichText::new(stats).size(12.0).color(p.fg_muted));
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if is_trashed {
+                    let delete_text = if compact {
+                        icon::TRASH_X.to_string()
+                    } else {
+                        format!("{} Delete Forever", icon::TRASH_X)
+                    };
                     if ui
                         .add(
                             egui::Button::new(
-                                RichText::new(format!("{} Delete Forever", icon::TRASH_X))
-                                    .size(12.0)
-                                    .color(Color32::WHITE),
+                                RichText::new(delete_text).size(12.0).color(Color32::WHITE),
                             )
                             .fill(p.danger),
                         )
+                        .on_hover_text("Delete this note forever")
                         .clicked()
                     {
                         action_perm_delete = true;
                     }
+                    let restore_text = if compact {
+                        icon::RESTORE.to_string()
+                    } else {
+                        format!("{} Restore", icon::RESTORE)
+                    };
                     if ui
                         .add(
                             egui::Button::new(
-                                RichText::new(format!("{} Restore", icon::RESTORE))
-                                    .size(12.5)
-                                    .color(p.accent),
+                                RichText::new(restore_text).size(12.5).color(p.accent),
                             )
                             .frame(true),
                         )
+                        .on_hover_text("Restore this note")
                         .clicked()
                     {
                         action_restore_trash = true;
                     }
                 } else if self.confirm_delete_id.as_deref() == Some(selected_id.as_str()) {
+                    let trash_text = if compact {
+                        "Trash".to_string()
+                    } else {
+                        format!("{} Move to Trash", icon::TRASH)
+                    };
                     if ui
                         .add(
                             egui::Button::new(
-                                RichText::new(format!("{} Move to Trash", icon::TRASH))
-                                    .size(12.0)
-                                    .color(Color32::WHITE),
+                                RichText::new(trash_text).size(12.0).color(Color32::WHITE),
                             )
                             .fill(p.danger),
                         )
@@ -2409,9 +2854,13 @@ impl EloraApp {
                     if ui
                         .add(
                             egui::Button::new(
-                                RichText::new(format!("{glyph} {label}"))
-                                    .size(12.0)
-                                    .color(col),
+                                RichText::new(if compact {
+                                    glyph.to_string()
+                                } else {
+                                    format!("{glyph} {label}")
+                                })
+                                .size(12.0)
+                                .color(col),
                             )
                             .frame(active),
                         )
@@ -2439,9 +2888,13 @@ impl EloraApp {
                     if ui
                         .add(
                             egui::Button::new(
-                                RichText::new(format!("{pin_glyph} {pin_text}"))
-                                    .size(12.0)
-                                    .color(pin_color),
+                                RichText::new(if compact {
+                                    pin_glyph.to_string()
+                                } else {
+                                    format!("{pin_glyph} {pin_text}")
+                                })
+                                .size(12.0)
+                                .color(pin_color),
                             )
                             .frame(is_pinned),
                         )
@@ -2676,6 +3129,20 @@ impl EloraApp {
                     self.icon_search.clear();
                 }
 
+                // The colour controls are the widest group in the bar, and a wrapped row cannot
+                // move a group of widgets as a unit: at some widths the swatch next to a button
+                // was left alone on a second line. Break the line before the group instead.
+                let needed = color_controls_width(ui, p);
+                // In a wrapping layout both `available_width` and `available_size_before_wrap`
+                // report the whole row, so the space left on the line is measured from the
+                // cursor instead.
+                let row = ui.max_rect();
+                let cursor = ui.cursor().min.x;
+                let remaining = (row.right() - cursor).max(0.0);
+                if needed > remaining && cursor > row.left() + 0.5 {
+                    ui.add_space(remaining);
+                }
+
                 ui.add_space(4.0);
                 ui.label(RichText::new("·").color(p.fg_muted));
                 ui.add_space(2.0);
@@ -2745,24 +3212,9 @@ impl EloraApp {
                     self.persist_settings();
                 }
 
-                // Preset Glow Color Swatches
-                for (name, rgb) in HIGHLIGHT_PRESETS {
-                    let is_sel = self.highlight_rgb == *rgb;
-                    if color_swatch_button(
-                        ui,
-                        *rgb,
-                        is_sel,
-                        &format!(
-                            "{name} ({}) — click to highlight selection",
-                            rgb_to_hex(*rgb)
-                        ),
-                    )
-                    .clicked()
-                    {
-                        self.highlight_rgb = *rgb;
-                        queued_format_op = Some(EditorFormatOp::GlowHighlight(*rgb));
-                    }
-                }
+                // The preset glow swatches are not repeated here: on a laptop-width window
+                // they wrapped onto a row of their own, so the bar now always fits its
+                // controls on one line. The presets remain in the right-click menu.
             });
         }
 
@@ -2810,44 +3262,67 @@ impl EloraApp {
                     });
             }
             EditorViewMode::Split => {
-                ui.columns(2, |cols| {
-                    cols[0].vertical(|ui| {
-                        ScrollArea::vertical()
-                            .id_salt("elora_split_left")
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                let min_h = ui.available_height().max(300.0);
-                                self.render_multiline_markdown_editor(
-                                    ui,
-                                    note_idx,
-                                    min_h,
-                                    p,
-                                    &mut needs_save,
-                                    &mut queued_format_op,
-                                );
-                            });
-                    });
-                    cols[1].vertical(|ui| {
-                        ScrollArea::vertical()
-                            .id_salt("elora_split_right")
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                let body_snapshot = self.notes[note_idx].body.clone();
-                                render_markdown_preview(
-                                    ui,
-                                    &body_snapshot,
-                                    p,
-                                    &mut clicked_wiki_link,
-                                    &mut toggled_task_idx,
-                                );
-                                render_backlinks_footer(
-                                    ui,
-                                    &backlinks,
-                                    p,
-                                    &mut clicked_backlink_id,
-                                );
-                            });
-                    });
+                // Both panes are the same width and sit inside the same column as Edit and
+                // Preview, so the outer margins do not change when the view is switched. The
+                // gutter is the width of the window margin: `ui.columns` sized its gap from the
+                // global item spacing (8 px), which left the two panes almost touching.
+                let pane_height = ui.available_height();
+                let pane_width = ((ui.available_width() - NOTE_SIDE_MARGIN) * 0.5).max(80.0);
+                ui.horizontal_top(|ui| {
+                    // The gutter below is the only space between the panes: the default item
+                    // spacing would otherwise be added to it and push the right pane past the
+                    // column's right edge.
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(pane_width, pane_height),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            // A pane owns its half of the column: nothing may be painted into
+                            // the gutter or the window margin, even a chip too wide to fit.
+                            ui.set_clip_rect(ui.max_rect());
+                            ScrollArea::vertical()
+                                .id_salt("elora_split_left")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    let min_h = ui.available_height().max(300.0);
+                                    self.render_multiline_markdown_editor(
+                                        ui,
+                                        note_idx,
+                                        min_h,
+                                        p,
+                                        &mut needs_save,
+                                        &mut queued_format_op,
+                                    );
+                                });
+                        },
+                    );
+                    ui.add_space(NOTE_SIDE_MARGIN);
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(pane_width, pane_height),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            ui.set_clip_rect(ui.max_rect());
+                            ScrollArea::vertical()
+                                .id_salt("elora_split_right")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    let body_snapshot = self.notes[note_idx].body.clone();
+                                    render_markdown_preview(
+                                        ui,
+                                        &body_snapshot,
+                                        p,
+                                        &mut clicked_wiki_link,
+                                        &mut toggled_task_idx,
+                                    );
+                                    render_backlinks_footer(
+                                        ui,
+                                        &backlinks,
+                                        p,
+                                        &mut clicked_backlink_id,
+                                    );
+                                });
+                        },
+                    );
                 });
             }
         }
@@ -2902,54 +3377,10 @@ impl eframe::App for EloraApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_shortcuts(ctx);
+        self.poll_update();
         self.settings_window(ctx);
         self.graph_window(ctx);
         let p = self.theme.palette_with(&self.colors, self.glow_strength);
-
-        egui::TopBottomPanel::bottom("elora_status_bar")
-            .frame(
-                Frame::new()
-                    .fill(p.bg_sidebar)
-                    .stroke(Stroke::new(1.0_f32, p.border))
-                    .inner_margin(Margin::symmetric(14, 5)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    let path_display = self.storage.root_dir().display().to_string();
-                    ui.label(
-                        RichText::new(format!("{} {path_display}", icon::FOLDER))
-                            .size(11.0)
-                            .color(p.fg_muted),
-                    );
-
-                    ui.label(RichText::new("·").size(11.0).color(p.fg_muted));
-                    ui.label(
-                        RichText::new(format!("{} {}", icon::PALETTE, self.theme.name()))
-                            .size(11.0)
-                            .color(p.fg_muted),
-                    );
-
-                    if let Some(msg) = &self.status_message {
-                        ui.label(RichText::new("·").size(11.0).color(p.fg_muted));
-                        ui.label(
-                            RichText::new(format!("{} {msg}", icon::CHECK))
-                                .size(11.0)
-                                .color(p.accent),
-                        );
-                    }
-
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(format!(
-                                "{} Right-Click Selection to Format/Glow  ·  Ctrl+B Bold  ·  Ctrl+Shift+H Highlight  ·  Ctrl+K Palette",
-                                icon::FLARE
-                            ))
-                            .size(11.0)
-                            .color(p.fg_muted),
-                        );
-                    });
-                });
-            });
 
         if !self.focus_mode {
             let sidebar = egui::SidePanel::left("elora_sidebar")
@@ -2983,36 +3414,41 @@ impl eframe::App for EloraApp {
             .frame(
                 Frame::new()
                     .fill(p.bg_canvas)
-                    // Keep the note area close to the sidebar: a wide left inset reads as an
-                    // empty gap between the note list and the note itself.
+                    // The horizontal inset is applied to the centred column below, equally on
+                    // both sides, instead of as a one-sided panel margin. A fixed right margin
+                    // made the note sit off-centre at every window size.
                     .inner_margin(Margin {
                         left: 0,
-                        right: 28,
+                        right: 0,
                         top: 18,
                         bottom: 18,
                     }),
             )
             .show(ctx, |ui| {
-                let max_width = if self.focus_mode {
-                    820.0
-                } else if self.view_mode == EditorViewMode::Split {
-                    1320.0
-                } else {
-                    980.0
-                };
-                if ui.available_width() > max_width {
-                    let pad = ((ui.available_width() - max_width) * 0.5).min(180.0);
-                    Frame::new()
-                        .inner_margin(Margin::symmetric(pad as i8, 0))
-                        .show(ui, |ui| {
-                            self.render_editor(ui, &p);
-                        });
-                } else {
-                    self.render_editor(ui, &p);
-                }
+                // Every view uses the same column width, so switching between Edit, Split
+                // and Preview never shifts the text sideways. Focus mode keeps a slightly
+                // narrower column because the sidebar is gone.
+                let max_width = if self.focus_mode { 820.0 } else { 980.0 };
+                let available = ui.available_width();
+                // Centre the column when the window is wide, and keep an equal minimum inset
+                // on both sides when it is not. Only the padding changes with the window size;
+                // the column never clings to one edge.
+                let pad = ((available - max_width) * 0.5).max(NOTE_SIDE_MARGIN);
+                let width = (available - pad * 2.0).max(200.0);
+                let height = ui.available_height();
+                ui.horizontal_top(|ui| {
+                    ui.add_space(pad);
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(width, height),
+                        Layout::top_down(Align::Min),
+                        |ui| self.render_editor(ui, &p),
+                    );
+                });
             });
 
         self.render_command_palette(ctx, &p);
+        self.update_window(ctx, &p);
+        self.status_toast(ctx, &p);
     }
 }
 
@@ -3284,6 +3720,35 @@ fn render_note_card(
     action
 }
 
+/// Width the colour pickers and their two apply buttons need on one line.
+///
+/// The formatting bar is a wrapping row, and a wrapping row cannot move a group of widgets to
+/// a new line on its own. Knowing this width lets the bar break before the group instead, so a
+/// swatch is never left stranded on a line of its own.
+fn color_controls_width(ui: &Ui, p: &Palette) -> f32 {
+    let text_width = |text: &str, strong: bool| {
+        let family = if strong {
+            crate::icons::bold_family()
+        } else {
+            FontFamily::Proportional
+        };
+        ui.fonts(|fonts| {
+            fonts
+                .layout_no_wrap(text.to_owned(), FontId::new(12.0, family), p.fg_primary)
+                .size()
+                .x
+        })
+    };
+    let button =
+        |text: &str, strong: bool| text_width(text, strong) + 2.0 * ui.spacing().button_padding.x;
+    // The two square colour buttons use the standard interaction height.
+    let swatch = ui.spacing().interact_size.y;
+    let text_button = button("A Text Color", false);
+    let glow_button = button(&format!("{} Glow Highlight", icon::HIGHLIGHT), true);
+    // Both swatches, both buttons, the two "·" separators and the gaps between them.
+    swatch + text_button + glow_button + swatch + 40.0
+}
+
 fn render_backlinks_footer(
     ui: &mut Ui,
     backlinks: &[(String, String)],
@@ -3336,6 +3801,7 @@ fn folder_menu_ui(
     current_folder: Option<&str>,
     folders: &[String],
     new_folder_input: &mut String,
+    width: f32,
 ) -> Option<Option<String>> {
     let mut choice: Option<Option<String>> = None;
     let folder_label = current_folder.unwrap_or("No folder");
@@ -3350,7 +3816,7 @@ fn folder_menu_ui(
                     p.fg_secondary
                 }),
         )
-        .width(148.0)
+        .width(width)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show_ui(ui, |ui| {
             if ui
@@ -3608,7 +4074,7 @@ mod tests {
             let _ = self.ctx.run(raw, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     *combo_id = Some(ui.make_persistent_id(Id::new("note_folder_choice")));
-                    *choice = folder_menu_ui(ui, &p, None, &folders, input);
+                    *choice = folder_menu_ui(ui, &p, None, &folders, input, 148.0);
                 });
             });
         }

@@ -128,18 +128,6 @@ pub struct Palette {
 }
 
 impl ThemeMode {
-    pub fn next(self) -> Self {
-        match self {
-            Self::Obsidian => Self::Paper,
-            Self::Paper => Self::Nordic,
-            Self::Nordic => Self::Matcha,
-            Self::Matcha => Self::Sepia,
-            Self::Sepia => Self::Midnight,
-            Self::Midnight => Self::Matugen,
-            Self::Matugen => Self::Obsidian,
-        }
-    }
-
     pub fn name(self) -> &'static str {
         match self {
             Self::Obsidian => "Obsidian",

@@ -23,3 +23,17 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --locked
+
+  # The installer and updater code has Windows-only and macOS-only branches that cannot be
+  # compiled on Linux, so both are checked on their own runners as well.
+  platforms:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check
+        run: cargo check --locked

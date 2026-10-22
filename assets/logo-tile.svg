@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!--
+    App icon: the EloraNotes feather (assets/logo.svg) on a rounded tile, in the palette the
+    app itself uses — near-black slate with the soft green accent and a faint glow.
+    scripts/make-icons.py rasterises this file into the PNG/ICO/ICNS set.
+  -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1d2026"/>
+      <stop offset="1" stop-color="#0e0f12"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.42" r="0.55">
+      <stop offset="0" stop-color="#8ed69a" stop-opacity="0.20"/>
+      <stop offset="0.65" stop-color="#8ed69a" stop-opacity="0.05"/>
+      <stop offset="1" stop-color="#8ed69a" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="soft" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="0.55"/>
+    </filter>
+  </defs>
+
+  <rect x="48" y="48" width="928" height="928" rx="212" fill="url(#tile)"/>
+  <rect x="48" y="48" width="928" height="928" rx="212" fill="url(#glow)"/>
+  <rect x="49.5" y="49.5" width="925" height="925" rx="210.5" fill="none"
+        stroke="#ffffff" stroke-opacity="0.07" stroke-width="3"/>
+
+  <!-- The feather, scaled from its 24x24 canvas to ~54% of the tile. -->
+  <g transform="translate(240 240) scale(22.66)" fill="none" stroke="#9fe0a6"
+     stroke-width="2.0" stroke-linecap="round" stroke-linejoin="round">
+    <g filter="url(#soft)" stroke-width="3" stroke-opacity="0.4">
+      <path d="M4 20l10 -10m0 -5v5h5m-9 -1v5h5m-9 -1v5h5m-5 -5l4 -4l4 -4"/>
+      <path d="M19 10c.638 -.636 1 -1.515 1 -2.486a3.515 3.515 0 0 0 -3.517 -3.514c-.97 0 -1.847 .367 -2.483 1m-3 13l4 -4l4 -4"/>
+    </g>
+    <path d="M4 20l10 -10m0 -5v5h5m-9 -1v5h5m-9 -1v5h5m-5 -5l4 -4l4 -4"/>
+    <path d="M19 10c.638 -.636 1 -1.515 1 -2.486a3.515 3.515 0 0 0 -3.517 -3.514c-.97 0 -1.847 .367 -2.483 1m-3 13l4 -4l4 -4"/>
+  </g>
+</svg>
