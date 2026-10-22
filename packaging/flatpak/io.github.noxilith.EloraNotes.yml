@@ -24,6 +24,9 @@ finish-args:
   - --filesystem=xdg-documents
   - --filesystem=~/Documents
   - --filesystem=xdg-download
+  # matugen (and anything else following the README) writes the wallpaper colors to
+  # ~/.config/elora/matugen.json, which the sandbox would otherwise hide.
+  - --filesystem=xdg-config/elora:ro
   # The launcher runs the app from a writable copy here so in-app updates are possible at all;
   # /app itself stays read-only.
   - --filesystem=xdg-data/EloraNotes:create

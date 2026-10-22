@@ -136,6 +136,8 @@ The **Matugen** theme takes its colors from your wallpaper using [matugen](https
 
 Missing colors fall back to the Obsidian theme.
 
+The Flatpak reads the same `~/.config/elora/matugen.json` (mounted read-only), so the wallpaper colors carry over without a second copy.
+
 ## Keyboard Shortcuts
 
 | Shortcut | Action |

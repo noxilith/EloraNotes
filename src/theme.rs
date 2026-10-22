@@ -6,8 +6,19 @@ use std::sync::RwLock;
 static MATUGEN_PALETTE: RwLock<Option<Palette>> = RwLock::new(None);
 
 /// Where matugen should write the generated colors: `<config dir>/elora/matugen.json`.
+///
+/// A Flatpak redirects the config dir into the sandbox (`~/.var/app/.../config`), where matugen
+/// never writes, so the file at the real `~/.config/elora/matugen.json` is used as well. The
+/// bundle mounts that folder read-only.
 pub fn matugen_colors_path() -> Option<std::path::PathBuf> {
-    dirs::config_dir().map(|d| d.join("elora").join("matugen.json"))
+    let in_config_dir = dirs::config_dir().map(|d| d.join("elora").join("matugen.json"));
+    let in_home = dirs::home_dir().map(|h| h.join(".config").join("elora").join("matugen.json"));
+    let existing = in_config_dir
+        .iter()
+        .chain(in_home.iter())
+        .find(|path| path.is_file())
+        .cloned();
+    existing.or(in_config_dir.or(in_home))
 }
 
 fn parse_hex(s: &str) -> Option<Color32> {
