@@ -35,6 +35,13 @@ const SIDEBAR_FOOTER_HEIGHT: f32 = 34.0;
 /// so resizing never pushes the text against one edge.
 const NOTE_SIDE_MARGIN: f32 = 24.0;
 
+/// Space reserved for the colour controls in the formatting bar, measured at the current text
+/// sizes with a few pixels of slack. They are drawn inside a child layout of this size so the
+/// wrapping row treats the whole group as one item: it fits beside the markdown buttons when
+/// there is room, and otherwise drops to the next line in one piece.
+const COLOR_GROUP_WIDTH: f32 = 344.0;
+const COLOR_GROUP_HEIGHT: f32 = 28.0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditorViewMode {
     Edit,
@@ -3131,61 +3138,51 @@ impl EloraApp {
                     self.icon_search.clear();
                 }
 
-                // The colour controls are the widest group in the bar, and a wrapped row cannot
-                // move a group of widgets as a unit: at some widths the swatch next to a button
-                // was left alone on a second line. Break the line before the group instead.
-                let needed = color_controls_width(ui, p);
-                // In a wrapping layout both `available_width` and `available_size_before_wrap`
-                // report the whole row, so the space left on the line is measured from the
-                // cursor instead.
-                let row = ui.max_rect();
-                let cursor = ui.cursor().min.x;
-                let remaining = (row.right() - cursor).max(0.0);
-                if needed > remaining && cursor > row.left() + 0.5 {
-                    ui.add_space(remaining);
-                }
-
+                // The colour controls are their own fixed-size child layout, so this wrapping
+                // row moves the whole group down as one piece. Letting them wrap one by one
+                // left the glow swatch stranded under the markdown buttons at narrow widths.
                 ui.add_space(4.0);
-                ui.label(RichText::new("·").color(p.fg_muted));
-                ui.add_space(2.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(COLOR_GROUP_WIDTH, COLOR_GROUP_HEIGHT),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        // Text color: color picker + apply button wraps selection in {color:#HEX}...{/color}
+                        if ui
+                            .color_edit_button_srgb(&mut self.text_color_rgb)
+                            .on_hover_text("Pick text color")
+                            .changed()
+                        {
+                            self.persist_settings();
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("A Text Color").size(12.0).color(
+                                    Color32::from_rgb(
+                                        self.text_color_rgb[0],
+                                        self.text_color_rgb[1],
+                                        self.text_color_rgb[2],
+                                    ),
+                                ))
+                                .fill(p.bg_elevated)
+                                .corner_radius(CornerRadius::same(6)),
+                            )
+                            .on_hover_text("Color the selected text with the chosen color")
+                            .clicked()
+                        {
+                            queued_format_op = Some(EditorFormatOp::TextColor(self.text_color_rgb));
+                        }
 
-                // Text color: color picker + apply button wraps selection in {color:#HEX}...{/color}
-                if ui
-                    .color_edit_button_srgb(&mut self.text_color_rgb)
-                    .on_hover_text("Pick text color")
-                    .changed()
-                {
-                    self.persist_settings();
-                }
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("A Text Color").size(12.0).color(
-                            Color32::from_rgb(
-                                self.text_color_rgb[0],
-                                self.text_color_rgb[1],
-                                self.text_color_rgb[2],
-                            ),
-                        ))
-                        .fill(p.bg_elevated)
-                        .corner_radius(CornerRadius::same(6)),
-                    )
-                    .on_hover_text("Color the selected text with the chosen color")
-                    .clicked()
-                {
-                    queued_format_op = Some(EditorFormatOp::TextColor(self.text_color_rgb));
-                }
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("·").color(p.fg_muted));
+                        ui.add_space(2.0);
 
-                ui.add_space(4.0);
-                ui.label(RichText::new("·").color(p.fg_muted));
-                ui.add_space(2.0);
-
-                // Glow Highlight button + Color Picker + Quick Swatches
-                let hl_col = Color32::from_rgb(
-                    self.highlight_rgb[0],
-                    self.highlight_rgb[1],
-                    self.highlight_rgb[2],
-                );
-                if ui
+                        // Glow Highlight button + Color Picker
+                        let hl_col = Color32::from_rgb(
+                            self.highlight_rgb[0],
+                            self.highlight_rgb[1],
+                            self.highlight_rgb[2],
+                        );
+                        if ui
                     .add(
                         egui::Button::new(
                             RichText::new(format!("{} Glow Highlight", icon::HIGHLIGHT))
@@ -3205,18 +3202,16 @@ impl EloraApp {
                     queued_format_op = Some(EditorFormatOp::GlowHighlight(self.highlight_rgb));
                 }
 
-                // Live Color Picker button
-                if ui
-                    .color_edit_button_srgb(&mut self.highlight_rgb)
-                    .on_hover_text("Pick custom glow highlight color")
-                    .changed()
-                {
-                    self.persist_settings();
-                }
-
-                // The preset glow swatches are not repeated here: on a laptop-width window
-                // they wrapped onto a row of their own, so the bar now always fits its
-                // controls on one line. The presets remain in the right-click menu.
+                        // Live Color Picker button
+                        if ui
+                            .color_edit_button_srgb(&mut self.highlight_rgb)
+                            .on_hover_text("Pick custom glow highlight color")
+                            .changed()
+                        {
+                            self.persist_settings();
+                        }
+                    },
+                );
             });
         }
 
@@ -3428,9 +3423,10 @@ impl eframe::App for EloraApp {
             )
             .show(ctx, |ui| {
                 // Every view uses the same column width, so switching between Edit, Split
-                // and Preview never shifts the text sideways. Focus mode keeps a slightly
-                // narrower column because the sidebar is gone.
-                let max_width = if self.focus_mode { 820.0 } else { 980.0 };
+                // and Preview never shifts the text sideways. Closing the sidebar gives the
+                // note more room instead of centring a narrow column in the wider window, so
+                // focus mode allows a wider column than the sidebar layout does.
+                let max_width = if self.focus_mode { 1200.0 } else { 980.0 };
                 let available = ui.available_width();
                 // Centre the column when the window is wide, and keep an equal minimum inset
                 // on both sides when it is not. Only the padding changes with the window size;
@@ -3743,35 +3739,6 @@ fn render_note_card(
     }
 
     action
-}
-
-/// Width the colour pickers and their two apply buttons need on one line.
-///
-/// The formatting bar is a wrapping row, and a wrapping row cannot move a group of widgets to
-/// a new line on its own. Knowing this width lets the bar break before the group instead, so a
-/// swatch is never left stranded on a line of its own.
-fn color_controls_width(ui: &Ui, p: &Palette) -> f32 {
-    let text_width = |text: &str, strong: bool| {
-        let family = if strong {
-            crate::icons::bold_family()
-        } else {
-            FontFamily::Proportional
-        };
-        ui.fonts(|fonts| {
-            fonts
-                .layout_no_wrap(text.to_owned(), FontId::new(12.0, family), p.fg_primary)
-                .size()
-                .x
-        })
-    };
-    let button =
-        |text: &str, strong: bool| text_width(text, strong) + 2.0 * ui.spacing().button_padding.x;
-    // The two square colour buttons use the standard interaction height.
-    let swatch = ui.spacing().interact_size.y;
-    let text_button = button("A Text Color", false);
-    let glow_button = button(&format!("{} Glow Highlight", icon::HIGHLIGHT), true);
-    // Both swatches, both buttons, the two "·" separators and the gaps between them.
-    swatch + text_button + glow_button + swatch + 40.0
 }
 
 fn render_backlinks_footer(

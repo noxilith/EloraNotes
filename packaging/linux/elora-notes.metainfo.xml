@@ -25,6 +25,15 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.7.3" date="2026-10-22">
+      <description>
+        <p>
+          The colour controls in the formatting bar move as one group instead of splitting
+          across rows at narrow widths, and closing the sidebar no longer leaves the note
+          centred in a narrow column.
+        </p>
+      </description>
+    </release>
     <release version="0.7.2" date="2026-10-22">
       <description>
         <p>
