@@ -25,6 +25,15 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.7.6" date="2026-10-22">
+      <description>
+        <p>
+          The AppImage no longer carries its own copy of the Wayland client library: the
+          graphics driver has to use the host's, so shipping one made the image fail to start
+          on hosts whose driver expects a newer copy.
+        </p>
+      </description>
+    </release>
     <release version="0.7.5" date="2026-10-22">
       <description>
         <p>
