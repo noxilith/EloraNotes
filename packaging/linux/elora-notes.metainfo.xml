@@ -25,6 +25,24 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.9.0" date="2026-10-22">
+      <description>
+        <p>
+          Shared notes. One machine runs the EloraNotes server, which keeps the notes as plain
+          Markdown files and serves them over TLS with a certificate each client pins on the
+          first connection. Everyone who connects sees the server's notes in the sidebar under
+          its name and edits them together: text merges as it is typed, each person's caret
+          carries their name and colour, and a note somebody has open shows a dot on its card.
+          Usernames come from the account each person is logged into, and the library structure
+          (titles, folders, tags, pins, trash) travels with the text.
+        </p>
+        <p>
+          Installers for the server are included with this release for Linux and Windows; they
+          ask for the server name, port and password, start it at boot and open the port in the
+          firewall. The app gains a Shared library section in Settings.
+        </p>
+      </description>
+    </release>
     <release version="0.8.0" date="2026-10-22">
       <description>
         <p>
