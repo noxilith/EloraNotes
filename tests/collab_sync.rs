@@ -5,6 +5,7 @@
 use elora_notes::collab::{Collab, ConnectionState, Incoming, ServerProfile};
 use elora_notes::net::ServerConfig;
 use elora_notes::server::Server;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -138,6 +139,15 @@ fn test_two_clients_edit_the_same_note() {
     });
 
     let mut bob = Collab::new();
+    // Bob's window only draws when egui is asked to, and an idle one is never asked, so a remote
+    // keystroke has to wake it; otherwise the other person's words wait for Bob's next mouse move.
+    let repaints = Arc::new(AtomicUsize::new(0));
+    let counter = repaints.clone();
+    let window = egui::Context::default();
+    window.set_request_repaint_callback(move |_| {
+        counter.fetch_add(1, Ordering::SeqCst);
+    });
+    bob.attach_ui(window.clone());
     bob.connect(profile(harness.port), "bob".into());
     let mut bob_body = String::new();
     settle(&mut bob, &mut bob_body, "bob", |c, _| c.is_connected());
@@ -163,6 +173,30 @@ fn test_two_clients_edit_the_same_note() {
     settle(&mut bob, &mut bob_body, "bob", |_, body| {
         body == "hello from alice"
     });
+
+    // Let the empty window settle into its idle state, then count from zero: anything after this
+    // is a wake-up from the connection.
+    for _ in 0..2 {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(640.0, 480.0),
+            )),
+            ..Default::default()
+        };
+        let _ = window.run(raw, |_| {});
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    repaints.store(0, Ordering::SeqCst);
+    alice_body.push('!');
+    alice.send_body(&note_id, &alice_body);
+    settle(&mut bob, &mut bob_body, "bob repaint", |_, body| {
+        body.ends_with('!')
+    });
+    assert!(
+        repaints.load(Ordering::SeqCst) > 0,
+        "a remote edit must ask for a new frame"
+    );
 
     // Both type at once, at different ends. The merged text must contain both edits.
     let alice_edit = format!("A{}", alice_body);
@@ -262,7 +296,7 @@ fn test_two_clients_edit_the_same_note() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(
-        saved.contains("Ahello from alice B"),
+        saved.contains("Ahello from alice! B"),
         "saved body: {saved:?}"
     );
     assert!(

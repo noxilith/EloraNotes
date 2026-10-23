@@ -145,6 +145,24 @@ pub enum Incoming {
     Offline(String),
 }
 
+/// Wakes the window when something arrives. The UI only redraws when egui is asked to, and the
+/// worker is the one place that knows a remote keystroke turned up, so without this the other
+/// person's words land in the channel and wait for the local mouse to move before they show.
+#[derive(Clone)]
+struct Notify {
+    events: Sender<Incoming>,
+    ui: Option<egui::Context>,
+}
+
+impl Notify {
+    fn send(&self, event: Incoming) {
+        let _ = self.events.send(event);
+        if let Some(ui) = &self.ui {
+            ui.request_repaint();
+        }
+    }
+}
+
 enum Command {
     Open(String),
     Close,
@@ -189,6 +207,8 @@ pub struct Collab {
     sent_body: Option<(String, String)>,
     /// True once a failure has been reported, so the retry loop below it stays quiet.
     offline_reported: bool,
+    /// The window, for the worker to wake when a remote edit arrives.
+    ui: Option<egui::Context>,
 }
 
 impl Default for Collab {
@@ -212,7 +232,14 @@ impl Collab {
             open: None,
             sent_body: None,
             offline_reported: false,
+            ui: None,
         }
+    }
+
+    /// Remembers the window so the worker can ask for a frame the moment a message arrives.
+    /// Called every frame, because the connection may be made long after this is first set.
+    pub fn attach_ui(&mut self, ui: egui::Context) {
+        self.ui = Some(ui);
     }
 
     pub fn state(&self) -> &ConnectionState {
@@ -272,9 +299,13 @@ impl Collab {
         }
         let (command_tx, command_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
+        let notify = Notify {
+            events: event_tx,
+            ui: self.ui.clone(),
+        };
         std::thread::Builder::new()
             .name("elora-collab".to_string())
-            .spawn(move || worker(profile, username, command_rx, event_tx))
+            .spawn(move || worker(profile, username, command_rx, notify))
             .ok();
         self.commands = Some(command_tx);
         self.events = event_rx;
@@ -471,12 +502,7 @@ struct Session {
     color: [u8; 3],
 }
 
-fn worker(
-    profile: ServerProfile,
-    name: String,
-    commands: Receiver<Command>,
-    events: Sender<Incoming>,
-) {
+fn worker(profile: ServerProfile, name: String, commands: Receiver<Command>, events: Notify) {
     let mut delay = FIRST_RETRY;
     loop {
         if matches!(
@@ -489,10 +515,10 @@ fn worker(
             Ok(mut session) => {
                 delay = FIRST_RETRY;
                 let reason = session.run(&commands, &events);
-                let _ = events.send(Incoming::Offline(reason));
+                events.send(Incoming::Offline(reason));
             }
             Err(error) => {
-                let _ = events.send(Incoming::Offline(error));
+                events.send(Incoming::Offline(error));
             }
         }
 
@@ -513,7 +539,7 @@ impl Session {
     fn start(
         profile: &ServerProfile,
         name: &str,
-        events: &Sender<Incoming>,
+        events: &Notify,
         commands: &Receiver<Command>,
     ) -> Result<Session, String> {
         let address = profile.address();
@@ -578,7 +604,7 @@ impl Session {
             .ok()
             .and_then(|slot| slot.clone())
             .ok_or_else(|| "the server presented no certificate".to_string())?;
-        let _ = events.send(Incoming::Online {
+        events.send(Incoming::Online {
             server,
             you: you.clone(),
             notes,
@@ -604,7 +630,7 @@ impl Session {
         Ok(session)
     }
 
-    fn run(&mut self, commands: &Receiver<Command>, events: &Sender<Incoming>) -> String {
+    fn run(&mut self, commands: &Receiver<Command>, events: &Notify) -> String {
         loop {
             loop {
                 match commands.try_recv() {
@@ -634,7 +660,7 @@ impl Session {
         }
     }
 
-    fn handle(&mut self, command: Command, events: &Sender<Incoming>) -> Result<(), String> {
+    fn handle(&mut self, command: Command, events: &Notify) -> Result<(), String> {
         match command {
             Command::Stop => return Err("disconnected".to_string()),
             Command::Open(id) => {
@@ -654,7 +680,7 @@ impl Session {
                 self.mirror.clear();
                 self.clear_awareness();
                 self.send_msg(&ClientMsg::Close)?;
-                let _ = events.send(Incoming::Peers(Vec::new()));
+                events.send(Incoming::Peers(Vec::new()));
             }
             Command::Body { text } => self.apply_local(&text)?,
             Command::Cursor(byte) => {
@@ -703,12 +729,7 @@ impl Session {
         Ok(())
     }
 
-    fn handle_frame(
-        &mut self,
-        kind: u8,
-        payload: Vec<u8>,
-        events: &Sender<Incoming>,
-    ) -> Result<(), String> {
+    fn handle_frame(&mut self, kind: u8, payload: Vec<u8>, events: &Notify) -> Result<(), String> {
         match kind {
             FRAME_JSON => {
                 let message: ServerMsg = match serde_json::from_slice(&payload) {
@@ -716,18 +737,10 @@ impl Session {
                     Err(_) => return Ok(()),
                 };
                 match message {
-                    ServerMsg::Notes { notes } => {
-                        let _ = events.send(Incoming::Notes(notes));
-                    }
-                    ServerMsg::Created { note } => {
-                        let _ = events.send(Incoming::Created(note));
-                    }
-                    ServerMsg::Presence { notes } => {
-                        let _ = events.send(Incoming::Presence(notes));
-                    }
-                    ServerMsg::Error { message } => {
-                        let _ = events.send(Incoming::Offline(message));
-                    }
+                    ServerMsg::Notes { notes } => events.send(Incoming::Notes(notes)),
+                    ServerMsg::Created { note } => events.send(Incoming::Created(note)),
+                    ServerMsg::Presence { notes } => events.send(Incoming::Presence(notes)),
+                    ServerMsg::Error { message } => events.send(Incoming::Offline(message)),
                     _ => {}
                 }
             }
@@ -769,7 +782,7 @@ impl Session {
                     return Ok(());
                 };
                 if self.awareness.apply_update(update).is_ok() {
-                    let _ = events.send(Incoming::Peers(self.peers()));
+                    events.send(Incoming::Peers(self.peers()));
                 }
             }
             _ => {}
@@ -832,7 +845,7 @@ impl Session {
         self.send_frame(FRAME_SYNC, &frame)
     }
 
-    fn emit_body(&mut self, events: &Sender<Incoming>) {
+    fn emit_body(&mut self, events: &Notify) {
         let Some(id) = self.open.clone() else {
             return;
         };
@@ -841,7 +854,7 @@ impl Session {
             return;
         }
         self.mirror = text.clone();
-        let _ = events.send(Incoming::Body { id, text });
+        events.send(Incoming::Body { id, text });
     }
 
     fn doc_text(&self) -> String {
@@ -849,7 +862,7 @@ impl Session {
         self.text.get_string(&txn)
     }
 
-    fn publish_awareness(&mut self, events: &Sender<Incoming>, force: bool) {
+    fn publish_awareness(&mut self, events: &Notify, force: bool) {
         let cursor = if force { None } else { self.last_cursor_sent };
         let state = serde_json::json!({
             "name": self.name,
@@ -862,7 +875,7 @@ impl Session {
         if let Ok(update) = self.awareness.update() {
             let bytes = update.encode_v1();
             let _ = self.send_frame(FRAME_AWARENESS, &bytes);
-            let _ = events.send(Incoming::Peers(self.peers()));
+            events.send(Incoming::Peers(self.peers()));
         }
     }
 
@@ -1037,6 +1050,20 @@ fn map_position(base: &str, current: &str, position: usize) -> usize {
     }
 }
 
+/// Where a caret at `index` characters ends up after somebody else replaced `removed` characters
+/// with `inserted` at `start`. Text they add at the caret itself is theirs, so the caret stays in
+/// front of it; anything before the caret carries the caret along with the words around it.
+pub fn carry_caret(start: usize, removed: usize, inserted: usize, index: usize) -> usize {
+    if index <= start {
+        index
+    } else if removed > 0 && index <= start + removed {
+        // The text the caret was in was replaced: it belongs at the end of the replacement.
+        start + inserted
+    } else {
+        index + inserted - removed
+    }
+}
+
 fn floor_char_boundary(text: &str, mut index: usize) -> usize {
     if index >= text.len() {
         return text.len();
@@ -1088,6 +1115,20 @@ mod tests {
         assert_eq!(map_position("abc", "abcXY", 1), 1);
         // Someone deleted before us: we shift back.
         assert_eq!(map_position("abcde", "ade", 4), 2);
+    }
+
+    #[test]
+    fn test_carried_caret_stays_with_its_own_text() {
+        // A line inserted above the caret pushes it down by exactly that line.
+        assert_eq!(carry_caret(10, 0, 5, 20), 25);
+        // Typing after the caret leaves it alone.
+        assert_eq!(carry_caret(30, 0, 3, 20), 20);
+        // Inserted at the caret: the new text is theirs, so the caret stays in front of it.
+        assert_eq!(carry_caret(20, 0, 4, 20), 20);
+        // A line deleted above the caret brings it back up with its text.
+        assert_eq!(carry_caret(10, 6, 0, 20), 14);
+        // The surrounding text was replaced: the caret lands at the end of the replacement.
+        assert_eq!(carry_caret(10, 5, 2, 12), 12);
     }
 
     #[test]

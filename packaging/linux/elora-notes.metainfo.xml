@@ -25,6 +25,19 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.9.7" date="2026-10-23">
+      <description>
+        <p>
+          Shared notes now update as they are typed. The connection asks the window to draw the
+          moment somebody else's keystroke arrives, instead of waiting for the next move of the
+          local mouse or the caret's blink, so the other person's words appear letter by letter.
+          The caret also belongs to the words around it: when somebody inserts a line above the
+          text being edited, the caret and its selection travel down with that text rather than
+          staying behind in what the other person just wrote, and if that pushes the line out of
+          view the editor follows it.
+        </p>
+      </description>
+    </release>
     <release version="0.9.6" date="2026-10-23">
       <description>
         <p>

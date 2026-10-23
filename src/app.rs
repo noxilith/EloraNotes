@@ -14,9 +14,10 @@ use crate::storage::{
 use crate::theme::{ColorOverrides, Palette, ThemeMode};
 use crate::update::{self, Release, UpdateOffer};
 use chrono::{Local, Utc};
+use egui::text::{CCursor, CCursorRange};
 use egui::{
     Align, Align2, Color32, CornerRadius, FontFamily, FontId, Frame, Id, Key, Layout, Margin, Pos2,
-    RichText, ScrollArea, Sense, Stroke, TextEdit, TextStyle, Ui, Vec2,
+    Rect, RichText, ScrollArea, Sense, Stroke, TextEdit, TextStyle, Ui, Vec2,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::f32::consts::TAU;
@@ -113,6 +114,11 @@ pub struct EloraApp {
     /// Caret position in the active note editor, in characters, for the presence cursor sent to
     /// the other people in a shared note.
     last_editor_caret: Option<usize>,
+    /// True while the caret was on screen last frame, so a remote edit only scrolled into view
+    /// when the words being worked on were already being looked at.
+    caret_in_view: bool,
+    /// Set by a remote edit that moved the caret: the editor pulls it back on screen this frame.
+    reveal_caret: bool,
     /// The shared library: connection, server notes and who is editing what.
     collab: Collab,
     /// The server saved in Settings, and the copy the Settings fields edit.
@@ -307,6 +313,8 @@ impl EloraApp {
             graph: None,
             last_editor_selection: None,
             last_editor_caret: None,
+            caret_in_view: false,
+            reveal_caret: false,
             collab: Collab::new(),
             server: settings.server.clone(),
             server_form: settings.server.clone(),
@@ -1280,7 +1288,7 @@ impl EloraApp {
     }
 
     /// Drains the connection's messages and folds them into the app state.
-    fn poll_collab(&mut self) {
+    fn poll_collab(&mut self, ctx: &egui::Context) {
         let mut library_changed = false;
         for event in self.collab.poll() {
             match event {
@@ -1371,6 +1379,11 @@ impl EloraApp {
                     library_changed = true;
                 }
                 Incoming::Body { id, text } => {
+                    let previous = self
+                        .notes
+                        .iter()
+                        .find(|n| n.id == id)
+                        .map(|n| n.body.clone());
                     self.remote_bodies.insert(id.clone(), text.clone());
                     if let Some(note) = self.notes.iter_mut().find(|n| n.id == id) {
                         note.body = text.clone();
@@ -1378,7 +1391,12 @@ impl EloraApp {
                     }
                     if self.selected_id.as_deref() == Some(id.as_str()) {
                         // Somebody else's typing is not a local edit: no undo step, no save.
-                        self.last_seen_body = Some((id, text));
+                        self.last_seen_body = Some((id.clone(), text.clone()));
+                        // The caret belongs to the words around it, not to a character count, so
+                        // it travels with them when somebody inserts a line above it.
+                        if let Some(previous) = previous {
+                            self.reveal_caret |= carry_caret_over(ctx, &id, &previous, &text);
+                        }
                     }
                 }
                 Incoming::Presence(_) | Incoming::Peers(_) => {}
@@ -3267,6 +3285,29 @@ impl EloraApp {
             self.last_editor_caret = Some(a);
         }
 
+        // Where the caret is on screen. egui scrolls to the caret when it moves it itself, but a
+        // remote edit moves it from the connection, so if those words were pushed out of view
+        // while the user was working in them, the editor brings them back this frame.
+        if let Some(rect) = output.cursor_range.map(|range| {
+            let caret = output.galley.pos_from_ccursor(range.primary.ccursor);
+            Rect::from_min_size(
+                output.galley_pos + caret.left_top().to_vec2(),
+                caret.size().max(Vec2::new(1.0, self.font_size)),
+            )
+        }) {
+            if self.reveal_caret
+                && self.caret_in_view
+                && ui.memory(|m| m.has_focus(editor_id))
+                && !ui.clip_rect().intersects(rect)
+            {
+                ui.scroll_to_rect(rect.expand(6.0), None);
+            }
+            self.caret_in_view = ui.clip_rect().contains_rect(rect);
+        } else {
+            self.caret_in_view = false;
+        }
+        self.reveal_caret = false;
+
         // Other people's carets, drawn where their cursor sits in the text.
         if !peers.is_empty() {
             let painter = ui.painter();
@@ -4307,7 +4348,8 @@ impl eframe::App for EloraApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_shortcuts(ctx);
         self.poll_update();
-        self.poll_collab();
+        self.collab.attach_ui(ctx.clone());
+        self.poll_collab(ctx);
         self.sync_open_note();
         self.settings_window(ctx);
         self.graph_window(ctx);
@@ -4398,6 +4440,41 @@ impl eframe::App for EloraApp {
 enum CardAction {
     SelectNote(String),
     FilterTag(String),
+}
+
+/// Moves the open note's caret and selection across somebody else's edit. The caret belongs to
+/// the words around it: when they insert a line above, it has to travel down with the text the
+/// user is in the middle of instead of staying behind in what they just wrote. Returns true when
+/// the caret actually moved.
+fn carry_caret_over(ctx: &egui::Context, note_id: &str, before: &str, after: &str) -> bool {
+    let editor_id = Id::new(("md_editor", note_id.to_string()));
+    let Some(mut state) = TextEdit::load_state(ctx, editor_id) else {
+        return false;
+    };
+    let Some(range) = state.cursor.char_range() else {
+        return false;
+    };
+
+    let (start, removed, inserted) = crate::collab::diff(before, after);
+    let chars = |text: &str, bytes: usize| text[..bytes].chars().count();
+    let start_chars = chars(before, start);
+    let removed_chars = chars(&before[start..], removed);
+    let inserted_chars = chars(&after[start..], inserted);
+    let carried = |index: usize| {
+        crate::collab::carry_caret(start_chars, removed_chars, inserted_chars, index)
+    };
+
+    let primary = carried(range.primary.index);
+    let secondary = carried(range.secondary.index);
+    if primary == range.primary.index && secondary == range.secondary.index {
+        return false;
+    }
+    state.cursor.set_char_range(Some(CCursorRange::two(
+        CCursor::new(primary),
+        CCursor::new(secondary),
+    )));
+    state.store(ctx, editor_id);
+    true
 }
 
 /// Blends `b` into `a`: `0.0` keeps `a`, `1.0` gives `b`.
@@ -5173,5 +5250,55 @@ mod tests {
             !egui::ComboBox::is_open(&h.ctx, widget_id),
             "picking a folder should close the folder menu"
         );
+    }
+
+    #[test]
+    fn test_remote_edit_carries_the_caret_with_its_text() {
+        let ctx = egui::Context::default();
+        let note_id = "shared-note";
+        let editor_id = Id::new(("md_editor", note_id.to_string()));
+        let frame = |ctx: &egui::Context, body: &mut String| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 480.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    TextEdit::multiline(body).id(editor_id).show(ui);
+                });
+            });
+        };
+
+        let before = "one\ntwo";
+        let mut body = before.to_string();
+        frame(&ctx, &mut body);
+
+        // The caret sits inside "two", as it would after somebody typed there.
+        let mut state = TextEdit::load_state(&ctx, editor_id).expect("editor state");
+        state
+            .cursor
+            .set_char_range(Some(CCursorRange::one(CCursor::new(6))));
+        state.store(&ctx, editor_id);
+
+        // Somebody else inserts a line above it; the caret travels down with "two".
+        assert!(carry_caret_over(&ctx, note_id, before, "zero\none\ntwo"));
+
+        let state = TextEdit::load_state(&ctx, editor_id).expect("editor state");
+        let range = state.cursor.char_range().expect("caret");
+        assert_eq!(range.primary.index, 11, "caret should still sit after 'tw'");
+
+        // An edit after the caret leaves it exactly where it is, and nothing jumps.
+        assert!(!carry_caret_over(
+            &ctx,
+            note_id,
+            "zero\none\ntwo",
+            "zero\none\ntwo!"
+        ));
+        let state = TextEdit::load_state(&ctx, editor_id).expect("editor state");
+        let range = state.cursor.char_range().expect("caret");
+        assert_eq!(range.primary.index, 11);
     }
 }
