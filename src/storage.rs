@@ -89,13 +89,19 @@ pub struct AppSettings {
     /// The shared library this client connects to, if any.
     #[serde(default)]
     pub server: crate::collab::ServerProfile,
-    /// The name other people see next to this client's caret. Empty means "use the account
-    /// name on this computer".
+    /// The identifier this client goes by: the name others see next to its caret, and the word
+    /// a private note is opened to. A fresh install fills it with one, so it is only empty in a
+    /// settings file from before the shared library had identifiers.
     #[serde(default)]
     pub display_name: String,
-    /// Whether a card in the sidebar shows the first lines of its note. Turning it off leaves
-    /// just the title, the date and the tags, so more notes fit in the list.
-    #[serde(default = "default_show_card_previews")]
+    /// Whether a card in the sidebar shows the first lines of its note. Off unless it is turned
+    /// on, which leaves just the title, the date and the tags, so more notes fit in the list.
+    ///
+    /// The key is `note_previews` because it started out as `show_card_previews` with the line
+    /// showing by default: a settings file written then still says `true`, and reading the old
+    /// key would keep the old default for exactly the people who never asked for it. The new key
+    /// is not in those files, so they open with the line off like a fresh install does.
+    #[serde(rename = "note_previews", default = "default_show_card_previews")]
     pub show_card_previews: bool,
 }
 
@@ -115,8 +121,10 @@ fn default_glow_strength() -> f32 {
     0.6
 }
 
+/// Cards start without the preview line: the sidebar is for finding a note, and titles do that
+/// in less room. Settings turns the line back on for anyone who wants to skim the first words.
 fn default_show_card_previews() -> bool {
-    true
+    false
 }
 
 impl Default for AppSettings {
@@ -151,6 +159,15 @@ pub struct Note {
     pub icon: Option<String>,
     /// Optional folder the note is filed under, stored in frontmatter.
     pub folder: Option<String>,
+    /// The identifier of the person the note belongs to. Notes created in the shared library
+    /// carry one, so the same identifier on another computer finds them again; notes on this
+    /// computer are never owned by anybody.
+    pub owner: Option<String>,
+    /// True when only the owner and the people named in `shared_with` may see the note. Stored
+    /// in the shared library's frontmatter, where the server reads it.
+    pub private: bool,
+    /// Identifiers allowed to see a private note.
+    pub shared_with: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub file_path: PathBuf,
@@ -172,6 +189,9 @@ impl Note {
             explicit_tags: Vec::new(),
             icon: None,
             folder: None,
+            owner: None,
+            private: false,
+            shared_with: Vec::new(),
             created_at: now,
             updated_at: now,
             file_path,
@@ -398,8 +418,27 @@ impl Note {
             format!("[{}]", items.join(", "))
         };
 
+        // Who the note belongs to and who may see it. Only the shared library sets these, so a
+        // note kept on this computer keeps its plain frontmatter.
+        let owner_line = self
+            .owner
+            .as_ref()
+            .map(|owner| format!("owner: \"{}\"\n", escape_yaml_string(owner)))
+            .unwrap_or_default();
+        let private_line = if self.private { "private: true\n" } else { "" };
+        let shared_line = if self.shared_with.is_empty() {
+            String::new()
+        } else {
+            let names: Vec<String> = self
+                .shared_with
+                .iter()
+                .map(|name| format!("\"{}\"", escape_yaml_string(name)))
+                .collect();
+            format!("shared_with: [{}]\n", names.join(", "))
+        };
+
         format!(
-            "---\ntitle: \"{}\"\npinned: {}\ntrashed: {}\ntags: {}\n{}{}created_at: {}\nupdated_at: {}\n---\n{}",
+            "---\ntitle: \"{}\"\npinned: {}\ntrashed: {}\ntags: {}\n{}{}{}{}{}created_at: {}\nupdated_at: {}\n---\n{}",
             escaped_title,
             self.pinned,
             self.trashed,
@@ -409,6 +448,9 @@ impl Note {
                 .as_ref()
                 .map(|i| format!("icon: {i}\n"))
                 .unwrap_or_default(),
+            owner_line,
+            private_line,
+            shared_line,
             self.created_at.to_rfc3339(),
             self.updated_at.to_rfc3339(),
             self.body
@@ -429,6 +471,9 @@ impl Note {
             let mut explicit_tags = Vec::new();
             let mut icon = None;
             let mut folder = None;
+            let mut owner = None;
+            let mut private = false;
+            let mut shared_with = Vec::new();
             let mut created_at = fallback_time;
             let mut updated_at = fallback_time;
 
@@ -452,6 +497,20 @@ impl Note {
                         }
                         "folder" => {
                             folder = normalize_folder(&unquote_yaml_string(val));
+                        }
+                        "owner" => {
+                            let name = crate::net::normalize_identifier(&unquote_yaml_string(val));
+                            owner = (!name.is_empty()).then_some(name);
+                        }
+                        "private" => {
+                            private = val.eq_ignore_ascii_case("true");
+                        }
+                        "shared_with" => {
+                            shared_with = parse_yaml_list(val)
+                                .iter()
+                                .map(|name| crate::net::normalize_identifier(name))
+                                .filter(|name| !name.is_empty())
+                                .collect();
                         }
                         "icon" => {
                             let name: String = val
@@ -485,6 +544,9 @@ impl Note {
                 explicit_tags,
                 icon,
                 folder,
+                owner,
+                private,
+                shared_with,
                 created_at,
                 updated_at,
                 file_path,
@@ -518,6 +580,9 @@ impl Note {
                 explicit_tags: Vec::new(),
                 icon: None,
                 folder: None,
+                owner: None,
+                private: false,
+                shared_with: Vec::new(),
                 created_at: fallback_time,
                 updated_at: fallback_time,
                 file_path,
@@ -750,6 +815,20 @@ fn unquote_yaml_string(val: &str) -> String {
     } else {
         val.to_string()
     }
+}
+
+/// Reads a `[a, b]` list of plain strings, keeping the case and wording of each entry. Tags
+/// have their own normalisation; identifiers must stay exactly as they were typed.
+fn parse_yaml_list(val: &str) -> Vec<String> {
+    let inner = val.trim().trim_start_matches('[').trim_end_matches(']');
+    if inner.trim().is_empty() {
+        return Vec::new();
+    }
+    inner
+        .split(',')
+        .map(|s| unquote_yaml_string(s.trim()))
+        .filter(|s| !s.trim().is_empty())
+        .collect()
 }
 
 fn parse_yaml_tags(val: &str) -> Vec<String> {
@@ -1088,6 +1167,41 @@ mod tests {
         assert_eq!(parsed.icon, None);
     }
 
+    /// A shared library's note remembers who it belongs to and who it was opened to, in plain
+    /// frontmatter the server can read back after a restart.
+    #[test]
+    fn test_note_owner_and_sharing_round_trip() {
+        let dir = temp_test_dir("share_roundtrip");
+        let mut note = Note::new("Private plan", "body", &dir);
+        note.owner = Some("Nox".to_string());
+        note.private = true;
+        note.shared_with = vec!["SuperSaiyan".to_string(), "Mira".to_string()];
+
+        let md = note.to_markdown();
+        assert!(md.contains("\nowner: \"Nox\"\n"), "{md}");
+        assert!(md.contains("\nprivate: true\n"), "{md}");
+        assert!(
+            md.contains("\nshared_with: [\"SuperSaiyan\", \"Mira\"]\n"),
+            "{md}"
+        );
+        let parsed = Note::from_markdown(note.id.clone(), &md, note.file_path.clone());
+        assert_eq!(parsed.owner.as_deref(), Some("Nox"));
+        assert!(parsed.private);
+        assert_eq!(parsed.shared_with, vec!["SuperSaiyan", "Mira"]);
+
+        // A note kept on this computer has no sharing lines at all, and an older note with none
+        // reads as open to everyone.
+        let plain = Note::new("Mine", "body", &dir);
+        let md = plain.to_markdown();
+        assert!(!md.contains("owner:"), "{md}");
+        assert!(!md.contains("private:"), "{md}");
+        assert!(!md.contains("shared_with:"), "{md}");
+        let parsed = Note::from_markdown(plain.id.clone(), &md, plain.file_path.clone());
+        assert_eq!(parsed.owner, None);
+        assert!(!parsed.private);
+        assert!(parsed.shared_with.is_empty());
+    }
+
     #[test]
     fn test_note_folder_round_trip() {
         let dir = temp_test_dir("folder_roundtrip");
@@ -1355,5 +1469,33 @@ And a number #123 should be ignored, while #valid_tag is kept.";
         assert!(legacy.join("Old.md").is_file());
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Cards start without the preview line, and a settings file written while the line showed
+    /// by default does not quietly keep it on.
+    #[test]
+    fn test_note_previews_start_off_and_old_settings_do_not_turn_them_on() {
+        assert!(!AppSettings::default().show_card_previews);
+
+        let old = serde_json::json!({
+            "theme_name": "Obsidian",
+            "show_formatting_bar": true,
+            "show_card_previews": true,
+        });
+        let settings: AppSettings = serde_json::from_value(old).unwrap();
+        assert!(
+            !settings.show_card_previews,
+            "the key from when the line was on by default is not read"
+        );
+
+        // A choice made now is kept, under the new key.
+        let chosen = AppSettings {
+            show_card_previews: true,
+            ..AppSettings::default()
+        };
+        let text = serde_json::to_string(&chosen).unwrap();
+        assert!(text.contains("\"note_previews\":true"), "{text}");
+        let back: AppSettings = serde_json::from_str(&text).unwrap();
+        assert!(back.show_card_previews);
     }
 }

@@ -147,5 +147,9 @@ pub mod icon {
     pub const CLOUD: &str = "\u{ea76}";
     pub const SERVER: &str = "\u{eb1f}";
     pub const USERS: &str = "\u{ebf2}";
+    pub const USER_PLUS: &str = "\u{eb4b}";
+    pub const LOCK: &str = "\u{eae2}";
+    pub const LOCK_OPEN: &str = "\u{eae1}";
+    pub const WORLD: &str = "\u{eb54}";
     pub const WIFI_OFF: &str = "\u{ecfa}";
 }

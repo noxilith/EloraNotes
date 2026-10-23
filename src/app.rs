@@ -31,6 +31,8 @@ use std::time::{Duration, Instant};
 /// and the editor stop shifting around while the window is resized. It only has to fit
 /// the logo, title and New button now that the other actions live in the footer.
 const SIDEBAR_WIDTH: f32 = 210.0;
+/// Where the footer's coffee cup sends people.
+const KOFI_URL: &str = "https://ko-fi.com/noxilith";
 /// How long the editor waits for a shared note's own text before trusting the copy it has. A
 /// note that opens normally answers in a few milliseconds; this only covers one that never does.
 const ROOM_BODY_WAIT: Duration = Duration::from_millis(800);
@@ -161,6 +163,10 @@ pub struct EloraApp {
     pending_server_move: Option<PendingMove>,
     confirm_delete_id: Option<String>,
     command_palette_open: bool,
+    /// The "who can see this note" panel, and the note it was opened for.
+    share_picker_open: bool,
+    share_picker_note_id: Option<String>,
+    share_input: String,
     icon_picker_open: bool,
     /// True when the picker is inserting a glyph into the body instead of setting the header icon.
     icon_picker_for_body: bool,
@@ -192,8 +198,24 @@ pub struct EloraApp {
     /// Pictures this computer sent to the library and has not heard about yet, so a refusal can
     /// be reported to the person who added the picture.
     shared_uploads: BTreeSet<String>,
-    /// The name other people see for this client, when the account name is not wanted.
+    /// The identifier this client goes by: what others see next to its caret, and the word a
+    /// note is opened to. Generated on first launch, and typed by the person when they want
+    /// their own.
     display_name: String,
+    /// A system file dialog running on its own thread, with the note its picture belongs to.
+    picture_pick: Option<PicturePick>,
+}
+
+/// A "choose a picture" dialog running on a thread of its own.
+///
+/// The desktop's dialog answers on the file portal's schedule, and the blocking call waits for
+/// it. On the window's own thread that stops the event loop for as long as somebody browses
+/// their pictures, which is long enough for the desktop to decide the app has hung and offer to
+/// close it. Off the thread, the window keeps drawing and the desktop never asks.
+struct PicturePick {
+    /// The note the picture goes into; the person may have moved on by the time it arrives.
+    note_id: String,
+    result: Receiver<Option<PathBuf>>,
 }
 
 /// Messages from the update worker threads to the UI.
@@ -344,7 +366,7 @@ impl EloraApp {
         let notes = storage.load_all().unwrap_or_default();
         let selected_id = notes.iter().find(|n| !n.trashed).map(|n| n.id.clone());
 
-        let app = Self {
+        let mut app = Self {
             storage,
             notes,
             selected_id,
@@ -384,6 +406,9 @@ impl EloraApp {
             last_seen_body: None,
             confirm_delete_id: None,
             command_palette_open: false,
+            share_picker_open: false,
+            share_picker_note_id: None,
+            share_input: String::new(),
             icon_picker_open: false,
             icon_picker_for_body: false,
             text_color_rgb: settings.text_color_rgb,
@@ -404,7 +429,15 @@ impl EloraApp {
             caret_after_insert: None,
             requested_pictures: BTreeSet::new(),
             shared_uploads: BTreeSet::new(),
+            picture_pick: None,
         };
+        // Every client needs a word it is known by: it is the name others see, and the key a
+        // private note is opened to. A fresh install gets one so nothing has to be filled in
+        // before the shared library works, and Settings lets it be replaced with any word.
+        if app.display_name.trim().is_empty() {
+            app.display_name = random_identifier();
+            app.persist_settings();
+        }
         app
     }
 
@@ -847,8 +880,9 @@ impl EloraApp {
                                 "Show a preview line on note cards",
                             )
                             .on_hover_text(
-                                "Turn this off to leave just the title, date and tags, so the \
-                                 sidebar's cards are shorter and more notes fit at once",
+                                "Off leaves just the title, date and tags, so the sidebar's \
+                                 cards are shorter and more notes fit at once. On adds the first \
+                                 lines of each note.",
                             )
                             .changed();
                         ui.separator();
@@ -1013,29 +1047,49 @@ impl EloraApp {
                     .desired_width(140.0),
             );
         });
-        // The name is what the others see, so it is changed here rather than by editing the
-        // account this computer is logged into.
-        let mut name_changed = false;
+        // One word is both the name others see and the identifier a private note is opened to,
+        // so sharing a note means typing what that person goes by — and the same word on
+        // another computer is that person again.
+        let mut identifier_changed = false;
+        let mut identifier_committed = false;
+        let mut new_identifier = false;
         ui.horizontal(|ui| {
-            ui.label("Your name");
+            ui.label("Your identifier");
             let account = crate::net::os_username();
             let typed = ui
                 .add(
                     TextEdit::singleline(&mut self.display_name)
                         .hint_text(&account)
-                        .desired_width(180.0),
+                        .desired_width(170.0),
                 )
-                .on_hover_text(format!(
-                    "The name others see next to your caret. Leave it empty to use {account}."
-                ));
-            name_changed = typed.changed();
-        });
-        if name_changed {
-            self.persist_settings();
-            if self.collab.is_connected() {
-                let name = self.server_display_name();
-                self.collab.set_name(&name);
+                .on_hover_text(
+                    "The name others see next to your caret, and the word they add to a note to \
+                     share it with you. Use the same identifier on another computer to find your \
+                     shared notes there.",
+                );
+            identifier_changed = typed.changed();
+            identifier_committed = typed.lost_focus();
+            if ui
+                .small_button("New")
+                .on_hover_text("Make a fresh random identifier")
+                .clicked()
+            {
+                new_identifier = true;
             }
+        });
+        if new_identifier {
+            self.display_name = random_identifier();
+            identifier_changed = true;
+            identifier_committed = true;
+        }
+        if identifier_changed {
+            self.persist_settings();
+        }
+        if identifier_committed && self.collab.is_connected() {
+            // Which notes the server shows depends on the identifier, so this is a new
+            // conversation with the server rather than a rename while it is open.
+            self.disconnect_server();
+            self.connect_server();
         }
 
         ui.horizontal(|ui| {
@@ -1073,7 +1127,9 @@ impl EloraApp {
         }
         ui.label(
             RichText::new(
-                "The server's notes appear in the sidebar under its name. Your username comes from this computer's login.",
+                "The server's notes appear in the sidebar under its name. Notes you make there are \
+                 filed under your identifier, and a note can be closed to everybody but the \
+                 people you name on it.",
             )
             .size(10.5)
             .color(p.fg_muted),
@@ -1238,6 +1294,11 @@ impl EloraApp {
                 trashed: note.trashed,
                 icon: note.icon,
                 updated_at: note.updated_at.timestamp(),
+                // Sharing has its own message, sent from the panel that changes it, so an
+                // ordinary edit never carries it and can never undo somebody else's.
+                owner: note.owner.clone(),
+                private: note.private,
+                shared_with: note.shared_with.clone(),
             });
         }
         if self.collab_open.as_deref() == Some(note.id.as_str())
@@ -1397,23 +1458,45 @@ impl EloraApp {
 
     /// The toolbar's picture button: the system's own file dialog, starting where pictures
     /// usually are, then the chosen file goes into the note like a dropped one.
-    fn pick_picture(&mut self, note_idx: usize) {
-        let mut dialog = rfd::FileDialog::new()
-            .set_title("Add a picture to this note")
-            .add_filter("Pictures", &["png", "jpg", "jpeg", "gif"]);
-        // Start where pictures usually are, but only if that folder really exists: a portal
-        // asked for a missing folder is left showing nothing useful.
-        if let Some(start) = dirs::picture_dir()
-            .filter(|dir| dir.is_dir())
-            .or_else(|| dirs::home_dir().filter(|dir| dir.is_dir()))
-        {
-            dialog = dialog.set_directory(start);
+    fn pick_picture(&mut self, ctx: &egui::Context, note_idx: usize) {
+        if self.picture_pick.is_some() {
+            self.status_message = Some("A picture is already being chosen".to_string());
+            return;
         }
-        let Some(path) = dialog.pick_file() else {
+        self.picture_pick = Some(PicturePick {
+            note_id: self.notes[note_idx].id.clone(),
+            result: choose_picture_file(ctx),
+        });
+    }
+
+    /// Picks up the file dialog's answer, if it has one by now, and adds the picture to the note
+    /// it was opened from. Called every frame, because the answer arrives between frames.
+    fn poll_picture_pick(&mut self) {
+        let Some(pick) = self.picture_pick.as_ref() else {
             return;
         };
-        if let Err(e) = self.add_picture_file(note_idx, &path) {
-            self.status_message = Some(e);
+        let note_id = pick.note_id.clone();
+        let answer = pick.result.try_recv();
+        match answer {
+            Ok(Some(path)) => {
+                self.picture_pick = None;
+                match self.notes.iter().position(|note| note.id == note_id) {
+                    Some(note_idx) => {
+                        if let Err(e) = self.add_picture_file(note_idx, &path) {
+                            self.status_message = Some(e);
+                        }
+                    }
+                    // The note was closed, copied away or the server dropped it while the dialog
+                    // was open; there is nowhere to put the picture now.
+                    None => {
+                        self.status_message =
+                            Some("That note is gone, so the picture was not added".to_string())
+                    }
+                }
+            }
+            Ok(None) => self.picture_pick = None,
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => self.picture_pick = None,
         }
     }
 
@@ -1534,8 +1617,8 @@ impl EloraApp {
         };
     }
 
-    /// The name this client goes by: what was typed in Settings, or the account name when that
-    /// is left empty.
+    /// The identifier this client goes by: what was typed in Settings, or the account name when
+    /// a settings file from before identifiers has nothing in it.
     fn server_display_name(&self) -> String {
         let typed = self.display_name.trim();
         if typed.is_empty() {
@@ -1664,6 +1747,9 @@ impl EloraApp {
                     note.pinned = meta.pinned;
                     note.trashed = meta.trashed;
                     note.icon = meta.icon;
+                    note.owner = meta.owner.clone();
+                    note.private = meta.private;
+                    note.shared_with = meta.shared_with.clone();
                     note.updated_at = updated;
                     if self.collab_open.as_deref() != Some(meta.id.as_str()) {
                         if let Some(body) = self.remote_bodies.get(&meta.id) {
@@ -1686,6 +1772,9 @@ impl EloraApp {
                         explicit_tags: meta.tags,
                         icon: meta.icon,
                         folder: meta.folder,
+                        owner: meta.owner,
+                        private: meta.private,
+                        shared_with: meta.shared_with,
                         created_at: updated,
                         updated_at: updated,
                         file_path: PathBuf::new(),
@@ -1695,6 +1784,15 @@ impl EloraApp {
             self.remote_ids.insert(meta.id);
         }
         self.resort();
+        // A note that was closed to this person while they were reading it takes their
+        // selection with it, so the window is not left showing a note that is no longer theirs.
+        if self
+            .selected_id
+            .as_ref()
+            .is_some_and(|id| !self.notes.iter().any(|note| &note.id == id))
+        {
+            self.select_first_visible();
+        }
     }
 
     /// Drains the connection's messages and folds them into the app state.
@@ -1714,6 +1812,9 @@ impl EloraApp {
                     library_changed = true;
                 }
                 Incoming::Notes(_) => library_changed = true,
+                // A note that is not this person's to change, or one that was closed to them
+                // while they had it open. The connection stays up; the reason is worth saying.
+                Incoming::Refused(message) => self.status_message = Some(message),
                 Incoming::Created(note) => {
                     // Open it straight away: the library broadcast that follows makes it a
                     // normal shared note in the list.
@@ -1735,6 +1836,9 @@ impl EloraApp {
                             explicit_tags: note.tags.clone(),
                             icon: note.icon.clone(),
                             folder: note.folder.clone(),
+                            owner: note.owner.clone(),
+                            private: note.private,
+                            shared_with: note.shared_with.clone(),
                             created_at: updated,
                             updated_at: updated,
                             file_path: PathBuf::new(),
@@ -3221,6 +3325,15 @@ impl EloraApp {
                     .clicked()
                 {
                     self.show_settings = true;
+                } // Ko-fi's cup, beside Settings: leaving a tip is the one thing the app can
+                  // offer besides its own features, so it has a place in the footer.
+                if kofi_button(ui, p)
+                    .on_hover_text(format!("Support EloraNotes on Ko-fi\n{KOFI_URL}"))
+                    .clicked()
+                {
+                    if let Err(e) = open_in_browser(KOFI_URL) {
+                        self.status_message = Some(e);
+                    }
                 }
 
                 if ui
@@ -3775,8 +3888,11 @@ impl EloraApp {
                 );
                 for peer in &peers {
                     let [r, g, b] = peer.color;
+                    // The same brush the sidebar cards use. The filled circle this used to
+                    // draw has no glyph in the bundled fonts, so it showed as a
+                    // missing-character box beside every name.
                     ui.label(
-                        RichText::new(format!("● {}", peer.name))
+                        RichText::new(format!("{} {}", icon::BRUSH, peer.name))
                             .size(11.0)
                             .color(Color32::from_rgb(r, g, b)),
                     );
@@ -3905,6 +4021,186 @@ impl EloraApp {
         output.response.context_menu(|ui| {
             self.render_editor_context_menu(ui, p, queued_op);
         });
+    }
+
+    /// The panel behind the header's lock button: open the note to the whole server, close it to
+    /// everybody but its owner, or name the people who may read it. Only the owner may change it;
+    /// everybody else sees which note they were let into and by whom.
+    fn render_share_picker(&mut self, ctx: &egui::Context, p: &Palette) {
+        if !self.share_picker_open {
+            return;
+        }
+        let Some(note_id) = self.share_picker_note_id.clone() else {
+            self.share_picker_open = false;
+            return;
+        };
+        // The library is the only place that knows who may see a note; a note that is not in it
+        // (deleted, or moved off the server) has nothing to show.
+        let Some(meta) = self
+            .collab
+            .notes()
+            .iter()
+            .find(|meta| meta.id == note_id)
+            .cloned()
+        else {
+            self.share_picker_open = false;
+            self.share_picker_note_id = None;
+            return;
+        };
+        let me = self.server_display_name();
+        let owner = meta.owner.clone().unwrap_or_else(|| me.clone());
+        let mine = owner.eq_ignore_ascii_case(&me);
+        let server = self.collab.server_name().map(str::to_string);
+        let mut open = true;
+        let mut change: Option<(bool, Vec<String>)> = None;
+        let mut remove: Option<String> = None;
+
+        egui::Window::new("Who can see this note")
+            .id(Id::new("elora_share_picker"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 68.0))
+            .frame(
+                Frame::new()
+                    .fill(p.bg_sidebar)
+                    .stroke(Stroke::new(1.5_f32, p.accent))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::symmetric(14, 12)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(330.0);
+                ui.label(
+                    RichText::new(meta.title.clone())
+                        .size(13.5)
+                        .strong()
+                        .color(p.fg_primary),
+                );
+                ui.label(
+                    RichText::new(if mine {
+                        "You decide who can read this note.".to_string()
+                    } else {
+                        format!("{owner} decides who can read this note.")
+                    })
+                    .size(11.0)
+                    .color(p.fg_muted),
+                );
+                ui.add_space(6.0);
+
+                let mut private = meta.private;
+                ui.add_enabled_ui(mine, |ui| {
+                    if ui
+                        .radio_value(
+                            &mut private,
+                            false,
+                            format!(
+                                "{} Everyone{}",
+                                icon::WORLD,
+                                server.map(|s| format!(" on {s}")).unwrap_or_default()
+                            ),
+                        )
+                        .clicked()
+                    {
+                        change = Some((false, Vec::new()));
+                    }
+                    let only = if meta.shared_with.is_empty() {
+                        format!("{} Only me", icon::LOCK)
+                    } else {
+                        format!("{} Only these people", icon::LOCK)
+                    };
+                    if ui.radio_value(&mut private, true, only).clicked() {
+                        change = Some((true, meta.shared_with.clone()));
+                    }
+                });
+
+                if meta.private {
+                    ui.add_space(4.0);
+                    if meta.shared_with.is_empty() {
+                        ui.label(
+                            RichText::new("Nobody else can open it.")
+                                .size(11.0)
+                                .color(p.fg_muted),
+                        );
+                    } else {
+                        ui.horizontal_wrapped(|ui| {
+                            for name in &meta.shared_with {
+                                let chip = format!("{name} {}", icon::X);
+                                if ui
+                                    .add_enabled(
+                                        mine,
+                                        egui::Button::new(RichText::new(chip).size(11.5)),
+                                    )
+                                    .on_hover_text("Take this person off the note")
+                                    .clicked()
+                                {
+                                    remove = Some(name.clone());
+                                }
+                            }
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        let field = ui.add_enabled(
+                            mine,
+                            TextEdit::singleline(&mut self.share_input)
+                                .hint_text("Their identifier, e.g. SuperSaiyan")
+                                .desired_width(200.0),
+                        );
+                        let entered = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        let added = ui
+                            .add_enabled(
+                                mine,
+                                egui::Button::new(format!("{} Add", icon::USER_PLUS)),
+                            )
+                            .clicked();
+                        if mine && (entered || added) {
+                            let name = crate::net::normalize_identifier(&self.share_input);
+                            if !name.is_empty()
+                                && !meta
+                                    .shared_with
+                                    .iter()
+                                    .any(|kept| kept.eq_ignore_ascii_case(&name))
+                            {
+                                let mut list = meta.shared_with.clone();
+                                list.push(name);
+                                change = Some((true, list));
+                            }
+                            self.share_input.clear();
+                        }
+                    });
+                    if let Some(name) = remove.take() {
+                        let kept = meta
+                            .shared_with
+                            .iter()
+                            .filter(|other| **other != name)
+                            .cloned()
+                            .collect();
+                        change = Some((true, kept));
+                    }
+                }
+
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!("Your identifier is “{me}”."))
+                        .size(10.5)
+                        .color(p.fg_secondary),
+                );
+                ui.label(
+                    RichText::new(
+                        "Names decide which notes the server hands out. The server password is \
+                         still what decides who may connect.",
+                    )
+                    .size(10.0)
+                    .color(p.fg_muted),
+                );
+            });
+
+        if let Some((private, shared_with)) = change {
+            self.collab.set_share(&note_id, private, shared_with);
+        }
+        if !open {
+            self.share_picker_open = false;
+            self.share_picker_note_id = None;
+        }
     }
 
     /// Floating, searchable Tabler icon picker for the selected note.
@@ -4166,6 +4462,40 @@ impl EloraApp {
                 &extras,
             ) {
                 folder_choice = Some(choice);
+            }
+
+            // Who may read this note. Only the server's notes can be closed to people: a note
+            // on this computer has no server to be private on.
+            if on_server {
+                if !compact {
+                    ui.label(RichText::new("·").color(p.fg_muted));
+                }
+                let (glyph, summary) = share_look(
+                    self.notes[note_idx].private,
+                    &self.notes[note_idx].shared_with,
+                    self.notes[note_idx].owner.as_deref(),
+                    &self.server_display_name(),
+                    self.collab.server_name(),
+                );
+                let showing = self.share_picker_open
+                    && self.share_picker_note_id.as_deref() == Some(selected_id.as_str());
+                let tint = if self.notes[note_idx].private {
+                    p.accent
+                } else {
+                    p.fg_secondary
+                };
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new(glyph).size(13.0).color(tint))
+                            .frame(showing),
+                    )
+                    .on_hover_text(summary)
+                    .clicked()
+                {
+                    self.share_picker_note_id = Some(self.notes[note_idx].id.clone());
+                    self.share_picker_open = true;
+                    self.share_input.clear();
+                }
             }
 
             if !compact {
@@ -4659,7 +4989,7 @@ impl EloraApp {
                     .on_hover_text("Add a picture to this note (or drop one on the window)")
                     .clicked()
                 {
-                    self.pick_picture(note_idx);
+                    self.pick_picture(ui.ctx(), note_idx);
                 }
 
                 // The colour controls are their own fixed-size child layout, so this wrapping
@@ -4961,6 +5291,7 @@ impl eframe::App for EloraApp {
         self.handle_shortcuts(ctx);
         self.poll_update();
         self.poll_collab(ctx);
+        self.poll_picture_pick();
         self.sync_open_note();
         self.settings_window(ctx);
         self.graph_window(ctx);
@@ -5062,6 +5393,7 @@ impl eframe::App for EloraApp {
         }
 
         self.render_command_palette(ctx, &p);
+        self.render_share_picker(ctx, &p);
         self.update_window(ctx, &p);
         self.status_toast(ctx, &p);
     }
@@ -5478,6 +5810,176 @@ enum FolderChoice {
 struct CardSelection {
     note_id: Option<String>,
     tag: Option<String>,
+}
+
+/// The footer's Ko-fi button: the cup with a heart on it, in the colour of the icons beside it
+/// and in the accent colour under the pointer.
+fn kofi_button(ui: &mut Ui, p: &Palette) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(20.0, 18.0), Sense::click());
+    let color = if response.hovered() {
+        p.accent
+    } else {
+        p.fg_secondary
+    };
+    let mark = Rect::from_center_size(rect.center(), Vec2::splat(18.0));
+    // The heart is a hole in the cup, so what shows through it is the panel behind the footer.
+    ui.painter()
+        .extend(kofi_mark_shapes(mark, color, p.bg_sidebar));
+    response
+}
+
+/// Ko-fi's mark, drawn rather than typed: the icon font has no Ko-fi glyph, and a plain coffee
+/// cup reads as "coffee" instead of "Ko-fi". The mark is a solid cup with a heart cut out of
+/// it and a handle on the right, built from a few shapes so it stays sharp at the footer's icon
+/// size and takes whatever colour the theme (or the pointer) gives it.
+///
+/// `hole` is the colour behind the button: the heart is painted in it, over the cup, which is
+/// the same thing as cutting it out without needing a masked shape.
+fn kofi_mark_shapes(rect: Rect, color: Color32, hole: Color32) -> Vec<egui::Shape> {
+    let scale = rect.width().min(rect.height()) / 18.0;
+    let at = |x: f32, y: f32| Pos2::new(rect.min.x + x * scale, rect.min.y + y * scale);
+
+    // The cup, and its handle: an arc centred on the right wall, reaching a little way inside it
+    // so the two join up instead of floating apart.
+    let cup = Rect::from_min_max(at(3.2, 4.0), at(12.2, 15.6));
+    let handle: Vec<Pos2> = (0..=16)
+        .map(|step| {
+            let angle = -1.7 + 3.4 * step as f32 / 16.0;
+            at(12.2 + 2.2 * angle.cos(), 9.4 + 2.2 * angle.sin())
+        })
+        .collect();
+
+    // Two lobes and a point make the heart as one shape, so it does not depend on the
+    // tessellator coping with a concave outline; the lobes overlap enough to read as one heart
+    // even at eighteen points.
+    let (cx, cy, r) = (7.6_f32, 9.4_f32, 2.4_f32);
+    let lobe = 0.66 * r * scale;
+    vec![
+        egui::Shape::rect_filled(
+            cup,
+            egui::CornerRadius::same((2.4 * scale).round() as u8),
+            color,
+        ),
+        egui::Shape::line(handle, Stroke::new((1.3 * scale).max(1.0), color)),
+        egui::Shape::circle_filled(at(cx - 0.62 * r, cy - 0.25 * r), lobe, hole),
+        egui::Shape::circle_filled(at(cx + 0.62 * r, cy - 0.25 * r), lobe, hole),
+        egui::Shape::convex_polygon(
+            vec![
+                at(cx - 1.12 * r, cy),
+                at(cx, cy + 1.45 * r),
+                at(cx + 1.12 * r, cy),
+            ],
+            hole,
+            Stroke::NONE,
+        ),
+    ]
+}
+
+/// Hands a web address to the desktop's browser. Started and let go: what the browser does with
+/// it is none of the app's business, and nothing waits for it to come back.
+fn open_in_browser(url: &str) -> Result<(), String> {
+    browser_command(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Could not open the browser: {e}"))
+}
+
+/// The desktop's own "open this address" command, per platform. Kept apart from the spawn so a
+/// test can read what would be run without starting a browser.
+fn browser_command(url: &str) -> std::process::Command {
+    #[cfg(target_os = "windows")]
+    let command = {
+        let mut command = std::process::Command::new("cmd");
+        // The empty title matters: `start` takes the first quoted word as the window title.
+        command.args(["/C", "start", ""]).arg(url);
+        command
+    };
+    #[cfg(target_os = "macos")]
+    let command = {
+        let mut command = std::process::Command::new("open");
+        command.arg(url);
+        command
+    };
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let command = {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(url);
+        command
+    };
+    command
+}
+
+/// The glyph and the one-line answer for who can read a note, used by the header's lock button.
+fn share_look(
+    private: bool,
+    shared_with: &[String],
+    owner: Option<&str>,
+    me: &str,
+    server: Option<&str>,
+) -> (&'static str, String) {
+    if !private {
+        let where_ = server.map(|name| format!(" on {name}")).unwrap_or_default();
+        return (icon::WORLD, format!("Everyone{where_} can see this note"));
+    }
+    let owner = owner.unwrap_or(me);
+    if owner.eq_ignore_ascii_case(me) {
+        if shared_with.is_empty() {
+            (icon::LOCK, "Only you can see this note".to_string())
+        } else {
+            (
+                icon::LOCK,
+                format!("Shared with {}", shared_with.join(", ")),
+            )
+        }
+    } else {
+        (icon::LOCK, format!("{owner} shared this note with you"))
+    }
+}
+
+/// A first identifier for this computer: the account name with a short random tail, so it reads
+/// as a person rather than a number while still not colliding with anybody else on a server.
+/// Settings replaces it with any word the person prefers.
+fn random_identifier() -> String {
+    let base: String = crate::net::os_username()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+        .take(24)
+        .collect();
+    let suffix = format!("{:04x}", rand::random::<u16>());
+    if base.is_empty() {
+        format!("guest-{suffix}")
+    } else {
+        format!("{base}-{suffix}")
+    }
+}
+
+/// Opens the system's "choose a picture" dialog on a thread of its own and hands back the
+/// channel its answer arrives on, so the window is never blocked waiting for it.
+fn choose_picture_file(ctx: &egui::Context) -> Receiver<Option<PathBuf>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let wake = ctx.clone();
+    std::thread::spawn(move || {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Add a picture to this note")
+            .add_filter("Pictures", &["png", "jpg", "jpeg", "gif"]);
+        // Start where pictures usually are, but only if that folder really exists: a portal
+        // asked for a missing folder is left showing nothing useful.
+        if let Some(start) = dirs::picture_dir()
+            .filter(|dir| dir.is_dir())
+            .or_else(|| dirs::home_dir().filter(|dir| dir.is_dir()))
+        {
+            dialog = dialog.set_directory(start);
+        }
+        let chosen = dialog.pick_file();
+        let _ = sender.send(chosen);
+        // A window that is not asked to draw would not see the answer until something else
+        // happened to repaint it.
+        wake.request_repaint();
+    });
+    receiver
 }
 
 /// Runs `add` shifted right by `indent`, so a nested group reads as inside its parent.
@@ -6206,6 +6708,9 @@ mod tests {
             explicit_tags: Vec::new(),
             icon: None,
             folder: folder.map(str::to_string),
+            owner: None,
+            private: false,
+            shared_with: Vec::new(),
             created_at: now,
             updated_at: now,
             file_path: PathBuf::new(),
@@ -6360,6 +6865,9 @@ mod tests {
             explicit_tags: vec!["tag".into()],
             icon: None,
             folder: None,
+            owner: None,
+            private: false,
+            shared_with: Vec::new(),
             created_at: now,
             updated_at: now,
             file_path: PathBuf::new(),
@@ -6563,14 +7071,32 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = EloraApp::with_context(&ctx, storage);
 
-        // Nobody has typed a name yet, so the computer's account name is used.
-        assert_eq!(app.server_display_name(), crate::net::os_username());
-        app.display_name = "  Nox  ".to_string();
-        assert_eq!(app.server_display_name(), "Nox");
-        // And the choice survives a restart.
+        // A fresh install gets an identifier of its own, so the shared library works before
+        // anything is typed. It reads as a person, not as a number.
+        let generated = app.server_display_name();
+        assert!(
+            !generated.trim().is_empty(),
+            "an identifier is made up front"
+        );
+        assert_eq!(
+            generated, app.display_name,
+            "it is saved, not made per launch"
+        );
+        assert!(
+            generated.len() > 4 && generated.len() <= 64,
+            "a usable identifier: {generated}"
+        );
+        // And it is still there after a restart, so a private note found on another computer is
+        // found again here.
+        let reopened = EloraApp::with_context(&ctx, NoteStorage::new(dir.join("notes")).unwrap());
+        assert_eq!(reopened.server_display_name(), generated);
+
+        // A word the person picks is used exactly, minus the space they typed around it.
+        app.display_name = "  SuperSaiyan  ".to_string();
+        assert_eq!(app.server_display_name(), "SuperSaiyan");
         app.persist_settings();
         let reopened = EloraApp::with_context(&ctx, NoteStorage::new(dir.join("notes")).unwrap());
-        assert_eq!(reopened.server_display_name(), "Nox");
+        assert_eq!(reopened.server_display_name(), "SuperSaiyan");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6645,6 +7171,65 @@ mod tests {
         app.last_seen_body = Some((note.id.clone(), note.body.clone()));
         app.notes.push(note);
         (app, dir, root)
+    }
+
+    /// The dialog answers between frames, so its result is collected later and goes into the
+    /// note it was opened from — not into whatever note happens to be selected by then.
+    #[test]
+    fn test_the_chosen_picture_is_added_to_the_note_the_dialog_was_opened_for() {
+        let (mut app, dir, root) = app_with_note("First line");
+        let wanted = app.notes.len() - 1;
+        let note_id = app.notes[wanted].id.clone();
+        // A second note gets selected while the dialog is still open.
+        let other = Note::new("Other", "Somewhere else", &root);
+        app.notes.push(other);
+        app.selected_id = app.notes.last().map(|note| note.id.clone());
+
+        let picture = dir.join("chosen.png");
+        std::fs::write(&picture, png_bytes()).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(Some(picture.clone())).unwrap();
+        app.picture_pick = Some(PicturePick {
+            note_id: note_id.clone(),
+            result: receiver,
+        });
+
+        app.poll_picture_pick();
+
+        assert!(app.picture_pick.is_none(), "the answer was collected");
+        assert!(
+            app.notes[wanted]
+                .body
+                .contains("![chosen](attachments/chosen-"),
+            "the picture went into the note it was picked for: {:?}",
+            app.notes[wanted].body
+        );
+        assert_eq!(
+            app.notes.last().unwrap().body,
+            "Somewhere else",
+            "the note selected meanwhile is left alone"
+        );
+        let stored = std::fs::read_dir(root.join("attachments"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .count();
+        assert_eq!(stored, 1, "the picture is kept beside the notes");
+
+        // Cancelling the dialog adds nothing and leaves no dialog pending.
+        let before = app.notes[wanted].body.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(None).unwrap();
+        app.picture_pick = Some(PicturePick {
+            note_id,
+            result: receiver,
+        });
+        app.poll_picture_pick();
+        assert!(app.picture_pick.is_none());
+        assert_eq!(
+            app.notes[wanted].body, before,
+            "a cancelled dialog adds nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -6988,7 +7573,9 @@ mod tests {
         let note_id = "shared-0001".to_string();
         std::fs::write(
             notes_dir.join(format!("{note_id}.md")),
-            "---\ntitle: \"Shared\"\npinned: false\ntrashed: false\ntags: []\n\
+            // Owned by nox, open to everyone: the shape a note has once its owner has made it
+            // in the library, and the starting point the privacy tests need.
+            "---\ntitle: \"Shared\"\npinned: false\ntrashed: false\ntags: []\nowner: \"nox\"\n\
              created_at: 2026-01-01T00:00:00+00:00\nupdated_at: 2026-01-01T00:00:00+00:00\n---\n\
              hello",
         )
@@ -7021,6 +7608,203 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         (dir, port, note_id)
+    }
+
+    /// Two people on one server: closing a note takes it out of the other person's library, and
+    /// naming them on it brings it back — the whole point of the identifier.
+    #[test]
+    fn test_a_note_closed_to_others_leaves_their_library_until_they_are_named() {
+        let (dir, port, shared_id) = start_shared_server("sharing");
+        let ctx = egui::Context::default();
+        let profile = ServerProfile {
+            host: "127.0.0.1".into(),
+            port,
+            password: "letmein".into(),
+            fingerprint: None,
+        };
+
+        let mut owner = EloraApp::with_context(&ctx, NoteStorage::new(dir.join("owner")).unwrap());
+        owner.display_name = "nox".to_string();
+        owner.server_form = profile.clone();
+        owner.connect_server();
+        wait_for_shared(&mut owner, &ctx, "owner connected", |app| {
+            app.collab.is_connected() && app.collab.notes().iter().any(|n| n.id == shared_id)
+        });
+
+        let mut friend =
+            EloraApp::with_context(&ctx, NoteStorage::new(dir.join("friend")).unwrap());
+        friend.display_name = "Mira".to_string();
+        friend.server_form = profile;
+        friend.connect_server();
+        wait_for_shared(&mut friend, &ctx, "friend connected", |app| {
+            app.collab.is_connected()
+                && app.notes.iter().any(|n| n.id == shared_id)
+                && app.remote_ids.contains(&shared_id)
+        });
+
+        // The note is somebody else's, so a guest cannot close it — and being told so leaves the
+        // connection up, with the reason in the corner.
+        friend.collab.set_share(&shared_id, true, Vec::new());
+        wait_for_shared(&mut friend, &ctx, "the refusal", |app| {
+            app.status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("only nox"))
+        });
+        assert!(friend.collab.is_connected(), "a refusal is not an outage");
+
+        // "Only me": it disappears for the other person, in their sidebar too.
+        owner.collab.set_share(&shared_id, true, Vec::new());
+        wait_for_shared(&mut owner, &ctx, "closed for the owner", |app| {
+            app.collab
+                .notes()
+                .iter()
+                .any(|meta| meta.id == shared_id && meta.private)
+        });
+        wait_for_shared(&mut friend, &ctx, "gone for the friend", |app| {
+            !app.notes.iter().any(|note| note.id == shared_id)
+        });
+        assert!(
+            !friend.remote_ids.contains(&shared_id),
+            "the restricted note left the friend's list of shared notes"
+        );
+
+        // Naming them — with a different capitalisation of their identifier — lets them in.
+        owner
+            .collab
+            .set_share(&shared_id, true, vec!["mira".to_string()]);
+        wait_for_shared(&mut friend, &ctx, "shared back", |app| {
+            app.notes.iter().any(|note| note.id == shared_id)
+        });
+        wait_for_shared(&mut owner, &ctx, "the owner sees the name", |app| {
+            app.collab
+                .notes()
+                .iter()
+                .any(|meta| meta.id == shared_id && meta.shared_with.len() == 1)
+        });
+
+        // And opening it again takes it back to the whole server.
+        owner.collab.set_share(&shared_id, false, Vec::new());
+        wait_for_shared(&mut owner, &ctx, "opened again", |app| {
+            app.collab
+                .notes()
+                .iter()
+                .any(|meta| meta.id == shared_id && !meta.private)
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// The mark is a cup with a heart cut out of it and a handle on its right, and nothing
+    /// spills outside the square the footer gives it.
+    #[test]
+    fn test_the_kofi_mark_is_a_cup_with_a_heart_on_it() {
+        let rect = Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::splat(18.0));
+        let cup_colour = Color32::WHITE;
+        let background = Color32::from_rgb(9, 9, 9);
+        let shapes = kofi_mark_shapes(rect, cup_colour, background);
+        assert_eq!(shapes.len(), 5, "cup, handle, two lobes and a point");
+        for shape in &shapes {
+            let bounds = shape.visual_bounding_rect();
+            assert!(
+                rect.expand(0.5).contains_rect(bounds),
+                "the mark stays inside the button: {bounds:?}"
+            );
+        }
+
+        // The cup is a solid shape in the icon colour...
+        let egui::Shape::Rect(cup) = &shapes[0] else {
+            panic!("the cup is a rectangle");
+        };
+        assert_eq!(cup.fill, cup_colour);
+        let cup_rect = cup.rect;
+
+        // ... and the heart is painted over it in the panel colour, which is what makes it a
+        // hole rather than a mark sitting in the middle of a solid block.
+        let egui::Shape::Circle(lobe) = &shapes[3] else {
+            panic!("a lobe is a circle");
+        };
+        assert_eq!(lobe.fill, background, "the heart shows the panel through");
+
+        let inside_cup = cup_rect.shrink(1.0);
+        for heart in &shapes[2..] {
+            assert!(
+                inside_cup.contains_rect(heart.visual_bounding_rect()),
+                "the heart sits on the cup, not on its rim: {:?}",
+                heart.visual_bounding_rect()
+            );
+        }
+
+        // Two lobes level with each other, and a point hanging below them.
+        let left = shapes[2].visual_bounding_rect();
+        let right = shapes[3].visual_bounding_rect();
+        let point = shapes[4].visual_bounding_rect();
+        assert!((left.center().y - right.center().y).abs() < 0.5);
+        assert!(
+            left.center().x < right.center().x,
+            "the lobes sit side by side"
+        );
+        assert!(
+            left.right() > right.left(),
+            "they meet in the middle, so the heart is one shape"
+        );
+        assert!(
+            point.bottom() > left.bottom() + 1.5,
+            "the point hangs below the lobes"
+        );
+
+        // The handle reaches past the cup's right wall, and starts on the cup so the two join.
+        let handle = shapes[1].visual_bounding_rect();
+        assert!(
+            handle.right() > cup_rect.right() + 1.0,
+            "the handle is on the outside: {handle:?}"
+        );
+        assert!(
+            handle.left() < cup_rect.right(),
+            "and its ends tuck inside the cup: {handle:?}"
+        );
+    }
+
+    /// The footer's Ko-fi button hands the browser the page it advertises, on every platform.
+    #[test]
+    fn test_the_coffee_button_opens_the_kofi_page() {
+        assert_eq!(KOFI_URL, "https://ko-fi.com/noxilith");
+        let command = browser_command(KOFI_URL);
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.iter().any(|arg| arg == KOFI_URL),
+            "the address is what gets opened: {args:?}"
+        );
+        assert!(
+            !command.get_program().is_empty(),
+            "something on this platform can open it"
+        );
+    }
+
+    /// The header's lock button says who can read the note, in one line.
+    #[test]
+    fn test_the_lock_button_says_who_can_read_the_note() {
+        let nobody: Vec<String> = Vec::new();
+        let (glyph, text) = share_look(false, &nobody, Some("nox"), "nox", Some("Home"));
+        assert_eq!(glyph, icon::WORLD);
+        assert_eq!(text, "Everyone on Home can see this note");
+
+        let (glyph, text) = share_look(true, &nobody, Some("nox"), "nox", Some("Home"));
+        assert_eq!(glyph, icon::LOCK);
+        assert_eq!(text, "Only you can see this note");
+
+        let (_, text) = share_look(
+            true,
+            &["SuperSaiyan".to_string(), "Mira".to_string()],
+            Some("nox"),
+            "nox",
+            Some("Home"),
+        );
+        assert_eq!(text, "Shared with SuperSaiyan, Mira");
+
+        // Somebody who was let in is told whose note it is, and cannot claim it as theirs.
+        let (_, text) = share_look(true, &nobody, Some("Nox"), "mira", Some("Home"));
+        assert_eq!(text, "Nox shared this note with you");
     }
 
     #[test]

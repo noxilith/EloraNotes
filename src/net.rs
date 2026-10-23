@@ -54,7 +54,11 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Field<T> {
 /// handler for them and drops them without a word, so a client that can share pictures must
 /// not pair with one: the picture would quietly never reach the library, which is why this
 /// went to 3 rather than staying at 2.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// Version 4 adds the identifier each client connects with, and the per-note answer to who may
+/// see it. A version-3 server does not know either, so it would list every note to everybody
+/// and accept changes from people the note was restricted away from — the opposite of what the
+/// setting promises. Nothing may pair across that line.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Prefixes a Yjs sync payload with the id of the note it belongs to.
 ///
@@ -190,6 +194,40 @@ pub fn os_username() -> String {
     "guest".to_string()
 }
 
+/// Trims an identifier to what can go into a note's frontmatter and be compared with another:
+/// no surrounding space, nothing on a second line, and a sane length.
+pub fn normalize_identifier(raw: &str) -> String {
+    // Commas and brackets are left out: a note's frontmatter keeps its list of identifiers on
+    // one `shared_with: [a, b]` line, and a name containing either would split it.
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .filter(|ch| !ch.is_control() && !matches!(ch, ',' | '[' | ']'))
+        .take(64)
+        .collect();
+    cleaned.trim().to_string()
+}
+
+/// Whether a note is for this person: everything public is for everybody, and a restricted note
+/// is only for its owner and the people it names. Identifiers are compared without case, so a
+/// name typed with a capital in one place and not the other still grants access.
+pub fn visible_to(meta: &NoteMeta, who: &str) -> bool {
+    if !meta.private {
+        return true;
+    }
+    let who = who.trim();
+    if who.is_empty() {
+        return false;
+    }
+    meta.owner
+        .as_deref()
+        .is_some_and(|owner| owner.eq_ignore_ascii_case(who))
+        || meta
+            .shared_with
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(who))
+}
+
 /// Notes the server owns, as the sidebar and the editor need them.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NoteMeta {
@@ -209,6 +247,17 @@ pub struct NoteMeta {
     /// Unix seconds; the sort order in the sidebar.
     #[serde(default)]
     pub updated_at: i64,
+    /// The identifier of the person the note belongs to. Recorded for every note so the same
+    /// identifier on another computer finds them again, and used as the owner of a restricted
+    /// note.
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// True when only the owner and the people in `shared_with` may see the note.
+    #[serde(default)]
+    pub private: bool,
+    /// Identifiers the owner has let in to a private note.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_with: Vec<String>,
 }
 
 /// Who is in a note right now.
@@ -225,7 +274,18 @@ pub enum ClientMsg {
     Hello {
         v: u32,
         name: String,
+        /// Who this client is: the identifier from its settings. It decides which restricted
+        /// notes it is shown and which it may change.
+        id: String,
         password: String,
+    },
+    /// Restricts a note to its owner and the identifiers listed, or opens it to the whole
+    /// server again. Only the note's owner may send this.
+    SetShare {
+        id: String,
+        private: bool,
+        #[serde(default)]
+        shared_with: Vec<String>,
     },
     /// Start receiving Yjs payloads for one note (switching rooms is allowed at any time).
     Open {
@@ -477,12 +537,94 @@ mod tests {
         let msg = ClientMsg::Hello {
             v: PROTOCOL_VERSION,
             name: "nox".into(),
+            id: "SuperSaiyan".into(),
             password: "hunter2".into(),
         };
         let text = msg.to_text().unwrap();
         assert!(text.contains("\"type\":\"hello\""));
+        assert!(text.contains("\"id\":\"SuperSaiyan\""));
         let back: ClientMsg = serde_json::from_str(&text).unwrap();
         assert!(matches!(back, ClientMsg::Hello { .. }));
+    }
+
+    fn meta(owner: Option<&str>, private: bool, shared: &[&str]) -> NoteMeta {
+        NoteMeta {
+            id: "n-1".into(),
+            title: "Note".into(),
+            folder: None,
+            tags: Vec::new(),
+            pinned: false,
+            trashed: false,
+            icon: None,
+            updated_at: 0,
+            owner: owner.map(str::to_string),
+            private,
+            shared_with: shared.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn test_a_public_note_is_for_everyone_and_a_restricted_one_is_not() {
+        let open = meta(Some("nox"), false, &[]);
+        assert!(visible_to(&open, "nox"));
+        assert!(visible_to(&open, "friend"));
+
+        // "Only me" means exactly that, whatever the case of the name typed.
+        let mine = meta(Some("Nox"), true, &[]);
+        assert!(visible_to(&mine, "nox"), "the owner keeps the note");
+        assert!(!visible_to(&mine, "friend"));
+
+        // Naming somebody lets them in, and only them.
+        let shared = meta(Some("nox"), true, &["SuperSaiyan", "Mira"]);
+        assert!(visible_to(&shared, "supersaiyan"));
+        assert!(visible_to(&shared, "MIRA"));
+        assert!(!visible_to(&shared, "  "));
+        assert!(!visible_to(&shared, "stranger"));
+
+        // A restricted note whose owner is unknown is not left open by accident.
+        let orphan = meta(None, true, &[]);
+        assert!(!visible_to(&orphan, "nox"));
+    }
+
+    #[test]
+    fn test_identifiers_keep_one_line_and_a_sane_length() {
+        assert_eq!(normalize_identifier("  SuperSaiyan \n"), "SuperSaiyan");
+        assert_eq!(normalize_identifier("a\u{0}b"), "ab");
+        assert_eq!(normalize_identifier("nox, [mira]"), "nox mira");
+        assert_eq!(normalize_identifier("   "), "");
+        assert_eq!(normalize_identifier(&"a".repeat(200)).len(), 64);
+    }
+
+    #[test]
+    fn test_share_message_travels_with_its_list() {
+        let msg = ClientMsg::SetShare {
+            id: "n-1".into(),
+            private: true,
+            shared_with: vec!["SuperSaiyan".into()],
+        };
+        let text = msg.to_text().unwrap();
+        assert!(text.contains("\"type\":\"set_share\""), "{text}");
+        let back: ClientMsg = serde_json::from_str(&text).unwrap();
+        assert!(matches!(
+            back,
+            ClientMsg::SetShare {
+                private: true,
+                ref shared_with,
+                ..
+            } if shared_with == &["SuperSaiyan".to_string()]
+        ));
+        // A note opened to everyone carries an empty list rather than being unreadable.
+        let open: ClientMsg =
+            serde_json::from_str("{\"type\":\"set_share\",\"id\":\"n\",\"private\":false}")
+                .unwrap();
+        assert!(matches!(
+            open,
+            ClientMsg::SetShare {
+                private: false,
+                ref shared_with,
+                ..
+            } if shared_with.is_empty()
+        ));
     }
 
     #[test]

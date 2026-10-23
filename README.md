@@ -15,7 +15,7 @@ A calm, minimalistic cross-platform desktop notes application written in **Rust*
 - **Bundled Tabler Icons**: Crisp outline glyphs from the Tabler Icons font embedded directly into the binary (`assets/tabler-icons.ttf`) across navigation, search, tags, checklists, formatting actions, and the command palette.
 - **Stackable Inline Formatting**: Markers nest, so `**==bold inside a glow==**`, `==**glow then bold**==`, `***==triple stack==***` and `{color:#4ECDFF}**colored bold**{/color}` each render as one run carrying several styles at once. Headings are drawn in the bold face and can carry highlights and text colors too.
 - **Collapsible Folders**: File any note into a folder from the header's folder menu (or type a new folder name there). Folders group the sidebar, show their note count, and fold shut with a click so the list takes less room. A folder's notes sit stepped in from its header, so the list shows what belongs to what. Fold state is remembered between runs. New notes join the folder of the note you had open.
-- **Compact Sidebar with One Filter Menu**: The sidebar is a fixed, narrow panel — only the accent **New** button shares the logo row, while the daily note, command palette and settings actions sit in a footer row at the bottom. **Settings** can drop the preview line from the note cards, leaving title, date and tags on a one-line-shorter card so more notes fit. The notes folder path and keyboard shortcuts are listed in Settings. Every tag filter lives in a single **Filter** dropdown with counts, so a growing tag list never pushes the note list down.
+- **Compact Sidebar with One Filter Menu**: The sidebar is a fixed, narrow panel — only the accent **New** button shares the logo row, while the daily note, command palette and settings actions sit in a footer row at the bottom. Note cards show just the title, date and tags, so more notes fit at once; **Settings** can add a preview line of each note to them. The notes folder path and keyboard shortcuts are listed in Settings. Every tag filter lives in a single **Filter** dropdown with counts, so a growing tag list never pushes the note list down.
 - **Updates Itself from GitHub Releases**: On launch EloraNotes asks GitHub for the latest release. If one is newer it offers to download it, starts the downloaded build once to confirm it runs on this machine, then installs it the way this copy was installed and restarts. **Settings → Updates** has the same thing on demand: check, then **Update and restart**. "Later" dismisses the launch prompt for that run, and a failed launch-time check (for example while offline) stays silent.
 - **Plain Markdown on Disk**: Every note is stored as a portable `.md` file with lightweight YAML frontmatter (`title`, `folder`, `pinned`, `trashed`, `tags`, `icon`, `created_at`, `updated_at`).
 - **Command Palette & Quick Switcher (`Ctrl+K`)**: Fuzzy-jump to any note, create notes from templates, switch color themes, or toggle views without leaving the keyboard.
@@ -27,7 +27,7 @@ A calm, minimalistic cross-platform desktop notes application written in **Rust*
 - **Quick Formatting Bar**: One-click insertion for `# H1`, `## H2`, `**bold**`, `*italic*`, bullet lists, `- [ ]` task checkboxes, blockquotes, code blocks, and `[[Wiki Links]]`.
 - **Safe Trash & Restore**: Deleted notes move to the **Trash** view first where they can be restored with one click or permanently deleted.
 - **Import Markdown Folder**: Copy `.md` files into an `Import` folder inside your notes folder, then run **Import Markdown From Import Folder** from the Command Palette. Each file becomes a new note with its frontmatter kept. Importing the same files twice creates duplicates.
-- **Shared Notes (Google-Docs style)**: Point the app at an EloraNotes server — address, port, password — and the server's notes appear in the sidebar under its name. Everyone with a note open sees each other's edits as they are typed, with a coloured caret and a name tag at each person's cursor, a dot on the note's card while somebody is in it, and a presence list above the editor. Usernames are the account each person is logged into on their computer.
+- **Shared Notes (Google-Docs style)**: Point the app at an EloraNotes server — address, port, password — and the server's notes appear in the sidebar under its name. Everyone with a note open sees each other's edits as they are typed, with a coloured caret and a name tag at each person's cursor, a dot on the note's card while somebody is in it, and a presence list above the editor. Each person goes by an **identifier** from Settings, which also lets a note be closed to everybody but its owner or opened to a few names on it.
 - **Color Themes**: Choose **Obsidian** (dark slate), **Paper** (warm light), **Nordic** (arctic dark), **Matcha** (soft sage light), or **Matugen** (colors from your wallpaper). Preferences and folded folders persist automatically.
 
 ## Install
@@ -187,7 +187,7 @@ next note directly on the server.
 
 Pictures in a shared note are kept on the server too, in an `attachments` folder inside its notes folder, so everyone with the library sees them and they are still there after the computer that added them is gone. A picture added before a note is moved to the server goes with it, and **Copy to this computer** brings copies of its pictures along. The server's notes folder stays an ordinary EloraNotes library, pictures included, so copying or backing it up keeps everything.
 
-Everyone in the library, and the server itself, needs a build that speaks the picture protocol (0.9.18 or newer). An older server used to drop a shared note's pictures without saying anything, so a client that can share them now refuses to connect to one and says to update whichever side is older.
+Everyone in the library, and the server itself, needs a build that speaks the same protocol (0.9.19 or newer). An older server used to drop a shared note's pictures without saying anything, so a client that can share them refuses to connect to one and says to update whichever side is older. The same check now covers note privacy: a server from before it could not keep a note to itself, so the two are never paired.
 
 ### Connecting from the app
 
@@ -205,12 +205,37 @@ While a shared note is open, **New** (and the daily-note, template and wiki-link
 the note in that library instead of on your disk: it joins the same folder, keeps the tag you are
 filtering by, and appears on everyone's sidebar straight away.
 
-Your username is the account you are logged into on your computer. While somebody else has a note
-open, its card shows a coloured dot; when you open it too you see their caret with their name, and
-the words they type appear as they type them.
+Your username is your **identifier** from Settings: a fresh install makes one up (the account name
+with a short random tail), and it can be replaced with any word. It is the name others see next to
+your caret, it is what a note is opened to, and the same identifier on another computer is you
+there too, so a note closed to everybody else follows you between machines.
+
+While somebody else has a note open, its card shows a coloured dot; when you open it too you see
+their caret with their name, and the words they type appear as they type them.
 
 Which notes are synced: the note bodies and the library structure (titles, folders, tags, pins,
 trash). Settings, themes and the update check stay on your own machine.
+
+### Who can see a note
+
+A note made in the shared library is open to everybody on that server, as before. The lock button
+in the note's header opens **Who can see this note**:
+
+- **Everyone on <server>** — the whole library, which is where a new note starts.
+- **Only me** — nobody else's sidebar lists it, nobody else can open it, and anyone reading it
+  when it is closed is taken out of it, so nothing typed afterwards reaches them.
+- **Only these people** — the same, plus any identifiers added to the list. Adding a name is all
+  it takes: **Their identifier, e.g. SuperSaiyan**. Removing the chip takes the note away again.
+
+Only the note's owner changes this; everybody else sees whose note it is and that it was shared
+with them. Ownership is recorded on every note the library creates, in its frontmatter
+(`owner:`, `private:`, `shared_with:`) which the server keeps in the `.md` file, so a restriction
+survives a restart and stays visible to anyone who edits the folder by hand.
+
+Two things this is not: the identifiers are chosen by the people using them, not proven, and the
+server password is still what decides who may connect at all. Treat the lock as *which notes the
+server hands out*, for a household or a group who trust each other with the password — not as
+protection against somebody who has it and wants to pretend to be you.
 
 ### If it stays on "Connecting…"
 

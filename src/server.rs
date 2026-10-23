@@ -47,6 +47,9 @@ pub struct Server {
 struct Client {
     id: u64,
     name: Mutex<String>,
+    /// The identifier this connection belongs to, from its handshake. It decides which notes
+    /// the client is shown and may change, so it is kept apart from the name used in logs.
+    identity: Mutex<String>,
     room: Mutex<Option<String>>,
     /// The awareness ids this connection has published, so leaving the room removes exactly
     /// those states. Matching on the name would make two people who happen to use the same
@@ -142,6 +145,7 @@ impl Server {
         let client = Arc::new(Client {
             id,
             name: Mutex::new(String::new()),
+            identity: Mutex::new(String::new()),
             room: Mutex::new(None),
             awareness: Mutex::new(HashSet::new()),
             authed: AtomicBool::new(false),
@@ -253,7 +257,13 @@ impl Server {
     fn handshake(&self, client: &Arc<Client>, payload: &[u8]) -> Result<bool, String> {
         let message: ClientMsg = serde_json::from_slice(payload)
             .map_err(|e| format!("could not read the handshake: {e}"))?;
-        let ClientMsg::Hello { v, name, password } = message else {
+        let ClientMsg::Hello {
+            v,
+            name,
+            id,
+            password,
+        } = message
+        else {
             return Err("the first message must be the handshake".to_string());
         };
         if v != PROTOCOL_VERSION {
@@ -279,18 +289,30 @@ impl Server {
             );
             return Ok(false);
         }
-        let name = if name.trim().is_empty() {
-            "guest".to_string()
-        } else {
-            name.trim().to_string()
-        };
+        // The identifier is what private notes are keyed to, so it may not be blank or span
+        // more than a frontmatter line. A client that sends none falls back to its name.
+        let mut identity = crate::net::normalize_identifier(&id);
+        if identity.is_empty() {
+            identity = crate::net::normalize_identifier(&name);
+        }
+        if identity.is_empty() {
+            identity = "guest".to_string();
+        }
+        let name = identity.clone();
         if let Ok(mut slot) = client.name.lock() {
             *slot = name.clone();
+        }
+        if let Ok(mut slot) = client.identity.lock() {
+            *slot = identity.clone();
         }
         client.authed.store(true, Ordering::Relaxed);
         eprintln!("{name} connected from the network");
 
-        let notes = self.library.lock().map_err(|_| "library poisoned")?.list();
+        let notes = self
+            .library
+            .lock()
+            .map_err(|_| "library poisoned")?
+            .list_for(&identity);
         self.push(
             client,
             FRAME_JSON,
@@ -307,6 +329,7 @@ impl Server {
     fn handle_control(&self, client: &Arc<Client>, payload: &[u8]) -> Result<(), String> {
         let message: ClientMsg = serde_json::from_slice(payload)
             .map_err(|e| format!("could not read the message: {e}"))?;
+        let who = self.identity_of(client);
         match message {
             ClientMsg::Hello { .. } => Err("already connected".to_string()),
             ClientMsg::Ping => {
@@ -328,10 +351,25 @@ impl Server {
             } => {
                 let meta = {
                     let mut library = self.library.lock().map_err(|_| "library poisoned")?;
-                    library.create(&title, folder, tags, &body, pinned, icon)?
+                    library.create(&title, folder, tags, &body, pinned, icon, &who)?
                 };
                 self.broadcast_library();
                 self.push(client, FRAME_JSON, json(&ServerMsg::Created { note: meta }));
+                Ok(())
+            }
+            ClientMsg::SetShare {
+                id,
+                private,
+                shared_with,
+            } => {
+                {
+                    let mut library = self.library.lock().map_err(|_| "library poisoned")?;
+                    library.set_share(&id, &who, private, shared_with)?;
+                }
+                // Closing a note while somebody is reading it has to take them out of it:
+                // otherwise they keep receiving what is typed into it afterwards.
+                self.revoke_members(&id);
+                self.broadcast_library();
                 Ok(())
             }
             ClientMsg::Update {
@@ -345,7 +383,7 @@ impl Server {
             } => {
                 {
                     let mut library = self.library.lock().map_err(|_| "library poisoned")?;
-                    library.update(&id, title, folder, tags, pinned, trashed, icon)?;
+                    library.update(&id, &who, title, folder, tags, pinned, trashed, icon)?;
                 }
                 self.broadcast_library();
                 Ok(())
@@ -353,7 +391,7 @@ impl Server {
             ClientMsg::Delete { id, permanent } => {
                 {
                     let mut library = self.library.lock().map_err(|_| "library poisoned")?;
-                    library.delete(&id, permanent)?;
+                    library.delete(&id, &who, permanent)?;
                 }
                 self.broadcast_library();
                 Ok(())
@@ -361,13 +399,47 @@ impl Server {
         }
     }
 
+    /// Takes everybody the note is no longer shared with out of its room, and leaves everybody
+    /// the note is still for where they are.
+    fn revoke_members(&self, id: &str) {
+        let meta = self
+            .library
+            .lock()
+            .ok()
+            .and_then(|library| library.notes.get(id).cloned());
+        let Some(meta) = meta else {
+            return;
+        };
+        for client in self.connected() {
+            let open = client.room.lock().ok().and_then(|slot| slot.clone());
+            if open.as_deref() == Some(id) && !net::visible_to(&meta, &self.identity_of(&client)) {
+                self.leave_room(&client);
+            }
+        }
+    }
+
+    /// The identifier a connection speaks for. Connections only reach here after the handshake,
+    /// which is the only place it is set.
+    fn identity_of(&self, client: &Arc<Client>) -> String {
+        client
+            .identity
+            .lock()
+            .map(|slot| slot.clone())
+            .unwrap_or_else(|_| "guest".to_string())
+    }
+
     fn open_room(&self, client: &Arc<Client>, id: &str) -> Result<(), String> {
         // Moving straight from one note to another must not leave this client subscribed to, or
         // shown as present in, the note it came from.
         self.leave_room(client);
+        let who = self.identity_of(client);
         let mut library = self.library.lock().map_err(|_| "library poisoned")?;
-        if !library.notes.contains_key(id) {
+        let Some(meta) = library.notes.get(id) else {
             return Err(format!("no note with id {id}"));
+        };
+        // A note restricted to its owner is not opened for anybody else, even by the right id.
+        if !crate::net::visible_to(meta, &who) {
+            return Err(format!("the note {id} is not shared with you"));
         }
         library.open(id)?;
         let Some(room) = library.rooms.get_mut(id) else {
@@ -737,20 +809,54 @@ impl Server {
         }
     }
 
+    /// Every connected client, snapshot so no lock is held while they are written to.
+    fn connected(&self) -> Vec<Arc<Client>> {
+        self.clients
+            .lock()
+            .map(|clients| {
+                clients
+                    .values()
+                    .filter(|client| client.authed.load(Ordering::Relaxed))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Sends each connection the library as that connection may see it. One list for everybody
+    /// would hand a client the notes that were restricted away from it.
     fn broadcast_library(&self) {
-        let notes = match self.library.lock() {
-            Ok(library) => library.list(),
-            Err(_) => return,
+        let clients = self.connected();
+        let Ok(library) = self.library.lock() else {
+            return;
         };
-        self.broadcast_except(0, FRAME_JSON, json(&ServerMsg::Notes { notes }));
+        for client in clients {
+            let who = self.identity_of(&client);
+            let notes = library.list_for(&who);
+            self.push(&client, FRAME_JSON, json(&ServerMsg::Notes { notes }));
+        }
     }
 
     fn broadcast_presence(&self) {
-        let notes: Vec<(String, Vec<PresenceUser>)> = match self.library.lock() {
-            Ok(library) => library.presence(),
-            Err(_) => return,
+        let clients = self.connected();
+        let Ok(library) = self.library.lock() else {
+            return;
         };
-        self.broadcast_except(0, FRAME_JSON, json(&ServerMsg::Presence { notes }));
+        let present = library.presence();
+        for client in clients {
+            let who = self.identity_of(&client);
+            let notes: Vec<(String, Vec<PresenceUser>)> = present
+                .iter()
+                .filter(|(id, _)| {
+                    library
+                        .notes
+                        .get(id)
+                        .is_some_and(|meta| net::visible_to(meta, &who))
+                })
+                .cloned()
+                .collect();
+            self.push(&client, FRAME_JSON, json(&ServerMsg::Presence { notes }));
+        }
     }
 
     fn flush_dirty(&self) {
@@ -833,6 +939,15 @@ impl Library {
         })
     }
 
+    /// The notes one identifier may see: everything the library shares with the whole server,
+    /// plus the notes it owns and the ones somebody opened to it.
+    fn list_for(&self, who: &str) -> Vec<NoteMeta> {
+        self.list()
+            .into_iter()
+            .filter(|meta| net::visible_to(meta, who))
+            .collect()
+    }
+
     fn list(&self) -> Vec<NoteMeta> {
         let mut notes: Vec<NoteMeta> = self.notes.values().cloned().collect();
         notes.sort_by(|a, b| {
@@ -843,6 +958,7 @@ impl Library {
         notes
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create(
         &mut self,
         title: &str,
@@ -851,6 +967,7 @@ impl Library {
         body: &str,
         pinned: bool,
         icon: Option<String>,
+        owner: &str,
     ) -> Result<NoteMeta, String> {
         let title = title.trim();
         let title = if title.is_empty() { "Untitled" } else { title };
@@ -875,6 +992,12 @@ impl Library {
             trashed: false,
             icon: icon.filter(|i| !i.trim().is_empty()),
             updated_at: now.timestamp(),
+            // Recorded even though the note starts out open to the whole server: it is what
+            // lets the same identifier on another computer find its notes again, and who may
+            // close the note later.
+            owner: Some(net::normalize_identifier(owner)).filter(|name| !name.is_empty()),
+            private: false,
+            shared_with: Vec::new(),
         };
         // Written straight to disk: there is no room for this note yet, and the first client to
         // open it starts from this body.
@@ -890,6 +1013,7 @@ impl Library {
     fn update(
         &mut self,
         id: &str,
+        who: &str,
         title: Option<String>,
         folder: Field<String>,
         tags: Option<Vec<String>>,
@@ -897,9 +1021,13 @@ impl Library {
         trashed: Option<bool>,
         icon: Field<String>,
     ) -> Result<(), String> {
-        let Some(meta) = self.notes.get_mut(id) else {
+        let Some(meta) = self.notes.get(id) else {
             return Err(format!("no note with id {id}"));
         };
+        if !net::visible_to(meta, who) {
+            return Err(format!("the note {id} is not shared with you"));
+        };
+        let meta = self.notes.get_mut(id).expect("the note was just found");
         if let Some(title) = title {
             let title = title.trim();
             if !title.is_empty() {
@@ -933,7 +1061,13 @@ impl Library {
         self.write(id)
     }
 
-    fn delete(&mut self, id: &str, permanent: bool) -> Result<(), String> {
+    fn delete(&mut self, id: &str, who: &str, permanent: bool) -> Result<(), String> {
+        let Some(meta) = self.notes.get(id) else {
+            return Err(format!("no note with id {id}"));
+        };
+        if !net::visible_to(meta, who) {
+            return Err(format!("the note {id} is not shared with you"));
+        }
         if permanent {
             self.notes.remove(id);
             self.rooms.remove(id);
@@ -942,8 +1076,61 @@ impl Library {
             let _ = std::fs::remove_file(path);
             Ok(())
         } else {
-            self.update(id, None, Field::Keep, None, None, Some(true), Field::Keep)
+            self.update(
+                id,
+                who,
+                None,
+                Field::Keep,
+                None,
+                None,
+                Some(true),
+                Field::Keep,
+            )
         }
+    }
+
+    /// Closes a note to everybody but its owner, opens it to named people, or opens it to the
+    /// whole server again. Only the owner decides: anybody else in the note is a guest.
+    fn set_share(
+        &mut self,
+        id: &str,
+        who: &str,
+        private: bool,
+        shared_with: Vec<String>,
+    ) -> Result<(), String> {
+        let Some(meta) = self.notes.get_mut(id) else {
+            return Err(format!("no note with id {id}"));
+        };
+        match meta.owner.as_deref() {
+            Some(owner) if !owner.eq_ignore_ascii_case(who) => {
+                return Err(format!("only {owner} can change who sees this note"));
+            }
+            // A note from before identifiers existed has nobody to ask; whoever restricts it
+            // takes it on, so it is not left open to the server forever.
+            None if private => meta.owner = Some(who.to_string()),
+            _ => {}
+        }
+        if !net::visible_to(meta, who) {
+            return Err(format!("the note {id} is not shared with you"));
+        }
+        let owner = meta.owner.clone().unwrap_or_default();
+        let mut names: Vec<String> = Vec::new();
+        for name in shared_with {
+            let name = net::normalize_identifier(&name);
+            if name.is_empty()
+                || name.eq_ignore_ascii_case(&owner)
+                || names.iter().any(|kept| kept.eq_ignore_ascii_case(&name))
+            {
+                continue;
+            }
+            names.push(name);
+        }
+        // Nobody can see a note through a list that is ignored, so an open note keeps no list at
+        // all: reopening it clears the names as well as the lock.
+        meta.private = private;
+        meta.shared_with = if private { names } else { Vec::new() };
+        meta.updated_at = Utc::now().timestamp();
+        self.write(id)
     }
 
     /// Opens the Yjs document for a note, loading the body from disk the first time.
@@ -1092,6 +1279,9 @@ fn meta_from_note(note: &Note) -> NoteMeta {
         trashed: note.trashed,
         icon: note.icon.clone(),
         updated_at: note.updated_at.timestamp(),
+        owner: note.owner.clone(),
+        private: note.private,
+        shared_with: note.shared_with.clone(),
     }
 }
 
@@ -1109,6 +1299,9 @@ fn note_from_meta(meta: &NoteMeta, body: String) -> Note {
         explicit_tags: meta.tags.clone(),
         icon: meta.icon.clone(),
         folder: meta.folder.clone(),
+        owner: meta.owner.clone(),
+        private: meta.private,
+        shared_with: meta.shared_with.clone(),
         created_at: updated,
         updated_at: updated,
         file_path: PathBuf::new(),
@@ -1204,9 +1397,10 @@ mod tests {
         let dir = temp_dir("library");
         let mut library = Library::load(&dir).unwrap();
         let meta = library
-            .create("Meeting notes", None, Vec::new(), "", false, None)
+            .create("Meeting notes", None, Vec::new(), "", false, None, "nox")
             .unwrap();
         assert!(meta.id.starts_with("meeting-notes-"));
+        assert_eq!(meta.owner.as_deref(), Some("nox"));
         let path = dir.join(format!("{}.md", meta.id));
         assert!(path.is_file());
         let raw = std::fs::read_to_string(&path).unwrap();
@@ -1227,6 +1421,7 @@ mod tests {
                 "written by the client",
                 false,
                 Some("book".to_string()),
+                "nox",
             )
             .unwrap();
         assert_eq!(meta.folder.as_deref(), Some("Team"));
@@ -1248,7 +1443,7 @@ mod tests {
         let dir = temp_dir("doc");
         let mut library = Library::load(&dir).unwrap();
         let meta = library
-            .create("Shared", None, Vec::new(), "", false, None)
+            .create("Shared", None, Vec::new(), "", false, None, "nox")
             .unwrap();
         library.open(&meta.id).unwrap();
         {
@@ -1269,11 +1464,12 @@ mod tests {
         let dir = temp_dir("meta");
         let mut library = Library::load(&dir).unwrap();
         let meta = library
-            .create("Tags", None, Vec::new(), "", false, None)
+            .create("Tags", None, Vec::new(), "", false, None, "nox")
             .unwrap();
         library
             .update(
                 &meta.id,
+                "nox",
                 Some("Tags!".into()),
                 Field::Set("Study".into()),
                 Some(vec!["#alpha".into(), "Beta".into()]),
@@ -1293,7 +1489,16 @@ mod tests {
         // server as `null`, which it read as "leave it alone", so the note stayed in the
         // folder for good.
         library
-            .update(&meta.id, None, Field::Clear, None, None, None, Field::Clear)
+            .update(
+                &meta.id,
+                "nox",
+                None,
+                Field::Clear,
+                None,
+                None,
+                None,
+                Field::Clear,
+            )
             .unwrap();
         let reloaded = Library::load(&dir).unwrap();
         let note = reloaded.notes.get(&meta.id).unwrap();
@@ -1419,6 +1624,7 @@ mod tests {
         let hello = ClientMsg::Hello {
             v: PROTOCOL_VERSION - 1,
             name: "older app".into(),
+            id: "older app".into(),
             password: "letmein".into(),
         };
         let payload = serde_json::to_vec(&hello).unwrap();
@@ -1451,6 +1657,196 @@ mod tests {
             }
             other => panic!("expected an error, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A note that was closed to everybody but its owner is not in anybody else's library, and
+    /// naming somebody on it lets exactly that one person in.
+    #[test]
+    fn test_a_restricted_note_is_listed_only_for_the_people_on_it() {
+        let dir = temp_dir("share-acl");
+        let mut library = Library::load(&dir).unwrap();
+        let meta = library
+            .create("Diary", None, Vec::new(), "", false, None, "nox")
+            .unwrap();
+        let listed = |library: &Library, who: &str| {
+            library.list_for(who).iter().any(|note| note.id == meta.id)
+        };
+        // A new note belongs to whoever made it but starts out open to the server.
+        assert_eq!(meta.owner.as_deref(), Some("nox"));
+        assert!(!meta.private);
+        assert!(listed(&library, "nox"));
+        assert!(listed(&library, "mira"));
+
+        library
+            .set_share(&meta.id, "nox", true, Vec::new())
+            .unwrap();
+        assert!(listed(&library, "nox"), "the owner keeps it");
+        assert!(!listed(&library, "mira"), "only my eyes means only mine");
+
+        // Names are kept as they were typed, without the owner and without a repeat that only
+        // differs in case.
+        library
+            .set_share(
+                &meta.id,
+                "nox",
+                true,
+                vec!["MirA".into(), "nox".into(), "mira".into()],
+            )
+            .unwrap();
+        assert_eq!(
+            library.notes[&meta.id].shared_with,
+            vec!["MirA".to_string()]
+        );
+        assert!(listed(&library, "mira"), "a named person sees it");
+        assert!(!listed(&library, "stranger"));
+
+        // The restriction is in the note's own frontmatter, so it survives a restart.
+        let reloaded = Library::load(&dir).unwrap();
+        let note = &reloaded.notes[&meta.id];
+        assert!(note.private);
+        assert_eq!(note.shared_with, vec!["MirA".to_string()]);
+        assert!(!reloaded
+            .list_for("stranger")
+            .iter()
+            .any(|note| note.id == meta.id));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The owner decides who sees a note. Somebody the note was shared with may still write in
+    /// it, but cannot lock the owner out, and loses even that when the note is closed again.
+    #[test]
+    fn test_only_the_owner_changes_who_sees_a_note() {
+        let dir = temp_dir("share-owner");
+        let mut library = Library::load(&dir).unwrap();
+        let meta = library
+            .create("Plan", None, Vec::new(), "", false, None, "nox")
+            .unwrap();
+        library
+            .update(
+                &meta.id,
+                "mira",
+                Some("Plan v2".into()),
+                Field::Keep,
+                None,
+                None,
+                None,
+                Field::Keep,
+            )
+            .expect("an open note is everybody's to edit");
+
+        let refused = library.set_share(&meta.id, "mira", true, Vec::new());
+        assert!(
+            matches!(&refused, Err(error) if error.contains("only nox")),
+            "a guest must not be able to close the note: {refused:?}"
+        );
+        assert!(!library.notes[&meta.id].private);
+
+        library
+            .set_share(&meta.id, "nox", true, Vec::new())
+            .unwrap();
+        assert!(library
+            .update(
+                &meta.id,
+                "mira",
+                Some("hijack".into()),
+                Field::Keep,
+                None,
+                None,
+                None,
+                Field::Keep,
+            )
+            .is_err());
+        assert!(library.delete(&meta.id, "mira", false).is_err());
+        library.open(&meta.id).unwrap();
+        assert_eq!(library.notes[&meta.id].title, "Plan v2");
+
+        // Opening it again takes it back to the whole server.
+        library
+            .set_share(&meta.id, "nox", false, Vec::new())
+            .unwrap();
+        assert!(library.notes[&meta.id].shared_with.is_empty());
+        assert!(library.list_for("mira").iter().any(|n| n.id == meta.id));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Even with the right note id, a room only opens for the people the note is meant for.
+    #[test]
+    fn test_a_restricted_note_does_not_open_for_a_stranger() {
+        let _guard = crate::tls::server_dir_lock();
+        let dir = temp_dir("share-room");
+        let notes = dir.join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        let id = "closed-0001".to_string();
+        std::fs::write(
+            notes.join(format!("{id}.md")),
+            "---\ntitle: \"Closed\"\npinned: false\ntrashed: false\ntags: []\n\
+             owner: \"nox\"\nprivate: true\nshared_with: [\"Mira\"]\n\
+             created_at: 2020-01-01T00:00:00+00:00\nupdated_at: 2020-01-01T00:00:00+00:00\n---\n\
+             secret",
+        )
+        .unwrap();
+        // SAFETY: the guard keeps the other tests that read this variable out of the way.
+        unsafe { std::env::set_var("ELORA_SERVER_DIR", dir.join("server")) };
+        let config = ServerConfig {
+            name: "Closed".into(),
+            port: 0,
+            password: "letmein".into(),
+            notes_dir: notes,
+            bind: "127.0.0.1".into(),
+        };
+        let server = Server::new(config).expect("server");
+        let client = |identity: &str| {
+            Arc::new(Client {
+                id: 1,
+                name: Mutex::new(identity.to_string()),
+                identity: Mutex::new(identity.to_string()),
+                room: Mutex::new(None),
+                awareness: Mutex::new(HashSet::new()),
+                authed: AtomicBool::new(true),
+                outbox: Mutex::new(Vec::new()),
+            })
+        };
+
+        let stranger = client("stranger");
+        let refused = server.open_room(&stranger, &id).unwrap_err();
+        assert!(refused.contains("not shared"), "{refused}");
+        assert!(server.library.lock().unwrap().rooms.is_empty());
+
+        let named = client("mira");
+        server
+            .clients
+            .lock()
+            .unwrap()
+            .insert(named.id, Arc::clone(&named));
+        server
+            .open_room(&named, &id)
+            .expect("a named person gets in");
+        let subscribed = |server: &Server| {
+            server
+                .library
+                .lock()
+                .unwrap()
+                .rooms
+                .get(&id)
+                .is_some_and(|room| room.subscribers.contains(&1))
+        };
+        assert!(subscribed(&server));
+
+        // The owner closes the note again while it is open for the other person: they are taken
+        // out of it, so nothing typed after that reaches them.
+        server
+            .library
+            .lock()
+            .unwrap()
+            .set_share(&id, "nox", true, Vec::new())
+            .unwrap();
+        server.revoke_members(&id);
+        assert!(!subscribed(&server), "a closed note has no guests in it");
+        assert!(named.room.lock().unwrap().is_none());
+
+        let owner = client("nox");
+        server.open_room(&owner, &id).expect("the owner gets in");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

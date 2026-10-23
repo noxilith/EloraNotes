@@ -164,6 +164,9 @@ pub enum Incoming {
     AttachmentAdded {
         name: String,
     },
+    /// The server turned one request down: a note that is not yours to change, or one that is
+    /// not shared with you. The connection is still up, so this is a message, not an outage.
+    Refused(String),
     Offline(String),
 }
 
@@ -219,6 +222,12 @@ enum Command {
     Update {
         id: String,
         meta: NoteMeta,
+    },
+    /// Who may see one note: only its owner and the names listed, or the whole server.
+    Share {
+        id: String,
+        private: bool,
+        shared_with: Vec<String>,
     },
     Delete {
         id: String,
@@ -443,6 +452,7 @@ impl Collab {
                     .collect();
             }
             Incoming::Peers(peers) => self.peers = peers.clone(),
+            Incoming::Refused(message) => self.last_error = Some(message.clone()),
             Incoming::Offline(reason) => {
                 self.state = ConnectionState::Offline;
                 self.last_error = Some(reason.clone());
@@ -554,6 +564,17 @@ impl Collab {
         self.send(Command::Update {
             id: meta.id.clone(),
             meta: meta.clone(),
+        });
+    }
+
+    /// Restricts a shared note, opens it again, or changes who is named on it. The server checks
+    /// that the note is the caller's before it answers, and the new library arrives as
+    /// [`Incoming::Notes`].
+    pub fn set_share(&mut self, id: &str, private: bool, shared_with: Vec<String>) {
+        self.send(Command::Share {
+            id: id.to_string(),
+            private,
+            shared_with,
         });
     }
 
@@ -691,8 +712,11 @@ impl Session {
             .map_err(|e| format!("could not start TLS: {e}"))?;
         let mut stream = rustls::StreamOwned::new(connection, socket);
 
+        // The same word is the name others see and the identifier private notes are keyed to,
+        // which is why there is only one of them.
         let hello = ClientMsg::Hello {
             v: PROTOCOL_VERSION,
+            id: name.to_string(),
             name: name.to_string(),
             password: profile.password.clone(),
         };
@@ -886,6 +910,15 @@ impl Session {
                 trashed: Some(meta.trashed),
                 icon: meta.icon.map(Field::Set).unwrap_or(Field::Clear),
             })?,
+            Command::Share {
+                id,
+                private,
+                shared_with,
+            } => self.send_msg(&ClientMsg::SetShare {
+                id,
+                private,
+                shared_with,
+            })?,
             Command::Delete { id, permanent } => {
                 self.send_msg(&ClientMsg::Delete { id, permanent })?
             }
@@ -915,7 +948,9 @@ impl Session {
                     ServerMsg::Attachment { name } => {
                         events.send(Incoming::AttachmentAdded { name })
                     }
-                    ServerMsg::Error { message } => events.send(Incoming::Offline(message)),
+                    // A refusal is not a reason to drop the connection: the library is still
+                    // there, and the note that was turned down simply is not this client's.
+                    ServerMsg::Error { message } => events.send(Incoming::Refused(message)),
                     _ => {}
                 }
             }

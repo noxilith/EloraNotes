@@ -25,6 +25,30 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.9.19" date="2026-10-23">
+      <description>
+        <p>
+          Notes in the shared library can be closed to everybody but you, or opened to the people
+          you name. Settings now holds your identifier — the name others see and the word a note
+          is shared with — and a lock button in a note’s header chooses who may read it. The
+          server enforces it: a closed note leaves everyone else’s sidebar, and anyone reading it
+          at the time is taken out of it.
+        </p>
+        <p>
+          The protocol is version 4 because of that, so the app and the server both need this
+          release to connect to each other.
+        </p>
+        <p>
+          Adding a picture no longer makes the desktop offer to close the app: the file chooser no
+          longer blocks the window while you browse. Note cards also start without their preview
+          line, so more notes fit in the sidebar, and that line is one checkbox away in Settings.
+        </p>
+        <p>
+          A Ko-fi button sits beside the gear in the sidebar footer, and the names in “Editing
+          with” carry the brush the cards use instead of a missing-character box.
+        </p>
+      </description>
+    </release>
     <release version="0.9.18" date="2026-10-23">
       <description>
         <p>
