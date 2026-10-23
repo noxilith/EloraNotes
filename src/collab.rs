@@ -498,6 +498,10 @@ struct Session {
     /// Last text the UI was told about (or that the UI sent), used to diff local edits.
     mirror: String,
     open: Option<String>,
+    /// True between asking for a note and the server sending that note's state. Updates that
+    /// arrive in that window belong to the note just left, whose document has been thrown away,
+    /// and must not be merged into this note.
+    awaiting_room_state: bool,
     buffer: Vec<u8>,
     last_cursor: Instant,
     last_cursor_sent: Option<usize>,
@@ -623,6 +627,7 @@ impl Session {
             text,
             mirror: String::new(),
             open: None,
+            awaiting_room_state: false,
             buffer,
             last_cursor: Instant::now(),
             last_cursor_sent: None,
@@ -670,7 +675,15 @@ impl Session {
                 if self.open.as_deref() == Some(id.as_str()) {
                     return Ok(());
                 }
+                // A document belongs to one note, not to the connection. Keeping the old one
+                // meant the text of the note just left travelled into the next room: switching
+                // notes, or creating one while another was open, handed the server the previous
+                // note's text and the new note came out as a copy of it.
+                let doc = Doc::new();
+                self.text = doc.get_or_insert_text("body");
+                self.awareness = Awareness::new(doc);
                 self.mirror.clear();
+                self.awaiting_room_state = true;
                 self.send_msg(&ClientMsg::Open { id: id.clone() })?;
                 self.open = Some(id);
                 self.last_cursor_sent = None;
@@ -761,21 +774,18 @@ impl Session {
                         let reply = YMessage::Sync(SyncMessage::SyncStep2(update)).encode_v1();
                         self.send_frame(FRAME_SYNC, &reply)?;
                     }
-                    YMessage::Sync(SyncMessage::SyncStep2(update))
-                    | YMessage::Sync(SyncMessage::Update(update)) => {
-                        let Ok(update) = yrs::Update::decode_v1(&update) else {
-                            return Ok(());
-                        };
-                        if self
-                            .awareness
-                            .doc_mut()
-                            .transact_mut()
-                            .apply_update(update)
-                            .is_err()
-                        {
+                    YMessage::Sync(SyncMessage::SyncStep2(update)) => {
+                        // The room's own state, sent as soon as the note opens.
+                        self.awaiting_room_state = false;
+                        self.apply_remote(update, events)?;
+                    }
+                    YMessage::Sync(SyncMessage::Update(update)) => {
+                        // An update still in flight from the note just left describes a document
+                        // that no longer exists here, and must not be merged into this one.
+                        if self.awaiting_room_state {
                             return Ok(());
                         }
-                        self.emit_body(events);
+                        self.apply_remote(update, events)?;
                     }
                     _ => {}
                 }
@@ -790,6 +800,24 @@ impl Session {
             }
             _ => {}
         }
+        Ok(())
+    }
+
+    /// Merges an update from the server into this note's document.
+    fn apply_remote(&mut self, update: Vec<u8>, events: &Notify) -> Result<(), String> {
+        let Ok(update) = yrs::Update::decode_v1(&update) else {
+            return Ok(());
+        };
+        if self
+            .awareness
+            .doc_mut()
+            .transact_mut()
+            .apply_update(update)
+            .is_err()
+        {
+            return Ok(());
+        }
+        self.emit_body(events);
         Ok(())
     }
 

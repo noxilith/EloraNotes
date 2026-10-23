@@ -25,6 +25,19 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.9.10" date="2026-10-23">
+      <description>
+        <p>
+          A new note in the shared library is its own note again. The app kept one Yjs document
+          for every note it opened, so the text of the note being looked at travelled into the
+          next room: creating a note while another was open made the new note a copy of the old
+          one, and switching notes carried the previous text with it. The document now belongs to
+          the note, updates still in flight from the note just left are dropped, and the server
+          only relays a caret to the people in that note instead of to every connection. The
+          server has to be updated as well: the presence part is on its side.
+        </p>
+      </description>
+    </release>
     <release version="0.9.9" date="2026-10-23">
       <description>
         <p>

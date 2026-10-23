@@ -1,6 +1,6 @@
 [package]
 name = "elora-notes"
-version = "0.9.9"
+version = "0.9.10"
 edition = "2021"
 description = "EloraNotes — A calm, minimalistic cross-platform Markdown notes desktop app"
 authors = ["EloraNotes"]

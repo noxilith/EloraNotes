@@ -303,6 +303,36 @@ fn test_two_clients_edit_the_same_note() {
         "body: {created_raw:?}"
     );
 
+    // Opening the note she just made must start from that note's own text. The client document
+    // belongs to one note; keeping it across the switch handed the server the note Alice had
+    // been looking at, so the new note came out as a copy of it.
+    alice.open_note(&created_id, "");
+    settle(
+        &mut alice,
+        &mut alice_body,
+        "alice opens the new note",
+        |_, body| body == "the body Alice wrote",
+    );
+
+    // Bob is still in the shared note; Alice is in the one she just made, so her caret and name
+    // must not be drawn over his note.
+    settle(
+        &mut bob,
+        &mut bob_body,
+        "bob after alice switched notes",
+        |c, _| c.peers().iter().all(|p| p.name != "alice"),
+    );
+    std::thread::sleep(Duration::from_millis(700));
+    let after_open = std::fs::read_to_string(&created_path).expect("the new note file");
+    assert!(
+        !after_open.contains("from alice"),
+        "the note Alice left leaked into the new note: {after_open:?}"
+    );
+    assert!(
+        after_open.contains("the body Alice wrote"),
+        "the new note lost its own body: {after_open:?}"
+    );
+
     // Everyone left but the viewer: their names and carets go away with them, not just their
     // sidebar entries.
     alice.disconnect();

@@ -421,7 +421,13 @@ impl Server {
         let published: Vec<u64> = client
             .awareness
             .lock()
-            .map(|ids| ids.iter().copied().collect())
+            .map(|mut ids| {
+                let published = ids.iter().copied().collect();
+                // The ids belonged to the room just left; a new note announces itself with a new
+                // state, so keeping the old set would only grow it for the whole session.
+                ids.clear();
+                published
+            })
             .unwrap_or_default();
         if let Ok(mut library) = self.library.lock() {
             if let Some(room) = library.rooms.get_mut(&id) {
@@ -524,7 +530,29 @@ impl Server {
                         }
                     }
                 }
-                self.broadcast_except(client.id, FRAME_AWARENESS, payload);
+                // Only the people in this note see where this person's caret is. Relaying to
+                // every connection told somebody editing one note that a person was in theirs,
+                // and left a name behind in a note that person had already left.
+                let recipients: Vec<u64> = self
+                    .library
+                    .lock()
+                    .ok()
+                    .and_then(|library| {
+                        library
+                            .rooms
+                            .get(&note_id)
+                            .map(|room| room.subscribers.clone())
+                    })
+                    .map(|subscribers| {
+                        subscribers
+                            .into_iter()
+                            .filter(|id| *id != client.id)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for recipient in recipients {
+                    self.push_to(recipient, FRAME_AWARENESS, payload.clone());
+                }
                 self.broadcast_presence();
             }
             _ => {}
