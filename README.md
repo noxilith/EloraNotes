@@ -187,7 +187,7 @@ next note directly on the server.
 
 Pictures in a shared note are kept on the server too, in an `attachments` folder inside its notes folder, so everyone with the library sees them and they are still there after the computer that added them is gone. A picture added before a note is moved to the server goes with it, and **Copy to this computer** brings copies of its pictures along. The server's notes folder stays an ordinary EloraNotes library, pictures included, so copying or backing it up keeps everything.
 
-Everyone in the library, and the server itself, needs a build that speaks the same protocol (0.9.20 or newer). An older server used to drop a shared note's pictures without saying anything, so a client that can share them refuses to connect to one and says to update whichever side is older. The same check covers note privacy, and the newest one covers who is who: a 0.9.19 client sends its name as its key, which is exactly what makes a name unguessable now, so those clients are turned away rather than trusted.
+Everyone in the library, and the server itself, needs a build that speaks the same protocol (0.9.21 or newer). An older server used to drop a shared note's pictures without saying anything, so a client that can share them refuses to connect to one and says to update whichever side is older. The same check covers note privacy, and the newest one covers what a note remembers about people: 0.9.20 and older recorded who owned or could see a note by name, so a client that checked those names was let in by whatever name it typed. From 0.9.21 a note records keys, and a 0.9.20 server or client is turned away rather than trusted with the older meaning.
 
 ### Connecting from the app
 
@@ -206,14 +206,14 @@ the note in that library instead of on your disk: it joins the same folder, keep
 filtering by, and appears on everyone's sidebar straight away.
 
 You go by two things, both in **Settings → Shared library** under **Your name** and
-**Identifier**:
-
-- **Your name** is public. It is what others see next to your caret and what they type to put you
-  on a note. A fresh install makes one up (the account name with a short random tail), and it can
-  be replaced with any word — but not one somebody else on that server already uses.
+**Identifier**:- **Your name** is public. It is what others see next to your caret and in the share panel, and
+  what they type to put you on a note. A fresh install makes one up (the account name with a
+  short random tail), and it can be replaced with any word — but not one somebody else on that
+  server has claimed.
 - **The identifier** is the secret behind it: 32 random hex characters, kept in this computer's
-  settings file, and given to the server and nobody else. The server compares it to remember that
-the name is really you, so knowing what somebody is called does not let anyone connect as them.
+  settings file, and given to the server and nobody else. It is never sent to other clients, never
+  written into a note, and the server keeps only a hash of it. What a note records is a public key
+  derived from it, which cannot be turned back into the identifier.
 
 To use the same identity on a second computer, press **Copy** beside the identifier here and
 paste it into the same box there — you arrive as the same person, and notes closed to everybody
@@ -242,26 +242,67 @@ in the note's header opens **Who can see this note**:
 
 Only the note's owner changes this; everybody else sees whose note it is and that it was shared
 with them. Ownership is recorded on every note the library creates, in its frontmatter
-(`owner:`, `private:`, `shared_with:`) which the server keeps in the `.md` file, so a restriction
-survives a restart and stays visible to anyone who edits the folder by hand.
+(`owner_key:`, `private:`, `shared_keys:`), which the server keeps in the `.md` file, so a
+restriction survives a restart and stays visible to anyone who edits the folder by hand.
 
-How the names are kept safe: the first identifier to claim a name keeps it. The server remembers
-`name → SHA-256 of that identifier` in a `people.json` beside its config, never the identifier
-itself, so somebody who types a taken name is refused at the handshake with a message saying the
-name belongs to somebody else, instead of being let in as that person. A name that is already
-claimed stays bound to its owner even after they change it, so notes they wrote before still find
-them.
+Who is who is decided by keys, never by the name you happen to be using:
 
-One thing to do after updating a server: connect with your own name before other people do. A
-server that has just been updated has no list yet, so each name is bound to the key that claims it
-first — which is you, as long as you get there first. Nothing else is lost either way: the notes
-keep the names they were written with, and whoever owns a name sees what that name was given.
+- **What decides.** Your identifier is turned into a public key, `SHA-256(identifier)`, and that
+  key — 64 hex characters — is what a note records: `owner_key:` for the owner, `shared_keys:` for
+  the guests. The server computes the same key from the identifier a connection brings and
+  compares it with the note, so one identifier on two computers is one person, and no other
+  identifier is.
+- **What the name is.** A label: shown next to a caret and in the share panel, and kept in the
+  note beside the key (`owner:`, `shared_with:`) purely so the sidebar can print a word instead
+  of sixty-four characters. Names live in `people.json` beside the server's config, each bound to
+  the key that claimed it first; the identifier itself is never stored, only its digest. A name
+  somebody else has claimed is refused at the handshake.
+- **So changing your name changes nothing.** Noxilith who becomes Skorp is still the key behind
+  Noxilith: the notes they own, the notes only they can see, and the notes other people shared
+  with them still reach them. Connecting as Skorp does not open Skorp's notes, because those
+  belong to a different key, and a name taken from somebody reaches nothing of theirs.
+- **A name nobody has claimed is not trusted.** Adding a person needs the name to resolve to a key
+  on the server, so a typo is refused with "nobody on this server is called that" rather than
+  quietly written into the note for whoever picks the name up later.
 
 Two limits worth knowing: the server password is still what decides who may connect at all, and
 whoever runs the server can read its files. Within that, knowing somebody's name is not enough to
 be them. Treat the lock as *which notes the server hands out*, plus the identity behind that — for
 a household or a group who trust each other with the password — and keep the identifier to
 yourself the way you keep the password.
+
+### Moving a server to keys
+
+Notes written before keys existed recorded a name as their owner. Such a note is handed to
+nobody over the network — a name proves nothing, which is the whole problem — so the person
+running the server gives it a key once they have checked the names:
+
+```sh
+elora-server people list             # which name is bound to which key
+elora-server people adopt            # what would change, and for whom; writes nothing
+# stop the server, then:
+elora-server people adopt --write    # apply it
+# start the server again
+```
+
+Connect once with the app first (0.9.21), so your name is in that list — a name the server has
+never seen cannot be turned into a key. Stop the server before `--write`: a running one keeps its
+own copy of the library in memory and would put the old frontmatter back on the next edit.
+
+`adopt` takes each locked note's owner name, looks the name up in that list, and writes the key
+behind it into the note. Guests named on the note get their keys too, so a restriction that used
+to be by name becomes one by key. A name nobody has claimed cannot be turned into a key: have
+that person connect once, then run it again.
+
+A name claimed by the wrong key — somebody connected first with a word that was not theirs — is
+what `people release` is for. The next connection with that name claims it:
+
+```sh
+elora-server people release Skorp
+```
+
+Notes that already carry a key need nothing: their `owner:` line is only the label the sidebar
+prints, so a stale one is harmless.
 
 ### If it stays on "Connecting…"
 

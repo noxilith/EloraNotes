@@ -168,16 +168,21 @@ pub struct Note {
     pub icon: Option<String>,
     /// Optional folder the note is filed under, stored in frontmatter.
     pub folder: Option<String>,
-    /// The display name of the person the note belongs to. Notes created in the shared library
-    /// carry one, so whoever is behind that name on the server finds them again; notes on this
-    /// computer are never owned by anybody. The secret that proves which person that is never
-    /// reaches a note: the server resolves the name through its own list.
+    /// The name of the person the note belongs to: what the sidebar prints. It is only a label —
+    /// the key below is what decides anything — so changing it moves no access.
     pub owner: Option<String>,
-    /// True when only the owner and the people named in `shared_with` may see the note. Stored
+    /// The owner's public key: the digest of their identifier. It is what may change who sees
+    /// the note, and it is safe to sit in a file anybody can read, because only the identifier
+    /// behind
+    /// it can present it at the server.
+    pub owner_key: Option<String>,
+    /// True when only the owner and the people in `shared_with` may see the note. Stored
     /// in the shared library's frontmatter, where the server reads it.
     pub private: bool,
     /// Display names allowed to see a private note.
     pub shared_with: Vec<String>,
+    /// The public keys behind those names, which is what actually lets their holders in.
+    pub shared_keys: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub file_path: PathBuf,
@@ -200,8 +205,10 @@ impl Note {
             icon: None,
             folder: None,
             owner: None,
+            owner_key: None,
             private: false,
             shared_with: Vec::new(),
+            shared_keys: Vec::new(),
             created_at: now,
             updated_at: now,
             file_path,
@@ -435,6 +442,11 @@ impl Note {
             .as_ref()
             .map(|owner| format!("owner: \"{}\"\n", escape_yaml_string(owner)))
             .unwrap_or_default();
+        let owner_key_line = self
+            .owner_key
+            .as_ref()
+            .map(|key| format!("owner_key: \"{}\"\n", escape_yaml_string(key)))
+            .unwrap_or_default();
         let private_line = if self.private { "private: true\n" } else { "" };
         let shared_line = if self.shared_with.is_empty() {
             String::new()
@@ -446,9 +458,19 @@ impl Note {
                 .collect();
             format!("shared_with: [{}]\n", names.join(", "))
         };
+        let shared_keys_line = if self.shared_keys.is_empty() {
+            String::new()
+        } else {
+            let keys: Vec<String> = self
+                .shared_keys
+                .iter()
+                .map(|key| format!("\"{}\"", escape_yaml_string(key)))
+                .collect();
+            format!("shared_keys: [{}]\n", keys.join(", "))
+        };
 
         format!(
-            "---\ntitle: \"{}\"\npinned: {}\ntrashed: {}\ntags: {}\n{}{}{}{}{}created_at: {}\nupdated_at: {}\n---\n{}",
+            "---\ntitle: \"{}\"\npinned: {}\ntrashed: {}\ntags: {}\n{}{}{}{}{}{}{}created_at: {}\nupdated_at: {}\n---\n{}",
             escaped_title,
             self.pinned,
             self.trashed,
@@ -459,8 +481,10 @@ impl Note {
                 .map(|i| format!("icon: {i}\n"))
                 .unwrap_or_default(),
             owner_line,
+            owner_key_line,
             private_line,
             shared_line,
+            shared_keys_line,
             self.created_at.to_rfc3339(),
             self.updated_at.to_rfc3339(),
             self.body
@@ -482,8 +506,10 @@ impl Note {
             let mut icon = None;
             let mut folder = None;
             let mut owner = None;
+            let mut owner_key = None;
             let mut private = false;
             let mut shared_with = Vec::new();
+            let mut shared_keys = Vec::new();
             let mut created_at = fallback_time;
             let mut updated_at = fallback_time;
 
@@ -512,6 +538,10 @@ impl Note {
                             let name = crate::net::normalize_identifier(&unquote_yaml_string(val));
                             owner = (!name.is_empty()).then_some(name);
                         }
+                        "owner_key" => {
+                            let key = unquote_yaml_string(val);
+                            owner_key = (!key.trim().is_empty()).then(|| key.trim().to_string());
+                        }
                         "private" => {
                             private = val.eq_ignore_ascii_case("true");
                         }
@@ -520,6 +550,13 @@ impl Note {
                                 .iter()
                                 .map(|name| crate::net::normalize_identifier(name))
                                 .filter(|name| !name.is_empty())
+                                .collect();
+                        }
+                        "shared_keys" => {
+                            shared_keys = parse_yaml_list(val)
+                                .iter()
+                                .map(|key| key.trim().to_string())
+                                .filter(|key| !key.is_empty())
                                 .collect();
                         }
                         "icon" => {
@@ -555,8 +592,10 @@ impl Note {
                 icon,
                 folder,
                 owner,
+                owner_key,
                 private,
                 shared_with,
+                shared_keys,
                 created_at,
                 updated_at,
                 file_path,
@@ -591,8 +630,10 @@ impl Note {
                 icon: None,
                 folder: None,
                 owner: None,
+                owner_key: None,
                 private: false,
                 shared_with: Vec::new(),
+                shared_keys: Vec::new(),
                 created_at: fallback_time,
                 updated_at: fallback_time,
                 file_path,

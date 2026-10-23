@@ -5,6 +5,7 @@
 //! boot service); `fingerprint` reprints the short code clients pin on first connect.
 
 use elora_notes::net::{self, ServerConfig};
+use elora_notes::people::Registry;
 use elora_notes::server::Server;
 use std::io::{BufRead, Write};
 use std::process::ExitCode;
@@ -20,6 +21,9 @@ USAGE:
     elora-server fingerprint
     elora-server show
     elora-server version
+    elora-server people [list]
+    elora-server people release NAME
+    elora-server people adopt [--write]
 
 COMMANDS:
     init         Ask for (or take) the settings, write the config, create the TLS certificate.
@@ -27,6 +31,8 @@ COMMANDS:
     fingerprint  Print the short code clients are asked to confirm.
     version      Print the version of this server, so the build in use can be checked.
     show         Print the saved settings and the addresses other machines can use.
+    people       Who goes by which name, and the key behind it: list, release a name that was
+                 claimed by mistake, or give notes locked before keys existed their owner.
 ";
 
 fn main() -> ExitCode {
@@ -43,6 +49,7 @@ fn main() -> ExitCode {
         "init" => init(rest),
         "fingerprint" | "fp" => fingerprint(),
         "show" | "info" => show(),
+        "people" | "names" => people(rest),
         "version" | "--version" | "-V" => {
             println!("elora-server {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -82,6 +89,90 @@ fn show() -> Result<(), String> {
     let config = ServerConfig::load()?;
     print_summary(&config, false);
     Ok(())
+}
+
+/// Who goes by what, and the two repairs the handshake cannot make by itself: a name claimed by
+/// the wrong key, and notes that were locked before notes carried keys.
+fn people(args: &[String]) -> Result<(), String> {
+    let config = ServerConfig::load()
+        .map_err(|e| format!("{e}\n\nRun 'elora-server init' first to create the settings."))?;
+    let path = ServerConfig::data_dir().join("people.json");
+    let mut people = Registry::load(path)?;
+    let action = args.first().map(String::as_str).unwrap_or("list");
+
+    match action {
+        "list" | "show" => {
+            let rows = people.pairs();
+            if rows.is_empty() {
+                println!(
+                    "Nobody has connected yet: a name is bound to a key the first time it is used."
+                );
+                return Ok(());
+            }
+            println!("\n  Name                 Key");
+            for (name, key) in rows {
+                println!("  {:<20} {}", name, key);
+            }
+            println!(
+                "\n  A name stays with the key that claimed it first. If one was claimed by the wrong\n  person, free it with: elora-server people release NAME"
+            );
+            Ok(())
+        }
+        "release" => {
+            let Some(name) = args.get(1) else {
+                return Err("which name?  elora-server people release NAME".to_string());
+            };
+            if people.release(name)? {
+                println!(
+                    "“{name}” is free again. Its owner can now connect and claim it; run \
+                     `elora-server people adopt --write` afterwards if their notes were locked \
+                     before keys existed."
+                );
+            } else {
+                println!("Nobody had claimed “{name}”.");
+            }
+            Ok(())
+        }
+        "adopt" => {
+            let write = args.iter().any(|arg| arg == "--write");
+            let report = elora_notes::server::adopt_note_keys(&config.notes_dir, &people, write)?;
+            if report.is_empty() {
+                println!("Every locked note already has its keys.");
+                return Ok(());
+            }
+            println!(
+                "\n  {} locked note{} need{} attention:",
+                report.len(),
+                if report.len() == 1 { "" } else { "s" },
+                if report.len() == 1 { "s" } else { "" }
+            );
+            for note in &report {
+                println!("\n  “{}” ({})", note.title, note.id);
+                for change in &note.changes {
+                    println!("      {change}");
+                }
+            }
+            if report.iter().any(|note| note.waiting) {
+                println!(
+                    "\n  A name nobody has claimed cannot be turned into a key: have that person \
+                     connect once, then run this again.\n  If a name was claimed by the wrong key, \
+                     free it first: elora-server people release NAME"
+                );
+            }
+            println!(
+                "\n{}",
+                if write {
+                    "Written. Restart the server: a running one would write its own copy back over \
+                     these files."
+                } else {
+                    "Nothing was written. To apply this: stop the server, run it again with \
+                     --write, and start the server afterwards."
+                }
+            );
+            Ok(())
+        }
+        other => Err(format!("unknown people command '{other}'\n\n{USAGE}")),
+    }
 }
 
 fn init(args: &[String]) -> Result<(), String> {

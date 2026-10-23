@@ -25,6 +25,34 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.9.21" date="2026-10-23">
+      <description>
+        <p>
+          Who a shared note belongs to is now decided by a key, not by a name. Renaming yourself
+          to the word somebody else goes by — which was enough to be let into their locked notes —
+          no longer opens anything: the note records a public key made from the owner’s
+          identifier, and the server checks the key it computes from the identifier a connection
+          brings. Names stay in the note as the labels the sidebar prints, so nothing is lost when
+          someone renames themselves, and a note shared with a name still reaches the person
+          behind it.
+        </p>
+        <p>
+          A name can no longer be used to reach somebody else’s note by being taken, and a name
+          nobody has claimed is refused instead of being written into a note. Settings shows your
+          key under the identifier, with a Copy button.
+        </p>
+        <p>
+          Locked notes written before keys existed are handed to nobody until the person running
+          the server gives them a key: “elora-server people list” shows the bindings, “people
+          adopt” shows what it would change, and “people adopt --write” applies it. A name claimed
+          by the wrong key is freed with “people release NAME”.
+        </p>
+        <p>
+          The protocol is version 6 because of that, so the app and the server both need this
+          release to connect to each other.
+        </p>
+      </description>
+    </release>
     <release version="0.9.20" date="2026-10-23">
       <description>
         <p>

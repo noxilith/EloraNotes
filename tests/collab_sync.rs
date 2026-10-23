@@ -4,6 +4,7 @@
 
 use elora_notes::collab::{Collab, ConnectionState, Incoming, ServerProfile};
 use elora_notes::net::ServerConfig;
+use elora_notes::people;
 use elora_notes::server::Server;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -24,6 +25,12 @@ impl Drop for Harness {
 
 /// Starts a server on a free loopback port with one note in it.
 fn start_server() -> Harness {
+    start_server_with(&[])
+}
+
+/// The same, with extra notes already on disk when the library is read, which matters for a
+/// note whose `private:` line decides whether the server ever hands it out.
+fn start_server_with(extra: &[(String, String)]) -> Harness {
     let dir = std::env::temp_dir().join(format!(
         "elora-collab-test-{}-{}",
         std::process::id(),
@@ -39,11 +46,20 @@ fn start_server() -> Harness {
     let notes_dir = dir.join("notes");
     std::fs::create_dir_all(&notes_dir).unwrap();
     let note_id = "shared-0001".to_string();
+    // Open to the whole server, and owned by alice's key so she can close it: a note keeps its
+    // owner's key next to the name, and that key is what decides who may change it.
+    for (id, body) in extra {
+        std::fs::write(notes_dir.join(format!("{id}.md")), body).unwrap();
+    }
+    let owner_key = people::public_key(&key("alice"));
     std::fs::write(
         notes_dir.join(format!("{note_id}.md")),
-        "---\ntitle: \"Shared\"\npinned: false\ntrashed: false\ntags: []\n\
-         created_at: 2026-01-01T00:00:00+00:00\nupdated_at: 2026-01-01T00:00:00+00:00\n---\n\
-         hello",
+        format!(
+            "---\ntitle: \"Shared\"\npinned: false\ntrashed: false\ntags: []\n\
+             owner: \"alice\"\nowner_key: \"{owner_key}\"\n\
+             created_at: 2026-01-01T00:00:00+00:00\n\
+             updated_at: 2026-01-01T00:00:00+00:00\n---\nhello"
+        ),
     )
     .unwrap();
 
@@ -512,6 +528,65 @@ fn test_a_name_cannot_be_taken_by_another_key() {
     );
 }
 
+/// Sharing a note by name works because the server turns the name into the key behind it, and
+/// a name nobody has claimed is refused instead of being written into the note as a label that
+/// reaches nobody.
+#[test]
+fn test_sharing_with_a_name_goes_through_the_servers_own_list() {
+    let _turn = SERVER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let harness = start_server();
+    let note_id = harness.note_id.clone();
+
+    let mut alice = Collab::new();
+    alice.connect(profile(harness.port), "alice".into(), key("alice"));
+    let mut alice_body = String::new();
+    settle(&mut alice, &mut alice_body, "alice", |c, _| {
+        c.is_connected() && !c.notes().is_empty()
+    });
+    alice.open_note(&note_id, "hello");
+    settle(&mut alice, &mut alice_body, "alice opens", |_, body| {
+        body == "hello"
+    });
+
+    // A name that belongs to nobody is turned away with an explanation, and the note is left
+    // exactly as it was.
+    alice.set_share(&note_id, true, vec!["Nobody".to_string()]);
+    wait_until(&mut alice, "the unknown name", |c| {
+        c.last_error()
+            .is_some_and(|error| error.contains("nobody on this server is called"))
+    });
+    assert!(
+        alice
+            .notes()
+            .iter()
+            .any(|note| note.id == note_id && !note.private),
+        "a refused share must not change the note"
+    );
+
+    // Bob arrives with a name of his own, and alice adds that name: the note comes back only
+    // for him, because the server knows which key the name is.
+    let mut bob = Collab::new();
+    bob.connect(profile(harness.port), "bob".into(), key("bob"));
+    settle(&mut bob, &mut String::new(), "bob", |c, _| {
+        c.is_connected() && c.notes().iter().any(|note| note.id == note_id)
+    });
+
+    alice.set_share(&note_id, true, Vec::new());
+    wait_until(&mut alice, "closed", |c| {
+        c.notes()
+            .iter()
+            .any(|note| note.id == note_id && note.private)
+    });
+    settle(&mut bob, &mut String::new(), "bob loses it", |c, _| {
+        !c.notes().iter().any(|note| note.id == note_id)
+    });
+
+    alice.set_share(&note_id, true, vec!["bob".to_string()]);
+    settle(&mut bob, &mut String::new(), "bob is named", |c, _| {
+        c.notes().iter().any(|note| note.id == note_id)
+    });
+}
+
 /// A picture added to a shared note goes to the server, so somebody who never had the file can
 /// see it — including after the computer that added it has gone.
 #[test]
@@ -650,4 +725,77 @@ fn wait_for_added(collab: &mut Collab, file: &str) -> bool {
         std::thread::sleep(Duration::from_millis(10));
     }
     false
+}
+
+/// A note belongs to a key, never to a name. Taking the word a note's owner goes by — which is
+/// what a rename does when nobody has claimed it yet — must not open the note, and the same
+/// identifier under a new name must keep everything it owned.
+#[test]
+fn test_taking_somebodys_name_does_not_open_their_note() {
+    let _turn = SERVER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let skorp_key = people::public_key(&key("skorp"));
+    let locked = "locked-0001";
+    let harness = start_server_with(&[(
+        locked.to_string(),
+        format!(
+            "---\ntitle: \"Skorp's diary\"\npinned: false\ntrashed: false\ntags: []\n\
+             owner: \"skorp\"\nowner_key: \"{skorp_key}\"\nprivate: true\n\
+             created_at: 2026-01-01T00:00:00+00:00\n\
+             updated_at: 2026-01-01T00:00:00+00:00\n---\nthe secret"
+        ),
+    )]);
+    let path = harness.notes_dir.join(format!("{locked}.md"));
+
+    // "skorp" has never connected to this server, so the name is free and this client is allowed
+    // to use it. Being allowed to use the word is all it gets.
+    let mut impostor = Collab::new();
+    impostor.connect(profile(harness.port), "skorp".into(), key("nox"));
+    settle(&mut impostor, &mut String::new(), "the impostor", |c, _| {
+        c.is_connected()
+    });
+    assert!(
+        impostor.notes().iter().all(|note| note.id != locked),
+        "a name is a label, not a key: the note was listed as {:?}",
+        impostor
+            .notes()
+            .iter()
+            .map(|note| note.id.clone())
+            .collect::<Vec<_>>()
+    );
+
+    // Asking the server for it directly is refused, and so is changing who can see it.
+    impostor.open_note(locked, "");
+    wait_until(&mut impostor, "opening the note", |c| {
+        c.last_error()
+            .is_some_and(|error| error.contains("not shared with you"))
+    });
+    impostor.set_share(locked, false, Vec::new());
+    wait_until(&mut impostor, "opening the note up", |c| {
+        c.last_error()
+            .is_some_and(|error| error.contains("not shared with you"))
+    });
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        saved.contains("private: true") && saved.contains(&skorp_key),
+        "a refused change must leave the note as it was: {saved:?}"
+    );
+
+    // The owner, under a name they have never used — the impostor took the word — still has it:
+    // the key is what the note knows.
+    let mut skorp = Collab::new();
+    skorp.connect(profile(harness.port), "skorp-two".into(), key("skorp"));
+    settle(&mut skorp, &mut String::new(), "the owner", |c, _| {
+        c.is_connected()
+    });
+    assert!(
+        skorp.notes().iter().any(|note| note.id == locked),
+        "the key that owns the note must still find it"
+    );
+    skorp.open_note(locked, "the secret");
+    settle(
+        &mut skorp,
+        &mut String::new(),
+        "the owner opens it",
+        |_, body| body == "the secret",
+    );
 }

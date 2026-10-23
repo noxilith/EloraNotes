@@ -62,7 +62,11 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Field<T> {
 /// sees, and the name everybody sees is separate. A version-4 client sends its name as its
 /// identifier, which is exactly the thing version 5 makes unguessable, so those clients are
 /// refused rather than trusted.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// Version 6 makes a note remember its people by their public keys. A version-5 server decided
+/// access from the display names in a note, so taking somebody's name was a way into their
+/// notes; a version-5 client reads none of the key fields and would see a note as belonging to
+/// nobody. The two cannot be paired.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Prefixes a Yjs sync payload with the id of the note it belongs to.
 ///
@@ -212,20 +216,30 @@ pub fn normalize_identifier(raw: &str) -> String {
     cleaned.trim().to_string()
 }
 
-/// Whether a note is for this person: everything public is for everybody, and a restricted note
-/// is only for its owner and the people it names. Notes are written in display names — the part
-/// everybody sees — and `names` is every name the asking key has gone by, so a note written
-/// against an older name of theirs still finds them. Names are compared without case, so one
-/// typed with a capital in one place and not the other still grants access.
-pub fn visible_to(meta: &NoteMeta, names: &[String]) -> bool {
+/// Whether a note is for this person, decided by **public keys** and nothing else: everything
+/// public is for everybody, and a restricted note is only for the key that owns it and the keys
+/// it names. The display names in the note are labels — what the sidebar prints, and what
+/// somebody typed when they shared it — so changing your name cannot move a note: the key
+/// behind it stays the same, and only the identifier that key was made from can present it.
+///
+/// A restricted note with no key on it was locked before keys were stored. It is visible to
+/// nobody over the network: `elora-server people adopt` gives those notes their person's key
+/// once the name list has been checked, which is the only honest way to decide who they were.
+pub fn visible_to(meta: &NoteMeta, key: &str) -> bool {
     if !meta.private {
         return true;
     }
-    let mine = |other: &str| {
-        let other = other.trim();
-        !other.is_empty() && names.iter().any(|name| name.eq_ignore_ascii_case(other))
-    };
-    meta.owner.as_deref().is_some_and(mine) || meta.shared_with.iter().any(|allowed| mine(allowed))
+    let key = key.trim();
+    if key.is_empty() {
+        return false;
+    }
+    meta.owner_key
+        .as_deref()
+        .is_some_and(|owner| owner.eq_ignore_ascii_case(key))
+        || meta
+            .shared_keys
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(key))
 }
 
 /// Notes the server owns, as the sidebar and the editor need them.
@@ -247,16 +261,23 @@ pub struct NoteMeta {
     /// Unix seconds; the sort order in the sidebar.
     #[serde(default)]
     pub updated_at: i64,
-    /// The display name of the person the note belongs to: the part everybody on the server
-    /// sees, never the key behind it.
+    /// The name of the person the note belongs to: what the sidebar prints, and the label the
+    /// server's name list turns into a key when somebody is added to a note.
     #[serde(default)]
     pub owner: Option<String>,
+    /// The owner's public key: who may change who sees the note. A digest, safe to be read by
+    /// anybody, and useless to them without the identifier behind it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_key: Option<String>,
     /// True when only the owner and the people in `shared_with` may see the note.
     #[serde(default)]
     pub private: bool,
-    /// Display names the owner has let in to a private note.
+    /// The names of the people the owner has let in to a private note.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shared_with: Vec<String>,
+    /// Their public keys, in the same order, which is what actually decides entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_keys: Vec<String>,
 }
 
 /// Who is in a note right now.
@@ -550,12 +571,10 @@ mod tests {
         assert!(matches!(back, ClientMsg::Hello { .. }));
     }
 
-    fn names(list: &[&str]) -> Vec<String> {
-        list.iter().map(|name| name.to_string()).collect()
-    }
-
     fn meta(owner: Option<&str>, private: bool, shared: &[&str]) -> NoteMeta {
         NoteMeta {
+            owner_key: owner.map(|name| format!("key-{name}")),
+            shared_keys: shared.iter().map(|key| format!("key-{key}")).collect(),
             id: "n-1".into(),
             title: "Note".into(),
             folder: None,
@@ -571,34 +590,37 @@ mod tests {
     }
 
     #[test]
-    fn test_a_public_note_is_for_everyone_and_a_restricted_one_is_not() {
+    fn test_a_public_note_is_for_everyone_and_a_restricted_one_does_not_hinge_on_a_name() {
         let open = meta(Some("nox"), false, &[]);
-        assert!(visible_to(&open, &names(&["nox"])));
-        assert!(visible_to(&open, &names(&["friend"])));
+        assert!(visible_to(&open, "key-nox"));
+        assert!(visible_to(&open, "key-friend"));
 
-        // "Only me" means exactly that, whatever the case of the name typed.
+        // "Only me" means the key that owns it, and only that key.
         let mine = meta(Some("Nox"), true, &[]);
-        assert!(
-            visible_to(&mine, &names(&["nox"])),
-            "the owner keeps the note"
-        );
-        assert!(!visible_to(&mine, &names(&["friend"])));
+        assert!(visible_to(&mine, "key-Nox"), "the owner keeps the note");
+        assert!(!visible_to(&mine, "key-friend"));
 
-        // Naming somebody lets them in, and only them.
+        // Naming somebody lets their key in, and only theirs.
         let shared = meta(Some("nox"), true, &["SuperSaiyan", "Mira"]);
-        assert!(visible_to(&shared, &names(&["supersaiyan"])));
-        assert!(visible_to(&shared, &names(&["MIRA"])));
-        assert!(!visible_to(&shared, &names(&["  "])));
-        assert!(!visible_to(&shared, &names(&["stranger"])));
-        assert!(!visible_to(&shared, &names(&[])));
+        assert!(visible_to(&shared, "key-SuperSaiyan"));
+        assert!(visible_to(&shared, "key-Mira"));
+        assert!(!visible_to(&shared, ""));
+        assert!(!visible_to(&shared, "   "));
+        assert!(!visible_to(&shared, "key-stranger"));
 
-        // Somebody who changed their display name keeps the notes written against the old one,
-        // because the server still knows both names belong to them.
-        assert!(visible_to(&shared, &names(&["Noxy", "Mira"])));
+        // The names in the note are labels, and a key that happens to read like one of them is
+        // not that person: knowing a name has never been enough here.
+        let named = meta(Some("skorp"), true, &["Mira"]);
+        assert!(!visible_to(&named, "skorp"));
+        assert!(!visible_to(&named, "Mira"));
+        assert!(!visible_to(&named, "Mira "));
 
-        // A restricted note whose owner is unknown is not left open by accident.
-        let orphan = meta(None, true, &[]);
-        assert!(!visible_to(&orphan, &names(&["nox"])));
+        // A restricted note with no key on it was locked before keys were stored. It is not
+        // left open to whoever asks: the operator adopts it with `elora-server people adopt`.
+        let mut orphan = meta(Some("nox"), true, &[]);
+        orphan.owner_key = None;
+        assert!(!visible_to(&orphan, "key-nox"));
+        assert!(!visible_to(&orphan, ""));
     }
 
     #[test]

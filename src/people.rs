@@ -37,8 +37,14 @@ pub struct Registry {
 /// typo or a hand-written key.
 pub const MIN_IDENTIFIER: usize = 16;
 
-/// The digest a client's secret identifier is remembered by. Compared, never shown.
-pub fn key_digest(identifier: &str) -> String {
+/// The public key behind a client's secret identifier: a one-way digest of it.
+///
+/// This is the value the world is allowed to see. It goes into the server's name list and into
+/// the notes a person owns or is named on, and it decides who may open them, because only the
+/// holder of the identifier can produce the key again at the handshake. Seeing somebody's key
+/// is therefore of no use to anybody: the identifier behind it is what grants access, and it
+/// never leaves the computer it was made on.
+pub fn public_key(identifier: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(identifier.trim().as_bytes());
     format!("{:x}", hasher.finalize())
@@ -104,6 +110,55 @@ impl Registry {
         self.identities.get(key).cloned().unwrap_or_default()
     }
 
+    /// The public key a name belongs to, if it has been claimed. A note stores this beside the
+    /// name: the name is the label, the key is who may open it.
+    pub fn key_of(&self, name: &str) -> Option<&str> {
+        let name = crate::net::normalize_identifier(name).to_lowercase();
+        self.names.get(&name).map(String::as_str)
+    }
+
+    /// Frees a name that was claimed by the wrong key — the one thing the handshake cannot
+    /// decide on its own, since it has no way to know who is sitting at the keyboard. Only the
+    /// server's own operator runs this.
+    pub fn release(&mut self, name: &str) -> Result<bool, String> {
+        let name = crate::net::normalize_identifier(name);
+        let Some(key) = self.names.remove(&name.to_lowercase()) else {
+            return Ok(false);
+        };
+        if let Some(used) = self.identities.get_mut(&key) {
+            used.retain(|known| !known.eq_ignore_ascii_case(&name));
+            if used.is_empty() {
+                self.identities.remove(&key);
+            }
+        }
+        self.save()?;
+        Ok(true)
+    }
+
+    /// Every claimed name with the key it belongs to, sorted by name, for the operator to
+    /// check before notes are handed their keys.
+    pub fn pairs(&self) -> Vec<(String, String)> {
+        let mut rows: Vec<(String, String)> = self
+            .names
+            .iter()
+            .map(|(lower, key)| {
+                let typed = self
+                    .identities
+                    .get(key)
+                    .and_then(|names| {
+                        names
+                            .iter()
+                            .find(|name| name.to_lowercase() == *lower)
+                            .cloned()
+                    })
+                    .unwrap_or_else(|| lower.clone());
+                (typed, key.clone())
+            })
+            .collect();
+        rows.sort_by_key(|(name, _)| name.to_lowercase());
+        rows
+    }
+
     fn save(&self) -> Result<(), String> {
         let Some(path) = &self.path else {
             return Ok(());
@@ -145,8 +200,8 @@ mod tests {
     fn test_a_name_belongs_to_the_key_that_claimed_it_first() {
         let path = temp_path("claim");
         let mut registry = Registry::load(path.clone()).unwrap();
-        let nox = key_digest("a-long-secret-of-nox");
-        let mira = key_digest("a-long-secret-of-mira");
+        let nox = public_key("a-long-secret-of-nox");
+        let mira = public_key("a-long-secret-of-mira");
 
         assert_eq!(
             registry.claim("SuperSaiyan", &nox).unwrap(),
@@ -181,37 +236,65 @@ mod tests {
     fn test_changing_a_name_keeps_the_old_one_bound() {
         let path = temp_path("rename");
         let mut registry = Registry::load(path.clone()).unwrap();
-        let key = key_digest("secret");
+        let key = public_key("secret");
         registry.claim("Noxy", &key).unwrap();
         let names = registry.claim("Nox", &key).unwrap();
         assert!(names.contains(&"Noxy".to_string()));
         assert!(names.contains(&"Nox".to_string()));
 
-        // A note written against the old name still belongs to the same person...
-        assert!(crate::net::visible_to(
-            &crate::net::NoteMeta {
-                id: "n".into(),
-                title: "Note".into(),
-                folder: None,
-                tags: Vec::new(),
-                pinned: false,
-                trashed: false,
-                icon: None,
-                updated_at: 0,
-                owner: Some("Noxy".into()),
-                private: true,
-                shared_with: Vec::new(),
-            },
-            &names
-        ));
+        // Both names still point at the same key, so a note written under either one is theirs.
+        assert_eq!(registry.key_of("Noxy"), Some(key.as_str()));
+        assert_eq!(registry.key_of("NoX"), Some(key.as_str()));
         // ... and nobody else may take the old name on.
-        let other = key_digest("another-secret");
+        let other = public_key("another-secret");
         assert!(registry.claim("Noxy", &other).is_err());
 
         // A registry with no path is usable in memory, for tests that do not need a file.
         let mut memory = Registry::default();
         assert!(memory.claim("Solo", &key).is_ok());
         assert!(memory.path().is_none());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A name claimed by the wrong person can be freed by the operator, and the person it
+    /// really belongs to can then claim it.
+    #[test]
+    fn test_a_name_can_be_released_for_its_real_owner() {
+        let path = temp_path("release");
+        let mut registry = Registry::load(path.clone()).unwrap();
+        let wrong = public_key("somebody-elses-identifier");
+        let right = public_key("the-real-skorp-identifier");
+        registry.claim("skorp", &wrong).unwrap();
+        assert!(registry.claim("skorp", &right).is_err());
+
+        assert!(registry.release("Skorp").unwrap(), "the name was taken");
+        assert_eq!(registry.key_of("skorp"), None);
+        assert!(registry.names_of(&wrong).is_empty(), "nothing is left over");
+        assert!(
+            registry.claim("skorp", &right).is_ok(),
+            "the real owner can claim it now"
+        );
+        assert_eq!(registry.key_of("skorp"), Some(right.as_str()));
+        assert!(!registry.release("nobody").unwrap(), "nothing to free");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The list an operator reads: every name with the key behind it.
+    #[test]
+    fn test_the_operator_can_see_who_is_who() {
+        let path = temp_path("pairs");
+        let mut registry = Registry::load(path.clone()).unwrap();
+        let nox = public_key("nox-secret");
+        let mira = public_key("mira-secret");
+        registry.claim("nox", &nox).unwrap();
+        registry.claim("Mira", &mira).unwrap();
+        registry.claim("Noxy", &nox).unwrap();
+
+        let rows = registry.pairs();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], ("Mira".to_string(), mira.clone()));
+        assert!(rows.iter().any(|(name, key)| name == "Noxy" && *key == nox));
+        assert!(rows.iter().any(|(name, key)| name == "nox" && *key == nox));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

@@ -1138,6 +1138,31 @@ impl EloraApp {
                 .color(p.danger),
             );
         }
+        // The public half of the identifier: what a note records as its owner or as somebody it
+        // was shared with. It cannot be turned back into the identifier, which is why it is safe
+        // to show — and it is what `elora-server adopt` takes, so it needs to be copyable.
+        let public_key = crate::people::public_key(self.identifier.trim());
+        ui.horizontal(|ui| {
+            ui.label("Your key");
+            ui.label(
+                RichText::new(crate::net::short_fingerprint(&public_key))
+                    .size(10.5)
+                    .color(p.fg_muted),
+            )
+            .on_hover_text(
+                "The public half of your identifier. Notes record it, not your name, so they \
+                 follow you even after you rename yourself. Give it to whoever runs the server \
+                 when older notes have to be handed over.",
+            );
+            if ui
+                .small_button("Copy")
+                .on_hover_text("Copy your full key")
+                .clicked()
+            {
+                ui.ctx().copy_text(public_key.clone());
+                self.status_message = Some("Key copied".to_string());
+            }
+        });
         if name_changed || identifier_changed {
             self.persist_settings();
         }
@@ -1353,8 +1378,10 @@ impl EloraApp {
                 // Sharing has its own message, sent from the panel that changes it, so an
                 // ordinary edit never carries it and can never undo somebody else's.
                 owner: note.owner.clone(),
+                owner_key: note.owner_key.clone(),
                 private: note.private,
                 shared_with: note.shared_with.clone(),
+                shared_keys: note.shared_keys.clone(),
             });
         }
         if self.collab_open.as_deref() == Some(note.id.as_str())
@@ -1846,8 +1873,10 @@ impl EloraApp {
                         icon: meta.icon,
                         folder: meta.folder,
                         owner: meta.owner,
+                        owner_key: meta.owner_key,
                         private: meta.private,
                         shared_with: meta.shared_with,
+                        shared_keys: meta.shared_keys,
                         created_at: updated,
                         updated_at: updated,
                         file_path: PathBuf::new(),
@@ -1910,8 +1939,10 @@ impl EloraApp {
                             icon: note.icon.clone(),
                             folder: note.folder.clone(),
                             owner: note.owner.clone(),
+                            owner_key: note.owner_key.clone(),
                             private: note.private,
                             shared_with: note.shared_with.clone(),
+                            shared_keys: note.shared_keys.clone(),
                             created_at: updated,
                             updated_at: updated,
                             file_path: PathBuf::new(),
@@ -4122,7 +4153,13 @@ impl EloraApp {
         };
         let me = self.server_display_name();
         let owner = meta.owner.clone().unwrap_or_else(|| me.clone());
-        let mine = owner.eq_ignore_ascii_case(&me);
+        // Whether this note is yours is the key's business, never the name's: renaming yourself
+        // to somebody else's word leaves you with your own key, and their notes stay theirs.
+        let my_key = crate::people::public_key(&self.identifier);
+        let mine = meta
+            .owner_key
+            .as_deref()
+            .is_some_and(|owner_key| owner_key.eq_ignore_ascii_case(&my_key));
         let server = self.collab.server_name().map(str::to_string);
         let mut open = true;
         let mut change: Option<(bool, Vec<String>)> = None;
@@ -4158,6 +4195,17 @@ impl EloraApp {
                     .size(11.0)
                     .color(p.fg_muted),
                 );
+                if meta.private && meta.owner_key.is_none() {
+                    ui.label(
+                        RichText::new(
+                            "It was locked before notes carried keys, so nobody can prove they own \
+                             it: whoever runs the server has to give it one with \
+                             `elora-server people adopt --write`.",
+                        )
+                        .size(10.0)
+                        .color(p.danger),
+                    );
+                }
                 ui.add_space(6.0);
 
                 let mut private = meta.private;
@@ -4544,11 +4592,20 @@ impl EloraApp {
                 if !compact {
                     ui.label(RichText::new("·").color(p.fg_muted));
                 }
+                let my_key = crate::people::public_key(&self.identifier);
+                let owner = self.notes[note_idx]
+                    .owner
+                    .clone()
+                    .unwrap_or_else(|| self.server_display_name());
+                let mine = self.notes[note_idx]
+                    .owner_key
+                    .as_deref()
+                    .is_some_and(|key| key.eq_ignore_ascii_case(&my_key));
                 let (glyph, summary) = share_look(
                     self.notes[note_idx].private,
                     &self.notes[note_idx].shared_with,
-                    self.notes[note_idx].owner.as_deref(),
-                    &self.server_display_name(),
+                    &owner,
+                    mine,
                     self.collab.server_name(),
                 );
                 let showing = self.share_picker_open
@@ -6010,16 +6067,15 @@ fn browser_command(url: &str) -> std::process::Command {
 fn share_look(
     private: bool,
     shared_with: &[String],
-    owner: Option<&str>,
-    me: &str,
+    owner: &str,
+    mine: bool,
     server: Option<&str>,
 ) -> (&'static str, String) {
     if !private {
         let where_ = server.map(|name| format!(" on {name}")).unwrap_or_default();
         return (icon::WORLD, format!("Everyone{where_} can see this note"));
     }
-    let owner = owner.unwrap_or(me);
-    if owner.eq_ignore_ascii_case(me) {
+    if mine {
         if shared_with.is_empty() {
             (icon::LOCK, "Only you can see this note".to_string())
         } else {
@@ -6810,8 +6866,10 @@ mod tests {
             icon: None,
             folder: folder.map(str::to_string),
             owner: None,
+            owner_key: None,
             private: false,
             shared_with: Vec::new(),
+            shared_keys: Vec::new(),
             created_at: now,
             updated_at: now,
             file_path: PathBuf::new(),
@@ -6967,8 +7025,10 @@ mod tests {
             icon: None,
             folder: None,
             owner: None,
+            owner_key: None,
             private: false,
             shared_with: Vec::new(),
+            shared_keys: Vec::new(),
             created_at: now,
             updated_at: now,
             file_path: PathBuf::new(),
@@ -7821,6 +7881,11 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// The identifier the owner uses in the sharing test. The fixture note is written before the
+    /// app that will own it exists, so its key is worked out from this string both here and
+    /// where the app is built.
+    const OWNER_IDENTIFIER: &str = "shared-test-owner-identifier-0123456789abcdef";
+
     /// Starts a real server on a loopback port with one shared note, for app-level tests.
     fn start_shared_server(label: &str) -> (PathBuf, u16, String) {
         let dir = std::env::temp_dir().join(format!(
@@ -7834,13 +7899,18 @@ mod tests {
         let notes_dir = dir.join("notes");
         std::fs::create_dir_all(&notes_dir).unwrap();
         let note_id = "shared-0001".to_string();
+        let owner_key = crate::people::public_key(OWNER_IDENTIFIER);
         std::fs::write(
             notes_dir.join(format!("{note_id}.md")),
             // Owned by nox, open to everyone: the shape a note has once its owner has made it
-            // in the library, and the starting point the privacy tests need.
-            "---\ntitle: \"Shared\"\npinned: false\ntrashed: false\ntags: []\nowner: \"nox\"\n\
-             created_at: 2026-01-01T00:00:00+00:00\nupdated_at: 2026-01-01T00:00:00+00:00\n---\n\
-             hello",
+            // in the library, and the starting point the privacy tests need. The key is the
+            // part that decides anything; the name is what the sidebar prints.
+            format!(
+                "---\ntitle: \"Shared\"\npinned: false\ntrashed: false\ntags: []\n\
+                 owner: \"nox\"\nowner_key: \"{owner_key}\"\n\
+                 created_at: 2026-01-01T00:00:00+00:00\n\
+                 updated_at: 2026-01-01T00:00:00+00:00\n---\nhello"
+            ),
         )
         .unwrap();
 
@@ -7888,6 +7958,7 @@ mod tests {
 
         let mut owner = EloraApp::with_context(&ctx, NoteStorage::new(dir.join("owner")).unwrap());
         owner.display_name = "nox".to_string();
+        owner.identifier = OWNER_IDENTIFIER.to_string();
         owner.server_form = profile.clone();
         owner.connect_server();
         wait_for_shared(&mut owner, &ctx, "owner connected", |app| {
@@ -8079,25 +8150,25 @@ mod tests {
     #[test]
     fn test_the_lock_button_says_who_can_read_the_note() {
         let nobody: Vec<String> = Vec::new();
-        let (glyph, text) = share_look(false, &nobody, Some("nox"), "nox", Some("Home"));
+        let (glyph, text) = share_look(false, &nobody, "nox", true, Some("Home"));
         assert_eq!(glyph, icon::WORLD);
         assert_eq!(text, "Everyone on Home can see this note");
 
-        let (glyph, text) = share_look(true, &nobody, Some("nox"), "nox", Some("Home"));
+        let (glyph, text) = share_look(true, &nobody, "nox", true, Some("Home"));
         assert_eq!(glyph, icon::LOCK);
         assert_eq!(text, "Only you can see this note");
 
         let (_, text) = share_look(
             true,
             &["SuperSaiyan".to_string(), "Mira".to_string()],
-            Some("nox"),
             "nox",
+            true,
             Some("Home"),
         );
         assert_eq!(text, "Shared with SuperSaiyan, Mira");
 
         // Somebody who was let in is told whose note it is, and cannot claim it as theirs.
-        let (_, text) = share_look(true, &nobody, Some("Nox"), "mira", Some("Home"));
+        let (_, text) = share_look(true, &nobody, "Nox", false, Some("Home"));
         assert_eq!(text, "Nox shared this note with you");
     }
 
