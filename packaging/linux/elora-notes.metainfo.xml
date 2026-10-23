@@ -25,6 +25,15 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.8.0" date="2026-10-22">
+      <description>
+        <p>
+          The seam between the note list and the editor is a single soft divider now. It had
+          been painted underneath the sidebar, so what showed there was the note list's
+          scroll bar, drawn in the text colour; scroll bars rest faint and out of the way.
+        </p>
+      </description>
+    </release>
     <release version="0.7.9" date="2026-10-22">
       <description>
         <p>
