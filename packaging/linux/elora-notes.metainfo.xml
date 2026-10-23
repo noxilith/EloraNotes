@@ -25,6 +25,18 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.9.6" date="2026-10-23">
+      <description>
+        <p>
+          The Windows server installer no longer stops with "The system cannot find the file
+          specified" when it checks for an existing server: the scheduled-task lookup reads its
+          result instead of treating a missing task as an error. It also asks, as the Linux
+          installer does, whether to update an existing server, uninstall it and keep the notes,
+          uninstall it and delete them, or cancel, and it stops the running server before
+          replacing its binary so the copy cannot hit a file in use.
+        </p>
+      </description>
+    </release>
     <release version="0.9.5" date="2026-10-22">
       <description>
         <p>

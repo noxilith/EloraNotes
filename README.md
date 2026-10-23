@@ -152,7 +152,8 @@ install: it prints what it found (service, binary, settings, how many notes, the
 and asks whether to **update** it, **uninstall** it and keep the notes, **uninstall** it and delete
 the notes and the certificate, or **cancel**. An update keeps the notes and the certificate, so the
 code clients already trust does not change. `ELORA_ACTION=update`, `uninstall` or `purge` skips the
-question for scripted installs; with no terminal to ask in, an existing install is updated.
+question for scripted installs (on Windows, set `$env:ELORA_ACTION` first); with no answer to it,
+an existing install is updated.
 
 From another network, forward the port on the router once and give people this machine's public IP
 or a DNS name. If the machine sits behind CGNAT, tunnel the port (for example with a small VPS
