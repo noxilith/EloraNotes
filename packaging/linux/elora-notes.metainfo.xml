@@ -25,6 +25,21 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.9.16" date="2026-10-23">
+      <description>
+        <p>
+          The shared library is headed by its cloud alone now, without a folder glyph in front of
+          it, so it no longer reads as a folder on this computer. The library also keeps folders
+          of its own: a shared note filed from its folder menu brings its folder to everyone’s
+          sidebar, where it can be folded shut like any other.
+        </p>
+        <p>
+          The sidebar shows what belongs to what: a folder’s notes are stepped in from its
+          header, and notes inside the shared library are stepped in further — twice over when
+          they sit in one of its folders.
+        </p>
+      </description>
+    </release>
     <release version="0.9.15" date="2026-10-23">
       <description>
         <p>

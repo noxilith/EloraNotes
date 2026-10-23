@@ -38,6 +38,11 @@ const ROOM_BODY_WAIT: Duration = Duration::from_millis(800);
 const SIDEBAR_MARGIN_X: i8 = 12;
 const SIDEBAR_MARGIN_Y: i8 = 10;
 
+/// How far a note or folder sits inside the group that holds it, in points. Notes filed in a
+/// folder are stepped in once, so a folder's contents read as its children; the shared
+/// library steps its folders in, and their notes in once more.
+const SIDEBAR_INDENT_STEP: i8 = 12;
+
 /// Height kept free at the bottom of the sidebar for the footer action row.
 const SIDEBAR_FOOTER_HEIGHT: f32 = 34.0;
 /// Space kept between the footer icons and the panel's right edge.
@@ -3323,6 +3328,7 @@ impl EloraApp {
                             &self.search_query,
                             Some(&self.collab),
                             &mut picked,
+                            0,
                         );
                         ui.add_space(4.0);
                     }
@@ -3330,9 +3336,12 @@ impl EloraApp {
                     if !remote_indices.is_empty() {
                         let key = format!("server:{server_label}");
                         let collapsed = !folders_open && self.collapsed_folders.contains(&key);
-                        if folder_header(
+                        // The shared library is marked by its cloud alone; a folder glyph in
+                        // front of it would read as a folder on this computer.
+                        if folder_header_with(
                             ui,
-                            &format!("{} {server_label}", icon::CLOUD),
+                            icon::CLOUD,
+                            &server_label,
                             remote_indices.len(),
                             collapsed,
                             p,
@@ -3343,16 +3352,47 @@ impl EloraApp {
                         }
                         if !collapsed {
                             ui.add_space(2.0);
-                            render_note_rows(
-                                ui,
-                                &self.notes,
-                                &remote_indices,
-                                self.selected_id.as_deref(),
-                                p,
-                                &self.search_query,
-                                Some(&self.collab),
-                                &mut picked,
-                            );
+                            // The shared library keeps folders of its own, laid out the same
+                            // way as local ones.
+                            let (remote_unfiled, remote_folders) =
+                                split_by_folder(&self.notes, &remote_indices);
+                            if !remote_unfiled.is_empty() {
+                                render_note_rows(
+                                    ui,
+                                    &self.notes,
+                                    &remote_unfiled,
+                                    self.selected_id.as_deref(),
+                                    p,
+                                    &self.search_query,
+                                    Some(&self.collab),
+                                    &mut picked,
+                                    SIDEBAR_INDENT_STEP,
+                                );
+                            }
+                            for (name, indices) in &remote_folders {
+                                let folder_key = format!("server:{server_label}/{name}");
+                                let folder_collapsed =
+                                    !folders_open && self.collapsed_folders.contains(&folder_key);
+                                let header = indented(ui, SIDEBAR_INDENT_STEP, |ui| {
+                                    folder_header(ui, name, indices.len(), folder_collapsed, p)
+                                });
+                                if header.clicked() {
+                                    toggled_folder = Some(folder_key);
+                                }
+                                if !folder_collapsed {
+                                    render_note_rows(
+                                        ui,
+                                        &self.notes,
+                                        indices,
+                                        self.selected_id.as_deref(),
+                                        p,
+                                        &self.search_query,
+                                        Some(&self.collab),
+                                        &mut picked,
+                                        SIDEBAR_INDENT_STEP * 2,
+                                    );
+                                }
+                            }
                             ui.add_space(3.0);
                         }
                     }
@@ -3373,6 +3413,7 @@ impl EloraApp {
                                 &self.search_query,
                                 Some(&self.collab),
                                 &mut picked,
+                                SIDEBAR_INDENT_STEP,
                             );
                             ui.add_space(3.0);
                         }
@@ -3391,6 +3432,7 @@ impl EloraApp {
                             &self.search_query,
                             Some(&self.collab),
                             &mut picked,
+                            0,
                         );
                     }
 
@@ -3405,6 +3447,7 @@ impl EloraApp {
                             &self.search_query,
                             Some(&self.collab),
                             &mut picked,
+                            0,
                         );
                     }
                 });
@@ -4357,8 +4400,15 @@ impl EloraApp {
                     self.notes[note_idx].folder = Some(name.clone());
                     self.notes[note_idx].updated_at = Utc::now();
                     needs_save = true;
-                    // Filing a note into a folded folder should reveal it.
+                    // Filing a note into a folded folder should reveal it — including a folder
+                    // of the shared library, which is folded under its own key.
                     self.collapsed_folders.remove(&name);
+                    if self.is_remote(&self.notes[note_idx].id) {
+                        if let Some(server) = self.collab.server_name().map(str::to_string) {
+                            self.collapsed_folders
+                                .remove(&format!("server:{server}/{name}"));
+                        }
+                    }
                     self.status_message = Some(format!("Filed under {name}"));
                 }
                 FolderChoice::ToServer => self.move_note_to_server(note_idx),
@@ -5317,6 +5367,19 @@ fn folder_header(
     collapsed: bool,
     p: &Palette,
 ) -> egui::Response {
+    folder_header_with(ui, icon::FOLDER, name, count, collapsed, p)
+}
+
+/// The same row with a glyph of the caller's choosing: the shared library is headed by a cloud,
+/// and the folders inside it keep the folder glyph.
+fn folder_header_with(
+    ui: &mut Ui,
+    glyph: &str,
+    name: &str,
+    count: usize,
+    collapsed: bool,
+    p: &Palette,
+) -> egui::Response {
     let chevron = if collapsed {
         icon::CHEVRON_RIGHT
     } else {
@@ -5327,7 +5390,7 @@ fn folder_header(
         let resp = ui
             .add(
                 egui::Button::new(
-                    RichText::new(format!("{chevron} {} {name}", icon::FOLDER))
+                    RichText::new(format!("{chevron} {glyph} {name}"))
                         .size(11.5)
                         .color(p.fg_secondary),
                 )
@@ -5385,6 +5448,44 @@ struct CardSelection {
     tag: Option<String>,
 }
 
+/// Runs `add` shifted right by `indent`, so a nested group reads as inside its parent.
+fn indented<R>(ui: &mut Ui, indent: i8, add: impl FnOnce(&mut Ui) -> R) -> R {
+    if indent <= 0 {
+        return add(ui);
+    }
+    Frame::new()
+        .inner_margin(Margin {
+            left: indent,
+            right: 0,
+            top: 0,
+            bottom: 0,
+        })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add(ui)
+        })
+        .inner
+}
+
+/// Splits note indices by the folder each note is filed in: the unfiled ones, and one group per
+/// folder in alphabetical order. Both the sidebar's local folder groups and the shared library's
+/// follow the same shape.
+fn split_by_folder(notes: &[Note], indices: &[usize]) -> (Vec<usize>, Vec<(String, Vec<usize>)>) {
+    let mut unfiled: Vec<usize> = Vec::new();
+    let mut folders: Vec<(String, Vec<usize>)> = Vec::new();
+    for &idx in indices {
+        match &notes[idx].folder {
+            Some(folder) => match folders.iter_mut().find(|(name, _)| name == folder) {
+                Some((_, list)) => list.push(idx),
+                None => folders.push((folder.clone(), vec![idx])),
+            },
+            None => unfiled.push(idx),
+        }
+    }
+    folders.sort_by_key(|(name, _)| name.to_lowercase());
+    (unfiled, folders)
+}
+
 /// Renders the given note indices as cards, recording any click in `picked`.
 #[allow(clippy::too_many_arguments)]
 fn render_note_rows(
@@ -5396,19 +5497,23 @@ fn render_note_rows(
     query: &str,
     collab: Option<&Collab>,
     picked: &mut CardSelection,
+    indent: i8,
 ) {
-    for &idx in indices {
-        let note = &notes[idx];
-        let is_selected = selected_id == Some(note.id.as_str());
-        let watchers: &[PresenceUser] = collab.map(|c| c.watchers(&note.id)).unwrap_or_default();
-        if let Some(action) = render_note_card(ui, note, is_selected, p, query, watchers) {
-            match action {
-                CardAction::SelectNote(id) => picked.note_id = Some(id),
-                CardAction::FilterTag(t) => picked.tag = Some(t),
+    indented(ui, indent, |ui| {
+        for &idx in indices {
+            let note = &notes[idx];
+            let is_selected = selected_id == Some(note.id.as_str());
+            let watchers: &[PresenceUser] =
+                collab.map(|c| c.watchers(&note.id)).unwrap_or_default();
+            if let Some(action) = render_note_card(ui, note, is_selected, p, query, watchers) {
+                match action {
+                    CardAction::SelectNote(id) => picked.note_id = Some(id),
+                    CardAction::FilterTag(t) => picked.tag = Some(t),
+                }
             }
+            ui.add_space(3.0);
         }
-        ui.add_space(3.0);
-    }
+    });
 }
 
 fn render_note_card(
@@ -6044,6 +6149,103 @@ mod tests {
         assert!(
             !egui::ComboBox::is_open(&h.ctx, widget_id),
             "picking a folder should close the folder menu"
+        );
+    }
+
+    /// The shared library's notes are split into folders the same way local ones are: the
+    /// unfiled ones stay in order and each folder becomes an alphabetical group.
+    #[test]
+    fn test_shared_library_notes_are_grouped_by_their_folder() {
+        let now = Utc::now();
+        let note = |id: &str, folder: Option<&str>| Note {
+            id: id.to_string(),
+            title: id.to_string(),
+            body: String::new(),
+            pinned: false,
+            trashed: false,
+            explicit_tags: Vec::new(),
+            icon: None,
+            folder: folder.map(str::to_string),
+            created_at: now,
+            updated_at: now,
+            file_path: PathBuf::new(),
+        };
+        let notes = vec![
+            note("loose", None),
+            note("b", Some("Second")),
+            note("a", Some("Alpha")),
+            note("b2", Some("Second")),
+            note("loose2", None),
+        ];
+
+        let (unfiled, folders) = split_by_folder(&notes, &[0, 1, 2, 3, 4]);
+        assert_eq!(unfiled, vec![0, 4]);
+        assert_eq!(folders.len(), 2);
+        assert_eq!(folders[0].0, "Alpha");
+        assert_eq!(folders[0].1, vec![2]);
+        assert_eq!(folders[1].0, "Second");
+        assert_eq!(folders[1].1, vec![1, 3]);
+    }
+
+    /// A folder's notes, and everything inside the shared library, sit in from the left edge so
+    /// the group they belong to reads as their parent.
+    #[test]
+    fn test_folder_contents_are_stepped_in() {
+        let ctx = egui::Context::default();
+        install_tabler_icons(&ctx);
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(240.0, 200.0))),
+            ..Default::default()
+        };
+        let mut rects: Vec<Rect> = Vec::new();
+        let mut edges: Vec<f32> = Vec::new();
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default()
+                .frame(Frame::new().inner_margin(Margin::ZERO))
+                .show(ctx, |ui| {
+                    rects.push(indented(ui, 0, |ui| ui.button("flush").rect));
+                    rects.push(indented(ui, SIDEBAR_INDENT_STEP, |ui| {
+                        ui.button("nested").rect
+                    }));
+                    rects.push(indented(ui, SIDEBAR_INDENT_STEP * 2, |ui| {
+                        ui.button("deep").rect
+                    }));
+                    // A full-width row inside the indent still ends at the panel's edge, so
+                    // stepping a note in narrows it instead of pushing it off the sidebar.
+                    edges.push(
+                        indented(ui, SIDEBAR_INDENT_STEP, |ui| {
+                            ui.allocate_response(
+                                egui::vec2(ui.available_width(), 8.0),
+                                Sense::hover(),
+                            )
+                            .rect
+                        })
+                        .right(),
+                    );
+                });
+        });
+
+        assert!(
+            (edges[0] - 240.0).abs() < 0.5,
+            "an indented row should still reach the panel edge: {}",
+            edges[0]
+        );
+
+        let step = f32::from(SIDEBAR_INDENT_STEP);
+        assert!(
+            rects[0].left().abs() < 0.5,
+            "the top level starts at the edge"
+        );
+        assert!(
+            (rects[1].left() - step).abs() < 0.5,
+            "a nested row should start {step} points in, not at {}",
+            rects[1].left()
+        );
+        assert!(
+            (rects[2].left() - step * 2.0).abs() < 0.5,
+            "a twice-nested row should start {} points in, not at {}",
+            step * 2.0,
+            rects[2].left()
         );
     }
 

@@ -14,7 +14,7 @@ A calm, minimalistic cross-platform desktop notes application written in **Rust*
 - **Note Icons & Text Color**: Pick a Tabler icon for each note from the header (the sidebar card then shows that glyph), or insert one at the cursor from the formatting bar. Color selected text with the **A Text Color** button, which saves it as `{color:#RRGGBB}…{/color}`.
 - **Bundled Tabler Icons**: Crisp outline glyphs from the Tabler Icons font embedded directly into the binary (`assets/tabler-icons.ttf`) across navigation, search, tags, checklists, formatting actions, and the command palette.
 - **Stackable Inline Formatting**: Markers nest, so `**==bold inside a glow==**`, `==**glow then bold**==`, `***==triple stack==***` and `{color:#4ECDFF}**colored bold**{/color}` each render as one run carrying several styles at once. Headings are drawn in the bold face and can carry highlights and text colors too.
-- **Collapsible Folders**: File any note into a folder from the header's folder menu (or type a new folder name there). Folders group the sidebar, show their note count, and fold shut with a click so the list takes less room. Fold state is remembered between runs. New notes join the folder of the note you had open.
+- **Collapsible Folders**: File any note into a folder from the header's folder menu (or type a new folder name there). Folders group the sidebar, show their note count, and fold shut with a click so the list takes less room. A folder's notes sit stepped in from its header, so the list shows what belongs to what. Fold state is remembered between runs. New notes join the folder of the note you had open.
 - **Compact Sidebar with One Filter Menu**: The sidebar is a fixed, narrow panel — only the accent **New** button shares the logo row, while the daily note, command palette and settings actions sit in a footer row at the bottom. The notes folder path and keyboard shortcuts are listed in Settings. Every tag filter lives in a single **Filter** dropdown with counts, so a growing tag list never pushes the note list down.
 - **Updates Itself from GitHub Releases**: On launch EloraNotes asks GitHub for the latest release. If one is newer it offers to download it, starts the downloaded build once to confirm it runs on this machine, then installs it the way this copy was installed and restarts. **Settings → Updates** has the same thing on demand: check, then **Update and restart**. "Later" dismisses the launch prompt for that run, and a failed launch-time check (for example while offline) stays silent.
 - **Plain Markdown on Disk**: Every note is stored as a portable `.md` file with lightweight YAML frontmatter (`title`, `folder`, `pinned`, `trashed`, `tags`, `icon`, `created_at`, `updated_at`).
@@ -195,7 +195,9 @@ match the code the installer printed. After that the key is remembered and a dif
 is refused, which is what makes a self-signed server safe to use over the internet.
 
 The server's notes appear in the sidebar in a group titled with the server's name, marked with a
-cloud glyph.
+cloud glyph. That group has folders of its own: file a shared note from its folder menu and the
+folder appears under the server, with its notes stepped in beneath it — further in than the
+server's own notes, so a folder on the server is never mistaken for one on this computer.
 
 While a shared note is open, **New** (and the daily-note, template and wiki-link actions) creates
 the note in that library instead of on your disk: it joins the same folder, keeps the tag you are
