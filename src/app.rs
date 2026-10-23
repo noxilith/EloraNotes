@@ -18,7 +18,7 @@ use chrono::{Local, Utc};
 use egui::text::{CCursor, CCursorRange};
 use egui::{
     Align, Align2, Color32, CornerRadius, FontFamily, FontId, Frame, Id, Key, Layout, Margin, Pos2,
-    Rect, RichText, ScrollArea, Sense, Stroke, TextEdit, TextStyle, Ui, Vec2,
+    Rect, RichText, ScrollArea, Sense, Stroke, TextEdit, TextStyle, Ui, UiBuilder, Vec2,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::f32::consts::TAU;
@@ -171,6 +171,8 @@ pub struct EloraApp {
     quiet_update: bool,
     /// Pictures embedded in the preview, decoded once and kept as textures.
     note_images: NoteImages,
+    /// The name other people see for this client, when the account name is not wanted.
+    display_name: String,
 }
 
 /// Messages from the update worker threads to the UI.
@@ -298,7 +300,8 @@ impl EloraApp {
         // A configured shared library reconnects on its own at launch.
         if app.server.is_configured() {
             let profile = app.server.clone();
-            app.collab.connect(profile, crate::net::os_username());
+            let name = app.server_display_name();
+            app.collab.connect(profile, name);
         }
         app
     }
@@ -347,6 +350,7 @@ impl EloraApp {
             collab: Collab::new(),
             server: settings.server.clone(),
             server_form: settings.server.clone(),
+            display_name: settings.display_name.clone(),
             remote_ids: BTreeSet::new(),
             remote_bodies: BTreeMap::new(),
             collab_open: None,
@@ -390,6 +394,7 @@ impl EloraApp {
             colors: self.colors,
             collapsed_folders: self.collapsed_folders.iter().cloned().collect(),
             server: self.server.clone(),
+            display_name: self.display_name.clone(),
         };
         self.storage.save_settings(&settings);
     }
@@ -957,6 +962,31 @@ impl EloraApp {
                     .desired_width(140.0),
             );
         });
+        // The name is what the others see, so it is changed here rather than by editing the
+        // account this computer is logged into.
+        let mut name_changed = false;
+        ui.horizontal(|ui| {
+            ui.label("Your name");
+            let account = crate::net::os_username();
+            let typed = ui
+                .add(
+                    TextEdit::singleline(&mut self.display_name)
+                        .hint_text(&account)
+                        .desired_width(180.0),
+                )
+                .on_hover_text(format!(
+                    "The name others see next to your caret. Leave it empty to use {account}."
+                ));
+            name_changed = typed.changed();
+        });
+        if name_changed {
+            self.persist_settings();
+            if self.collab.is_connected() {
+                let name = self.server_display_name();
+                self.collab.set_name(&name);
+            }
+        }
+
         ui.horizontal(|ui| {
             if connected {
                 if ui
@@ -1167,6 +1197,17 @@ impl EloraApp {
         Ok(())
     }
 
+    /// The name this client goes by: what was typed in Settings, or the account name when that
+    /// is left empty.
+    fn server_display_name(&self) -> String {
+        let typed = self.display_name.trim();
+        if typed.is_empty() {
+            crate::net::os_username()
+        } else {
+            typed.to_string()
+        }
+    }
+
     /// Connects to the server in Settings and remembers the details.
     fn connect_server(&mut self) {
         self.server = self.server_form.clone();
@@ -1176,8 +1217,8 @@ impl EloraApp {
             return;
         }
         self.remote_bodies.clear();
-        self.collab
-            .connect(self.server.clone(), crate::net::os_username());
+        let name = self.server_display_name();
+        self.collab.connect(self.server.clone(), name);
         self.status_message = Some(format!("Connecting to {}…", self.server.address()));
     }
 
@@ -1424,7 +1465,10 @@ impl EloraApp {
                     self.remote_bodies.insert(id.clone(), text.clone());
                     if let Some(note) = self.notes.iter_mut().find(|n| n.id == id) {
                         note.body = text.clone();
-                        note.updated_at = Utc::now();
+                        // The date is left alone on purpose: opening a note hands over the
+                        // room's text, and that is not somebody editing it. The server stamps
+                        // the note when its text really changes, and that date is what sorts
+                        // the list.
                     }
                     if self.selected_id.as_deref() == Some(id.as_str()) {
                         // Somebody else's typing is not a local edit: no undo step, no save.
@@ -3524,7 +3568,12 @@ impl EloraApp {
         choice
     }
 
-    fn render_editor(&mut self, ui: &mut Ui, p: &Palette) {
+    /// `content_width` is the note column's text width and `right_extra` the empty strip between
+    /// it and the window's right edge.
+    fn render_editor(&mut self, ui: &mut Ui, p: &Palette, content_width: f32, right_extra: f32) {
+        // Everything the editor draws keeps the column's width; only the scroll areas below are
+        // allowed to reach the window edge.
+        ui.set_max_width(content_width);
         let Some(selected_id) = self.selected_id.clone() else {
             ui.centered_and_justified(|ui| {
                 ui.vertical_centered(|ui| {
@@ -4255,10 +4304,12 @@ impl EloraApp {
 
         match view_mode {
             EditorViewMode::Edit => {
-                ScrollArea::vertical()
-                    .id_salt("elora_editor_scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
+                note_scroll(
+                    ui,
+                    "elora_editor_scroll",
+                    content_width,
+                    right_extra,
+                    |ui| {
                         let min_h = (ui.available_height() - 70.0).max(260.0);
                         self.render_multiline_markdown_editor(
                             ui,
@@ -4269,13 +4320,16 @@ impl EloraApp {
                             &mut queued_format_op,
                         );
                         render_backlinks_footer(ui, &backlinks, p, &mut clicked_backlink_id);
-                    });
+                    },
+                );
             }
             EditorViewMode::Preview => {
-                ScrollArea::vertical()
-                    .id_salt("elora_preview_scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
+                note_scroll(
+                    ui,
+                    "elora_preview_scroll",
+                    content_width,
+                    right_extra,
+                    |ui| {
                         let body_snapshot = self.notes[note_idx].body.clone();
                         render_markdown_preview(
                             ui,
@@ -4287,7 +4341,8 @@ impl EloraApp {
                             &mut self.note_images,
                         );
                         render_backlinks_footer(ui, &backlinks, p, &mut clicked_backlink_id);
-                    });
+                    },
+                );
             }
             EditorViewMode::Split => {
                 // Both panes are the same width and sit inside the same column as Edit and
@@ -4306,51 +4361,46 @@ impl EloraApp {
                         Layout::top_down(Align::Min),
                         |ui| {
                             // A pane owns its half of the column: nothing may be painted into
-                            // the gutter or the window margin, even a chip too wide to fit.
-                            ui.set_clip_rect(ui.max_rect());
-                            ScrollArea::vertical()
-                                .id_salt("elora_split_left")
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    let min_h = ui.available_height().max(300.0);
-                                    self.render_multiline_markdown_editor(
-                                        ui,
-                                        note_idx,
-                                        min_h,
-                                        p,
-                                        &mut needs_save,
-                                        &mut queued_format_op,
-                                    );
-                                });
+                            // the gutter or the window margin, even a chip too wide to fit.                            ui.set_clip_rect(ui.max_rect());
+                            note_scroll(ui, "elora_split_left", pane_width, 0.0, |ui| {
+                                let min_h = ui.available_height().max(300.0);
+                                self.render_multiline_markdown_editor(
+                                    ui,
+                                    note_idx,
+                                    min_h,
+                                    p,
+                                    &mut needs_save,
+                                    &mut queued_format_op,
+                                );
+                            });
                         },
                     );
                     ui.add_space(NOTE_SIDE_MARGIN);
+                    // The preview pane reaches the window edge, so its bar does too.
                     ui.allocate_ui_with_layout(
-                        Vec2::new(pane_width, pane_height),
+                        Vec2::new(pane_width + right_extra, pane_height),
                         Layout::top_down(Align::Min),
                         |ui| {
                             ui.set_clip_rect(ui.max_rect());
-                            ScrollArea::vertical()
-                                .id_salt("elora_split_right")
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    let body_snapshot = self.notes[note_idx].body.clone();
-                                    render_markdown_preview(
-                                        ui,
-                                        &body_snapshot,
-                                        p,
-                                        &mut clicked_wiki_link,
-                                        &mut toggled_task_idx,
-                                        note_dir.as_deref(),
-                                        &mut self.note_images,
-                                    );
-                                    render_backlinks_footer(
-                                        ui,
-                                        &backlinks,
-                                        p,
-                                        &mut clicked_backlink_id,
-                                    );
-                                });
+                            note_scroll(ui, "elora_split_right", pane_width, right_extra, |ui| {
+                                let body_snapshot = self.notes[note_idx].body.clone();
+                                render_markdown_preview(
+                                    ui,
+                                    &body_snapshot,
+                                    p,
+                                    &mut clicked_wiki_link,
+                                    &mut toggled_task_idx,
+                                    note_dir.as_deref(),
+                                    &mut self.note_images,
+                                );
+
+                                render_backlinks_footer(
+                                    ui,
+                                    &backlinks,
+                                    p,
+                                    &mut clicked_backlink_id,
+                                );
+                            });
                         },
                     );
                 });
@@ -4492,14 +4542,15 @@ impl eframe::App for EloraApp {
                 // it spanned the whole window while the text sat in the middle. A proportional
                 // inset keeps a little air at the edges instead.
                 let (pad, width) = note_column(ui.available_width());
-                let height = ui.available_height();
-                ui.horizontal_top(|ui| {
-                    ui.add_space(pad);
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(width, height),
-                        Layout::top_down(Align::Min),
-                        |ui| self.render_editor(ui, &p),
-                    );
+                // The column runs to the window's right edge, so a note's scroll bar can sit
+                // against it instead of floating inside the inset. What the editor draws is held
+                // to `width`, the text column, within.
+                let column_rect = Rect::from_min_max(
+                    Pos2::new(ui.max_rect().left() + pad, ui.max_rect().top()),
+                    ui.max_rect().right_bottom(),
+                );
+                ui.allocate_new_ui(UiBuilder::new().max_rect(column_rect), |ui| {
+                    self.render_editor(ui, &p, width, pad)
                 });
             });
 
@@ -4561,6 +4612,30 @@ fn caret_chip(top: Pos2, line_height: f32, size: Vec2, clip: Rect) -> Rect {
         chip = chip.translate(Vec2::new(clip.right() - chip.right(), 0.0));
     }
     chip
+}
+
+/// A note's vertical scroll area. The area itself is allowed to reach `bar_extra` points further
+/// right than the text it holds, so the scroll bar sits against the window's edge while the text
+/// keeps the column's inset.
+fn note_scroll(
+    ui: &mut Ui,
+    id: &str,
+    content_width: f32,
+    bar_extra: f32,
+    add: impl FnOnce(&mut Ui),
+) -> Rect {
+    ui.scope(|ui| {
+        ui.set_max_width(ui.available_width() + bar_extra);
+        ScrollArea::vertical()
+            .id_salt(id)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_max_width(content_width);
+                add(ui);
+            })
+    })
+    .inner
+    .inner_rect
 }
 
 /// The inset on each side of the note column and the width of the column itself. A wide window is
@@ -4858,17 +4933,17 @@ fn render_note_card(
                         .size(13.5)
                         .color(p.fg_primary),
                 );
-                // A dot per person with this note open, in the colour of their caret.
+                // A brush per person with this note open, in the colour of their caret.
                 if !watchers.is_empty() {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         for user in watchers.iter().rev().take(4) {
                             let [r, g, b] = user.color;
                             ui.label(
-                                RichText::new("●")
-                                    .size(9.0)
+                                RichText::new(icon::BRUSH)
+                                    .size(11.0)
                                     .color(Color32::from_rgb(r, g, b)),
                             )
-                            .on_hover_text(format!("{} is in this note", user.name));
+                            .on_hover_text(format!("{} is editing this note", user.name));
                         }
                     });
                 }
@@ -5490,6 +5565,89 @@ mod tests {
         assert_eq!(pad, NOTE_SIDE_MARGIN);
         assert_eq!(width, 320.0 - NOTE_SIDE_MARGIN * 2.0);
         assert!(note_column(100.0).1 >= 200.0);
+    }
+
+    /// The note's scroll bar belongs against the window's edge, not out in the middle of the
+    /// inset the note leaves beside itself — while the text it holds keeps the column's width.
+    #[test]
+    fn test_a_notes_scroll_bar_reaches_the_window_edge() {
+        let ctx = egui::Context::default();
+        install_tabler_icons(&ctx);
+        let window = egui::vec2(900.0, 600.0);
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, window)),
+            ..Default::default()
+        };
+        let mut area: Option<Rect> = None;
+        let mut column = 0.0f32;
+        let mut inset = 0.0f32;
+        let _ = ctx.run(raw, |ctx| {
+            // The same frame the app uses: full width, no side margin of its own.
+            egui::CentralPanel::default()
+                .frame(Frame::new().inner_margin(Margin {
+                    left: 0,
+                    right: 0,
+                    top: 18,
+                    bottom: 18,
+                }))
+                .show(ctx, |ui| {
+                    let (pad, width) = note_column(ui.available_width());
+                    column = width;
+                    inset = pad;
+                    let column_rect = Rect::from_min_max(
+                        Pos2::new(ui.max_rect().left() + pad, ui.max_rect().top()),
+                        ui.max_rect().right_bottom(),
+                    );
+                    ui.allocate_new_ui(UiBuilder::new().max_rect(column_rect), |ui| {
+                        ui.set_max_width(width);
+                        area = Some(note_scroll(ui, "edge_test", width, pad, |ui| {
+                            for line in 0..200 {
+                                ui.label(format!("line {line}"));
+                            }
+                        }));
+                    });
+                });
+        });
+
+        let area = area.expect("the scroll area was drawn");
+        assert!(
+            (area.right() - window.x).abs() < 0.5,
+            "the scroll bar should sit at the window edge: area ends at {}, window at {}",
+            area.right(),
+            window.x
+        );
+        assert!(
+            (area.left() - inset).abs() < 0.5 && (area.width() - (column + inset)).abs() < 0.5,
+            "the area is the column plus the empty strip beside it: {}..{} for a column of {column}",
+            area.left(),
+            area.right()
+        );
+    }
+
+    #[test]
+    fn test_the_shared_name_falls_back_to_the_account() {
+        let dir = std::env::temp_dir().join(format!(
+            "elora-name-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = NoteStorage::new(dir.join("notes")).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = EloraApp::with_context(&ctx, storage);
+
+        // Nobody has typed a name yet, so the computer's account name is used.
+        assert_eq!(app.server_display_name(), crate::net::os_username());
+        app.display_name = "  Nox  ".to_string();
+        assert_eq!(app.server_display_name(), "Nox");
+        // And the choice survives a restart.
+        app.persist_settings();
+        let reopened = EloraApp::with_context(&ctx, NoteStorage::new(dir.join("notes")).unwrap());
+        assert_eq!(reopened.server_display_name(), "Nox");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

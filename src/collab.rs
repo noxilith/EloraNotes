@@ -184,6 +184,8 @@ enum Command {
         id: String,
         byte: usize,
     },
+    /// The name other people see for this connection.
+    SetName(String),
     Create {
         title: String,
         folder: Option<String>,
@@ -457,6 +459,14 @@ impl Collab {
             id: id.to_string(),
             text: body.to_string(),
         });
+    }
+
+    /// Changes the name shown next to this client's caret, without reconnecting.
+    pub fn set_name(&mut self, name: &str) {
+        if !self.is_connected() {
+            return;
+        }
+        self.send(Command::SetName(name.to_string()));
     }
 
     /// Sends a caret position for `note_id`, in bytes.
@@ -737,6 +747,13 @@ impl Session {
                     return Ok(());
                 }
                 self.apply_local(&text)?;
+            }
+            Command::SetName(name) => {
+                self.name = name;
+                // Sent as an ordinary awareness change, so the people in this note see the new
+                // name without the connection being made again.
+                self.publish_awareness(events, false);
+                return Ok(());
             }
             Command::Cursor { id, byte } => {
                 if self.open.as_deref() != Some(id.as_str()) {

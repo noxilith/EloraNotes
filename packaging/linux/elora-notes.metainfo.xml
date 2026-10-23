@@ -25,6 +25,20 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.9.13" date="2026-10-23">
+      <description>
+        <p>
+          Clicking a shared note no longer pushes it to the top of the list: opening a note handed
+          its text around and the server counted that as an edit, so the date the list sorts by
+          moved every time. Only a change to the text counts now. The note's scroll bar sits
+          against the window's edge instead of floating inside the margin beside the text, the
+          marks that show who else has a note open are brushes, and Settings → Shared library has
+          a "Your name" field: leave it empty to use the account name on this computer, or type a
+          name to have others see that, which reaches them without reconnecting. The server needs
+          this one too, for the note list part.
+        </p>
+      </description>
+    </release>
     <release version="0.9.12" date="2026-10-23">
       <description>
         <p>

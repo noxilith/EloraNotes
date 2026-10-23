@@ -183,6 +183,17 @@ fn test_two_clients_edit_the_same_note() {
             .any(|peer| peer.name == "alice" && peer.cursor == Some(3))
     });
 
+    // A name typed in Settings reaches the other side without the connection being made again.
+    alice.set_name("Alice B.");
+    settle(&mut bob, &mut bob_body, "bob sees the new name", |c, _| {
+        c.peers().iter().any(|peer| peer.name == "Alice B.")
+    });
+    alice.set_name("alice");
+    settle(&mut bob, &mut bob_body, "bob sees the old name", |c, _| {
+        c.peers().iter().all(|peer| peer.name != "Alice B.")
+            && c.peers().iter().any(|peer| peer.name == "alice")
+    });
+
     // Alice types; Bob's text follows.
     alice_body.push_str(" from alice");
     alice.send_body(&note_id, &alice_body);

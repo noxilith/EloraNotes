@@ -589,11 +589,21 @@ impl Server {
             let Some(room) = library.rooms.get_mut(note_id) else {
                 return;
             };
-            let mut txn = room.doc.transact_mut();
             let Ok(decoded) = yrs::Update::decode_v1(&update) else {
                 return;
             };
-            if txn.apply_update(decoded).is_err() {
+            // A client answering our own state request sends its document even when it is
+            // empty, and opening a note is not an edit: without this, merely clicking a shared
+            // note moved it to the top of the list for everyone. Only an update that adds
+            // something counts.
+            let before = room.doc.transact().state_vector().encode_v1();
+            {
+                let mut txn = room.doc.transact_mut();
+                if txn.apply_update(decoded).is_err() {
+                    return;
+                }
+            }
+            if room.doc.transact().state_vector().encode_v1() == before {
                 return;
             }
             room.subscribers.clone()
@@ -1157,6 +1167,72 @@ mod tests {
         assert!(constant_time_eq(b"secret", b"secret"));
         assert!(!constant_time_eq(b"secret", b"secreT"));
         assert!(!constant_time_eq(b"secret", b"secret "));
+    }
+
+    /// Opening a note hands its text around, and a client with nothing to add still answers the
+    /// server's state request. That answer is not an edit: it must not restamp the note, which
+    /// is what sorted the sidebar by it and pushed a note to the top on a mere click.
+    #[test]
+    fn test_an_update_that_adds_nothing_is_not_an_edit() {
+        let _guard = crate::tls::server_dir_lock();
+        let dir = temp_dir("noop-update");
+        let notes = dir.join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        let id = "quiet-0001".to_string();
+        std::fs::write(
+            notes.join(format!("{id}.md")),
+            "---\ntitle: \"Quiet\"\npinned: false\ntrashed: false\ntags: []\n\
+             created_at: 2020-01-01T00:00:00+00:00\nupdated_at: 2020-01-01T00:00:00+00:00\n---\n\
+             unchanged",
+        )
+        .unwrap();
+        // SAFETY: the guard keeps the other tests that read this variable out of the way.
+        unsafe { std::env::set_var("ELORA_SERVER_DIR", dir.join("server")) };
+        let config = ServerConfig {
+            name: "Quiet".into(),
+            port: 0,
+            password: "letmein".into(),
+            notes_dir: notes,
+            bind: "127.0.0.1".into(),
+        };
+        let server = Server::new(config).expect("server");
+        {
+            let mut library = server.library.lock().unwrap();
+            library.open(&id).expect("open");
+        }
+
+        // A note waiting to be written out is the server's own record of "this changed", and
+        // it is what restamps the note and tells everyone to reorder their list.
+        let pending_write = || server.library.lock().unwrap().dirty.contains_key(&id);
+
+        // Exactly what a client with an empty document sends back after being asked for its
+        // state.
+        let empty = {
+            let library = server.library.lock().unwrap();
+            let room = &library.rooms[&id];
+            let txn = room.doc.transact();
+            txn.encode_state_as_update_v1(&StateVector::default())
+        };
+        server.apply_update(&id, 7, empty);
+        assert!(
+            !pending_write(),
+            "opening a note must not count as a change to it"
+        );
+
+        // A real edit still counts, so the list keeps following the text.
+        let edited = {
+            let doc = Doc::new();
+            let text = doc.get_or_insert_text("body");
+            {
+                let mut txn = doc.transact_mut();
+                text.insert(&mut txn, 0, "and now a word");
+            }
+            let txn = doc.transact();
+            txn.encode_state_as_update_v1(&StateVector::default())
+        };
+        server.apply_update(&id, 9, edited);
+        assert!(pending_write(), "an edit is a change to the note");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A client that speaks an older protocol is told why, instead of being dropped like a

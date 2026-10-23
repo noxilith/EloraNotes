@@ -89,6 +89,10 @@ pub struct AppSettings {
     /// The shared library this client connects to, if any.
     #[serde(default)]
     pub server: crate::collab::ServerProfile,
+    /// The name other people see next to this client's caret. Empty means "use the account
+    /// name on this computer".
+    #[serde(default)]
+    pub display_name: String,
 }
 
 fn default_highlight_rgb() -> [u8; 3] {
@@ -120,6 +124,7 @@ impl Default for AppSettings {
             colors: Default::default(),
             collapsed_folders: Vec::new(),
             server: Default::default(),
+            display_name: String::new(),
         }
     }
 }
