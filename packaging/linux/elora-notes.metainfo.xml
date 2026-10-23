@@ -25,6 +25,14 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.9.17" date="2026-10-23">
+      <description>
+        <p>
+          The note list’s scroll bar now has a strip of its own along the right of the list, so it
+          no longer floats over the note cards.
+        </p>
+      </description>
+    </release>
     <release version="0.9.16" date="2026-10-23">
       <description>
         <p>

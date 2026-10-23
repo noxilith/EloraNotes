@@ -43,6 +43,10 @@ const SIDEBAR_MARGIN_Y: i8 = 10;
 /// library steps its folders in, and their notes in once more.
 const SIDEBAR_INDENT_STEP: i8 = 12;
 
+/// Strip kept free on the right of the note list for its scroll bar, so the bar sits beside the
+/// cards instead of painting over them. The bar is 9 points wide at its widest.
+const SIDEBAR_SCROLL_STRIP: f32 = 10.0;
+
 /// Height kept free at the bottom of the sidebar for the footer action row.
 const SIDEBAR_FOOTER_HEIGHT: f32 = 34.0;
 /// Space kept between the footer icons and the panel's right edge.
@@ -3311,7 +3315,7 @@ impl EloraApp {
         // inside the panel's margin is the very edge the divider is drawn on. Inset the bar by
         // the panel margin so it reads as a scrollbar in the note column, not a line on the seam.
         ui.scope(|ui| {
-            ui.spacing_mut().scroll.bar_outer_margin = SIDEBAR_MARGIN_X as f32;
+            note_list_scroll(&mut ui.spacing_mut().scroll);
             ScrollArea::vertical()
                 .id_salt("notes_sidebar_scroll")
                 .max_height(max_height)
@@ -5350,6 +5354,13 @@ fn short_tag(tag: &str, max_chars: usize) -> String {
     elided
 }
 
+/// Gives the note list's scroll bar a strip of its own at the right edge. A floating bar is
+/// painted over the content by default, which here means over the note cards themselves.
+fn note_list_scroll(style: &mut egui::style::ScrollStyle) {
+    style.floating_allocated_width = SIDEBAR_SCROLL_STRIP;
+    style.bar_outer_margin = 0.0;
+}
+
 /// A small all-caps heading above a group of note cards.
 fn section_heading(ui: &mut Ui, glyph: &str, label: &str, color: Color32) {
     ui.horizontal(|ui| {
@@ -6246,6 +6257,61 @@ mod tests {
             "a twice-nested row should start {} points in, not at {}",
             step * 2.0,
             rects[2].left()
+        );
+    }
+
+    /// The note list's scroll bar sits in a strip of its own on the right, so it never covers
+    /// the cards. It used to float over them, right where their text is.
+    #[test]
+    fn test_the_note_lists_scroll_bar_sits_beside_the_cards() {
+        let ctx = egui::Context::default();
+        let mut outer = Rect::NOTHING;
+        let mut inner = Rect::NOTHING;
+        let mut card_right = 0.0f32;
+
+        // Several frames: the strip the bar reserves widens as the bar fades in.
+        for frame in 0..10 {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(210.0, 400.0))),
+                time: Some(frame as f64 * 0.1),
+                predicted_dt: 0.1,
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default()
+                    .frame(Frame::new().inner_margin(Margin::ZERO))
+                    .show(ctx, |ui| {
+                        ui.scope(|ui| {
+                            note_list_scroll(&mut ui.spacing_mut().scroll);
+                            outer = ui.available_rect_before_wrap();
+                            let out = ScrollArea::vertical()
+                                .id_salt("note_list_strip")
+                                .max_height(120.0)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    for _ in 0..40 {
+                                        ui.allocate_response(
+                                            egui::vec2(ui.available_width(), 12.0),
+                                            Sense::hover(),
+                                        );
+                                    }
+                                    card_right = ui.min_rect().right();
+                                });
+                            inner = out.inner_rect;
+                        });
+                    });
+            });
+        }
+
+        assert!(
+            (card_right - inner.right()).abs() < 0.5,
+            "the cards should fill the scrolling area: {card_right} against {}",
+            inner.right()
+        );
+        let strip = outer.right() - inner.right();
+        assert!(
+            strip >= 9.0,
+            "the bar needs a strip of its own at the right, but only {strip} points are kept free"
         );
     }
 
