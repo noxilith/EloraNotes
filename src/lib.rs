@@ -15,6 +15,7 @@ pub mod images;
 #[cfg(feature = "gui")]
 pub mod markdown;
 pub mod net;
+pub mod people;
 pub mod server;
 pub mod storage;
 #[cfg(feature = "gui")]

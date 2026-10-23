@@ -8,6 +8,7 @@ use crate::markdown::{
     set_image_width, split_images, wrap_selection, LinePiece, HIGHLIGHT_PRESETS,
 };
 use crate::net::{NoteMeta, PresenceUser};
+use crate::people::MIN_IDENTIFIER;
 use crate::storage::{
     extract_wiki_links, fuzzy_subsequence, normalize_folder, normalize_tag, sort_notes,
     AppSettings, Note, NoteStorage, NoteTemplate,
@@ -31,7 +32,7 @@ use std::time::{Duration, Instant};
 /// and the editor stop shifting around while the window is resized. It only has to fit
 /// the logo, title and New button now that the other actions live in the footer.
 const SIDEBAR_WIDTH: f32 = 210.0;
-/// Where the footer's coffee cup sends people.
+/// Where the footer's Ko-fi button sends people.
 const KOFI_URL: &str = "https://ko-fi.com/noxilith";
 /// How long the editor waits for a shared note's own text before trusting the copy it has. A
 /// note that opens normally answers in a few milliseconds; this only covers one that never does.
@@ -198,12 +199,21 @@ pub struct EloraApp {
     /// Pictures this computer sent to the library and has not heard about yet, so a refusal can
     /// be reported to the person who added the picture.
     shared_uploads: BTreeSet<String>,
-    /// The identifier this client goes by: what others see next to its caret, and the word a
-    /// note is opened to. Generated on first launch, and typed by the person when they want
-    /// their own.
+    /// The name this client goes by: what others see next to its caret, and the word they add
+    /// to a note to share it. It is public on purpose — the server sees it, and so does everyone
+    /// else. Generated on first launch, and typed by the person when they want their own.
     display_name: String,
+    /// The secret behind that name. Only the server ever reads it, to recognise this person
+    /// again; no other client is told it, so a name cannot be taken by somebody who simply
+    /// knows what it is. The same identifier on another computer is the same person.
+    identifier: String,
+    /// The identifier the open connection was made with, so a pasted one can be noticed and
+    /// acted on rather than waiting for the next reconnect.
+    sent_identifier: String,
     /// A system file dialog running on its own thread, with the note its picture belongs to.
     picture_pick: Option<PicturePick>,
+    /// Ko-fi's mark, painted in the theme's colours beside Settings.
+    kofi: Option<KofiMark>,
 }
 
 /// A "choose a picture" dialog running on a thread of its own.
@@ -344,7 +354,9 @@ impl EloraApp {
         if app.server.is_configured() {
             let profile = app.server.clone();
             let name = app.server_display_name();
-            app.collab.connect(profile, name);
+            let identifier = app.identifier.clone();
+            app.sent_identifier = identifier.clone();
+            app.collab.connect(profile, name, identifier);
         }
         app
     }
@@ -395,6 +407,8 @@ impl EloraApp {
             server: settings.server.clone(),
             server_form: settings.server.clone(),
             display_name: settings.display_name.clone(),
+            identifier: settings.identifier.clone(),
+            sent_identifier: String::new(),
             remote_ids: BTreeSet::new(),
             remote_bodies: BTreeMap::new(),
             collab_open: None,
@@ -430,12 +444,18 @@ impl EloraApp {
             requested_pictures: BTreeSet::new(),
             shared_uploads: BTreeSet::new(),
             picture_pick: None,
+            kofi: KofiMark::load(ctx),
         };
-        // Every client needs a word it is known by: it is the name others see, and the key a
-        // private note is opened to. A fresh install gets one so nothing has to be filled in
-        // before the shared library works, and Settings lets it be replaced with any word.
+        // Every client needs a name others can see and a secret the server can recognise it by.
+        // A fresh install gets both so nothing has to be filled in before the shared library
+        // works; Settings lets the name be replaced with any word and the secret be copied to
+        // another computer.
         if app.display_name.trim().is_empty() {
-            app.display_name = random_identifier();
+            app.display_name = default_display_name();
+            app.persist_settings();
+        }
+        if app.identifier.trim().is_empty() {
+            app.identifier = fresh_identifier();
             app.persist_settings();
         }
         app
@@ -454,6 +474,7 @@ impl EloraApp {
             collapsed_folders: self.collapsed_folders.iter().cloned().collect(),
             server: self.server.clone(),
             display_name: self.display_name.clone(),
+            identifier: self.identifier.clone(),
         };
         self.storage.save_settings(&settings);
     }
@@ -1047,14 +1068,15 @@ impl EloraApp {
                     .desired_width(140.0),
             );
         });
-        // One word is both the name others see and the identifier a private note is opened to,
-        // so sharing a note means typing what that person goes by — and the same word on
-        // another computer is that person again.
+        // The name is public: the server and everyone on it see it. The identifier is the
+        // secret behind it, which only the server reads, so nobody can be somebody else just by
+        // typing their name. The same identifier on another computer is the same person.
+        let mut name_changed = false;
+        let mut name_committed = false;
         let mut identifier_changed = false;
         let mut identifier_committed = false;
-        let mut new_identifier = false;
         ui.horizontal(|ui| {
-            ui.label("Your identifier");
+            ui.label("Your name");
             let account = crate::net::os_username();
             let typed = ui
                 .add(
@@ -1063,31 +1085,65 @@ impl EloraApp {
                         .desired_width(170.0),
                 )
                 .on_hover_text(
-                    "The name others see next to your caret, and the word they add to a note to \
-                     share it with you. Use the same identifier on another computer to find your \
-                     shared notes there.",
+                    "The name others see next to your caret, and the one they add to a note to \
+                     share it with you. It has to be free on this server: the first person to use \
+                     a name keeps it.",
                 );
-            identifier_changed = typed.changed();
-            identifier_committed = typed.lost_focus();
+            name_changed = typed.changed();
+            name_committed = typed.lost_focus();
+        });
+        // The identifier is a key, not a word: it is made once by the app, copied to another
+        // computer to be the same person there, and never edited for fun. There is no "make a
+        // new one" button because the server keeps a name bound to the key that claimed it —
+        // a fresh key would be a stranger, locked out of the name and the notes behind it.
+        ui.horizontal(|ui| {
+            ui.label("Identifier");
+            let typed = ui
+                .add(
+                    TextEdit::singleline(&mut self.identifier)
+                        .password(true)
+                        .desired_width(170.0),
+                )
+                .on_hover_text(
+                    "The secret behind your name. Only the server reads it, to know it is really \
+                     you; nobody else ever sees it, so nobody can connect as you. It is how your \
+                     notes follow you to another computer: copy this value into the same box \
+                     there. Treat it like a password.",
+                );
+            let long_enough = self.identifier.trim().len() >= MIN_IDENTIFIER;
+            identifier_changed = typed.changed() && long_enough;
+            // A pasted key only takes effect when the box is left, and only if it is a different
+            // one from the connection already open: clicking Copy must not re-key.
+            identifier_committed =
+                typed.lost_focus() && long_enough && self.identifier != self.sent_identifier;
             if ui
-                .small_button("New")
-                .on_hover_text("Make a fresh random identifier")
+                .small_button("Copy")
+                .on_hover_text("Copy this identifier, to paste into EloraNotes on another computer")
                 .clicked()
             {
-                new_identifier = true;
+                ui.ctx().copy_text(self.identifier.clone());
+                self.status_message = Some(
+                    "Identifier copied; paste it into EloraNotes on your other computer"
+                        .to_string(),
+                );
             }
         });
-        if new_identifier {
-            self.display_name = random_identifier();
-            identifier_changed = true;
-            identifier_committed = true;
+        if self.identifier.trim().len() < MIN_IDENTIFIER {
+            ui.label(
+                RichText::new(
+                    "This identifier is too short to be a key: it needs at least 16 characters. \
+                     Paste the one from your other computer here.",
+                )
+                .size(10.5)
+                .color(p.danger),
+            );
         }
-        if identifier_changed {
+        if name_changed || identifier_changed {
             self.persist_settings();
         }
-        if identifier_committed && self.collab.is_connected() {
-            // Which notes the server shows depends on the identifier, so this is a new
-            // conversation with the server rather than a rename while it is open.
+        if (name_committed || identifier_committed) && self.collab.is_connected() {
+            // Which notes the server shows depends on who it thinks this client is, so this is a
+            // new conversation with the server rather than a rename while it is open.
             self.disconnect_server();
             self.connect_server();
         }
@@ -1127,9 +1183,9 @@ impl EloraApp {
         }
         ui.label(
             RichText::new(
-                "The server's notes appear in the sidebar under its name. Notes you make there are \
-                 filed under your identifier, and a note can be closed to everybody but the \
-                 people you name on it.",
+                "The server's notes appear in the sidebar under its name. A note can be closed to \
+                 everybody but the people you name on it; they add your name, and the server \
+                 knows it is you by the identifier only it can see.",
             )
             .size(10.5)
             .color(p.fg_muted),
@@ -1636,9 +1692,26 @@ impl EloraApp {
             self.status_message = Some("Enter the server address and password first".to_string());
             return;
         }
+        // A short key is not a secret, so it is refused here with a hint rather than at the
+        // server with a sentence about keys: this is the box it has to be fixed in.
+        if self.identifier.trim().len() < MIN_IDENTIFIER {
+            self.status_message = Some(format!(
+                "The identifier needs at least {MIN_IDENTIFIER} characters; paste the one from \
+                 your other computer into Settings → Shared library"
+            ));
+            return;
+        }
         self.remote_bodies.clear();
+        // A name is what the server binds this key to, so it is never left blank: an empty box
+        // would otherwise fall back to the account name, which somebody else may already have.
+        if self.display_name.trim().is_empty() {
+            self.display_name = default_display_name();
+            self.persist_settings();
+        }
         let name = self.server_display_name();
-        self.collab.connect(self.server.clone(), name);
+        let identifier = self.identifier.clone();
+        self.sent_identifier = identifier.clone();
+        self.collab.connect(self.server.clone(), name, identifier);
         self.status_message = Some(format!("Connecting to {}…", self.server.address()));
     }
 
@@ -3327,7 +3400,7 @@ impl EloraApp {
                     self.show_settings = true;
                 } // Ko-fi's cup, beside Settings: leaving a tip is the one thing the app can
                   // offer besides its own features, so it has a place in the footer.
-                if kofi_button(ui, p)
+                if kofi_button(ui, p, self.kofi.as_ref())
                     .on_hover_text(format!("Support EloraNotes on Ko-fi\n{KOFI_URL}"))
                     .clicked()
                 {
@@ -4142,7 +4215,7 @@ impl EloraApp {
                         let field = ui.add_enabled(
                             mine,
                             TextEdit::singleline(&mut self.share_input)
-                                .hint_text("Their identifier, e.g. SuperSaiyan")
+                                .hint_text("Their name, e.g. SuperSaiyan")
                                 .desired_width(200.0),
                         );
                         let entered = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
@@ -4180,14 +4253,15 @@ impl EloraApp {
 
                 ui.add_space(8.0);
                 ui.label(
-                    RichText::new(format!("Your identifier is “{me}”."))
+                    RichText::new(format!("You are “{me}”."))
                         .size(10.5)
                         .color(p.fg_secondary),
                 );
                 ui.label(
                     RichText::new(
-                        "Names decide which notes the server hands out. The server password is \
-                         still what decides who may connect.",
+                        "Add the name somebody uses as you see it next to their caret; the server \
+                         checks it is really them. The server password is still what decides who \
+                         may connect.",
                     )
                     .size(10.0)
                     .color(p.fg_muted),
@@ -5812,67 +5886,87 @@ struct CardSelection {
     tag: Option<String>,
 }
 
-/// The footer's Ko-fi button: the cup with a heart on it, in the colour of the icons beside it
-/// and in the accent colour under the pointer.
-fn kofi_button(ui: &mut Ui, p: &Palette) -> egui::Response {
+/// Ko-fi's own symbol, baked into two alpha masks by `scripts/make-kofi-mark.py` from
+/// `assets/kofi-symbol.svg` (their brand asset). The mark is drawn with a dark structure — the
+/// cup's outline and its handle loop — and an orange heart, so it needs two masks: each is one
+/// alpha byte per pixel, and the app paints it in whichever theme colour that part takes.
+const KOFI_MASK_WIDTH: usize = 96;
+const KOFI_MASK_HEIGHT: usize = 77;
+const KOFI_CUP_ALPHA: &[u8] = include_bytes!("../assets/icons/kofi-cup.alpha");
+const KOFI_HEART_ALPHA: &[u8] = include_bytes!("../assets/icons/kofi-heart.alpha");
+
+/// The two tinted textures the footer's Ko-fi button draws, loaded once at startup.
+struct KofiMark {
+    cup: egui::TextureHandle,
+    heart: egui::TextureHandle,
+}
+
+impl KofiMark {
+    fn load(ctx: &egui::Context) -> Option<Self> {
+        Some(Self {
+            cup: mask_texture(ctx, "kofi-cup", KOFI_CUP_ALPHA)?,
+            heart: mask_texture(ctx, "kofi-heart", KOFI_HEART_ALPHA)?,
+        })
+    }
+}
+
+/// Turns one alpha mask into a white texture, so the painter's tint decides its colour and the
+/// two halves of the mark can be different colours.
+fn mask_texture(ctx: &egui::Context, name: &str, alpha: &[u8]) -> Option<egui::TextureHandle> {
+    if alpha.len() != KOFI_MASK_WIDTH * KOFI_MASK_HEIGHT {
+        return None;
+    }
+    let mut rgba = Vec::with_capacity(alpha.len() * 4);
+    for &value in alpha {
+        rgba.extend_from_slice(&[255, 255, 255, value]);
+    }
+    let image =
+        egui::ColorImage::from_rgba_unmultiplied([KOFI_MASK_WIDTH, KOFI_MASK_HEIGHT], &rgba);
+    Some(ctx.load_texture(name, image, egui::TextureOptions::LINEAR))
+}
+
+/// Where the mark goes inside the space the footer gives it: as wide as the button, in the
+/// symbol's own proportions.
+fn kofi_mark_rect(rect: Rect) -> Rect {
+    let size = Vec2::new(
+        rect.width().min(19.0),
+        rect.width().min(19.0) * KOFI_MASK_HEIGHT as f32 / KOFI_MASK_WIDTH as f32,
+    );
+    Rect::from_center_size(rect.center(), size)
+}
+
+/// The footer's Ko-fi button: the cup and its handle in the colour of the icons beside it, and
+/// the heart in the theme's accent, with the whole mark taking the accent under the pointer.
+fn kofi_button(ui: &mut Ui, p: &Palette, mark: Option<&KofiMark>) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::new(20.0, 18.0), Sense::click());
-    let color = if response.hovered() {
+    let ink = if response.hovered() {
         p.accent
     } else {
         p.fg_secondary
     };
-    let mark = Rect::from_center_size(rect.center(), Vec2::splat(18.0));
-    // The heart is a hole in the cup, so what shows through it is the panel behind the footer.
-    ui.painter()
-        .extend(kofi_mark_shapes(mark, color, p.bg_sidebar));
+    match mark {
+        Some(mark) => {
+            let box_ = kofi_mark_rect(rect);
+            let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+            let painter = ui.painter();
+            // The white face of the cup is not painted at all, so the panel shows through it
+            // and the mark reads as an outline with a heart in it whatever theme is on.
+            painter.image(mark.cup.id(), box_, uv, ink);
+            painter.image(mark.heart.id(), box_, uv, p.accent);
+        }
+        // A build that lost its masks still leaves a working button: the icon font's coffee
+        // cup is not Ko-fi's mark, but it is not an empty square either.
+        None => {
+            ui.painter().text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                tabler_glyph("coffee").unwrap_or_default(),
+                FontId::new(15.0, FontFamily::Name("tabler".into())),
+                ink,
+            );
+        }
+    }
     response
-}
-
-/// Ko-fi's mark, drawn rather than typed: the icon font has no Ko-fi glyph, and a plain coffee
-/// cup reads as "coffee" instead of "Ko-fi". The mark is a solid cup with a heart cut out of
-/// it and a handle on the right, built from a few shapes so it stays sharp at the footer's icon
-/// size and takes whatever colour the theme (or the pointer) gives it.
-///
-/// `hole` is the colour behind the button: the heart is painted in it, over the cup, which is
-/// the same thing as cutting it out without needing a masked shape.
-fn kofi_mark_shapes(rect: Rect, color: Color32, hole: Color32) -> Vec<egui::Shape> {
-    let scale = rect.width().min(rect.height()) / 18.0;
-    let at = |x: f32, y: f32| Pos2::new(rect.min.x + x * scale, rect.min.y + y * scale);
-
-    // The cup, and its handle: an arc centred on the right wall, reaching a little way inside it
-    // so the two join up instead of floating apart.
-    let cup = Rect::from_min_max(at(3.2, 4.0), at(12.2, 15.6));
-    let handle: Vec<Pos2> = (0..=16)
-        .map(|step| {
-            let angle = -1.7 + 3.4 * step as f32 / 16.0;
-            at(12.2 + 2.2 * angle.cos(), 9.4 + 2.2 * angle.sin())
-        })
-        .collect();
-
-    // Two lobes and a point make the heart as one shape, so it does not depend on the
-    // tessellator coping with a concave outline; the lobes overlap enough to read as one heart
-    // even at eighteen points.
-    let (cx, cy, r) = (7.6_f32, 9.4_f32, 2.4_f32);
-    let lobe = 0.66 * r * scale;
-    vec![
-        egui::Shape::rect_filled(
-            cup,
-            egui::CornerRadius::same((2.4 * scale).round() as u8),
-            color,
-        ),
-        egui::Shape::line(handle, Stroke::new((1.3 * scale).max(1.0), color)),
-        egui::Shape::circle_filled(at(cx - 0.62 * r, cy - 0.25 * r), lobe, hole),
-        egui::Shape::circle_filled(at(cx + 0.62 * r, cy - 0.25 * r), lobe, hole),
-        egui::Shape::convex_polygon(
-            vec![
-                at(cx - 1.12 * r, cy),
-                at(cx, cy + 1.45 * r),
-                at(cx + 1.12 * r, cy),
-            ],
-            hole,
-            Stroke::NONE,
-        ),
-    ]
 }
 
 /// Hands a web address to the desktop's browser. Started and let go: what the browser does with
@@ -5939,10 +6033,10 @@ fn share_look(
     }
 }
 
-/// A first identifier for this computer: the account name with a short random tail, so it reads
-/// as a person rather than a number while still not colliding with anybody else on a server.
-/// Settings replaces it with any word the person prefers.
-fn random_identifier() -> String {
+/// A first public name for this computer: the account name with a short random tail, so it
+/// reads as a person rather than a number while still not colliding with anybody else on a
+/// server. Settings replaces it with any name the person prefers.
+fn default_display_name() -> String {
     let base: String = crate::net::os_username()
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
@@ -5954,6 +6048,13 @@ fn random_identifier() -> String {
     } else {
         format!("{base}-{suffix}")
     }
+}
+
+/// A fresh secret: 128 random bits written as hex. Long enough that guessing one out of the
+/// blue is not worth thinking about, and short enough to paste between computers.
+fn fresh_identifier() -> String {
+    let bytes: [u8; 16] = rand::random();
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Opens the system's "choose a picture" dialog on a thread of its own and hands back the
@@ -7056,8 +7157,10 @@ mod tests {
         );
     }
 
+    /// A fresh install needs both halves of who it is: a public name others can see and type,
+    /// and a secret the server alone reads so nobody can join as that name.
     #[test]
-    fn test_the_shared_name_falls_back_to_the_account() {
+    fn test_a_fresh_install_gets_a_public_name_and_a_secret() {
         let dir = std::env::temp_dir().join(format!(
             "elora-name-{}-{}",
             std::process::id(),
@@ -7071,33 +7174,193 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = EloraApp::with_context(&ctx, storage);
 
-        // A fresh install gets an identifier of its own, so the shared library works before
-        // anything is typed. It reads as a person, not as a number.
+        // A fresh install gets a name of its own, so the shared library works before anything
+        // is typed. It reads as a person, not as a number.
         let generated = app.server_display_name();
-        assert!(
-            !generated.trim().is_empty(),
-            "an identifier is made up front"
-        );
+        assert!(!generated.trim().is_empty(), "a name is made up front");
         assert_eq!(
             generated, app.display_name,
             "it is saved, not made per launch"
         );
         assert!(
             generated.len() > 4 && generated.len() <= 64,
-            "a usable identifier: {generated}"
+            "a usable name: {generated}"
         );
-        // And it is still there after a restart, so a private note found on another computer is
-        // found again here.
+
+        // The secret behind it is a long random string of hex, not the name and not something
+        // that could be guessed from it.
+        let secret = app.identifier.clone();
+        assert_eq!(
+            secret.len(),
+            32,
+            "128 random bits, written as hex: {secret}"
+        );
+        assert!(
+            secret.chars().all(|ch| ch.is_ascii_hexdigit()),
+            "only hex digits: {secret}"
+        );
+        assert_ne!(secret, app.server_display_name(), "not the public name");
+        assert!(
+            secret.len() >= MIN_IDENTIFIER,
+            "long enough for the server to accept it"
+        );
+
+        // And both are still there after a restart, so a private note found on another computer
+        // is found again here, and the secret can be copied to it.
         let reopened = EloraApp::with_context(&ctx, NoteStorage::new(dir.join("notes")).unwrap());
         assert_eq!(reopened.server_display_name(), generated);
+        assert_eq!(reopened.identifier, secret);
 
-        // A word the person picks is used exactly, minus the space they typed around it.
+        // A name the person picks is used exactly, minus the space they typed around it, and
+        // leaves the secret alone: renaming is not re-keying.
         app.display_name = "  SuperSaiyan  ".to_string();
         assert_eq!(app.server_display_name(), "SuperSaiyan");
         app.persist_settings();
         let reopened = EloraApp::with_context(&ctx, NoteStorage::new(dir.join("notes")).unwrap());
         assert_eq!(reopened.server_display_name(), "SuperSaiyan");
+        assert_eq!(reopened.identifier, secret);
+
+        // A key somebody types themselves is kept exactly: that is how a second computer is
+        // given the same identity as the first.
+        app.identifier = "0123456789abcdef0123456789abcdef".to_string();
+        app.persist_settings();
+        let reopened = EloraApp::with_context(&ctx, NoteStorage::new(dir.join("notes")).unwrap());
+        assert_eq!(reopened.identifier, app.identifier);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A key that is too short is caught in Settings, before a connection is attempted. The
+    /// server refuses it too, but that refusal would arrive as an outage notice instead of
+    /// pointing at the box that needs the key pasted into it.
+    #[test]
+    fn test_a_short_identifier_never_reaches_the_server() {
+        let dir = std::env::temp_dir().join(format!(
+            "elora-short-key-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = NoteStorage::new(dir.join("notes")).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = EloraApp::with_context(&ctx, storage);
+        app.server_form.host = "127.0.0.1".into();
+        app.server_form.port = 1;
+        app.server_form.password = "letmein".into();
+        app.identifier = "abc".to_string();
+
+        app.connect_server();
+        let message = app.status_message.clone().expect("a message saying why");
+        assert!(
+            message.contains(&format!("at least {MIN_IDENTIFIER}")),
+            "the reason should name the length: {message}"
+        );
+        assert!(!app.collab.is_active(), "nothing should be dialled yet");
+        assert!(
+            app.sent_identifier.is_empty(),
+            "a key that was never sent cannot be the one the connection uses"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Everything a frame draws, as text, so a test can say what a person can read on screen.
+    fn drawn_text(shapes: &[egui::epaint::ClippedShape]) -> String {
+        fn walk(shape: &egui::Shape, out: &mut String) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push_str(text.galley.text());
+                    out.push('\n');
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| walk(shape, out)),
+                _ => {}
+            }
+        }
+        let mut out = String::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    /// The name is on screen because it is public; the identifier never is, even in Settings, so
+    /// nobody reading over a shoulder gets the key. The two also have to fit side by side in the
+    /// settings column.
+    #[test]
+    fn test_settings_show_the_name_but_never_the_identifier() {
+        let dir = std::env::temp_dir().join(format!(
+            "elora-key-on-screen-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = NoteStorage::new(dir.join("notes")).unwrap();
+        let ctx = egui::Context::default();
+        install_tabler_icons(&ctx);
+        let mut app = EloraApp::with_context(&ctx, storage);
+        app.display_name = "SuperSaiyan".to_string();
+        app.identifier = "9f3a1c2b4d5e6f708192a3b4c5d6e7f8".to_string();
+        let p = ThemeMode::Obsidian.palette();
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(420.0, 900.0))),
+            ..Default::default()
+        };
+        let output = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default()
+                .frame(Frame::new().inner_margin(Margin::symmetric(12, 12)))
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        app.shared_library_settings(ui, &p);
+                    });
+                });
+        });
+
+        let text = drawn_text(&output.shapes);
+        assert!(
+            text.contains("Your name"),
+            "the name row is missing: {text}"
+        );
+        assert!(
+            text.contains("Identifier"),
+            "the key row is missing: {text}"
+        );
+        assert!(
+            text.contains("SuperSaiyan"),
+            "the public name should be readable: {text}"
+        );
+        assert!(
+            !text.contains("9f3a"),
+            "the key must not be drawn anywhere: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two launches must not share a secret: it is made once and then kept.
+    #[test]
+    fn test_two_computers_get_different_secrets() {
+        let keep: Vec<String> = (0..2)
+            .map(|tag| {
+                let dir = std::env::temp_dir().join(format!(
+                    "elora-key-{tag}-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                std::fs::create_dir_all(&dir).unwrap();
+                let storage = NoteStorage::new(dir.join("notes")).unwrap();
+                let ctx = egui::Context::default();
+                let app = EloraApp::with_context(&ctx, storage);
+                let _ = std::fs::remove_dir_all(&dir);
+                app.identifier
+            })
+            .collect();
+        assert_ne!(keep[0], keep[1], "each install needs its own secret");
     }
 
     #[test]
@@ -7692,74 +7955,105 @@ mod tests {
         });
         let _ = std::fs::remove_dir_all(&dir);
     }
-    /// The mark is a cup with a heart cut out of it and a handle on its right, and nothing
-    /// spills outside the square the footer gives it.
+    /// The footer's mark is Ko-fi's own symbol, baked into two masks: the cup's structure and
+    /// the heart, which are tinted separately. Neither mask carries the white face, so the panel
+    /// shows through it and the mark reads as an outline in whatever theme is on.
     #[test]
-    fn test_the_kofi_mark_is_a_cup_with_a_heart_on_it() {
-        let rect = Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::splat(18.0));
-        let cup_colour = Color32::WHITE;
-        let background = Color32::from_rgb(9, 9, 9);
-        let shapes = kofi_mark_shapes(rect, cup_colour, background);
-        assert_eq!(shapes.len(), 5, "cup, handle, two lobes and a point");
-        for shape in &shapes {
-            let bounds = shape.visual_bounding_rect();
-            assert!(
-                rect.expand(0.5).contains_rect(bounds),
-                "the mark stays inside the button: {bounds:?}"
-            );
-        }
+    fn test_the_kofi_masks_come_from_the_official_symbol() {
+        assert_eq!(KOFI_CUP_ALPHA.len(), KOFI_MASK_WIDTH * KOFI_MASK_HEIGHT);
+        assert_eq!(KOFI_HEART_ALPHA.len(), KOFI_MASK_WIDTH * KOFI_MASK_HEIGHT);
+        let at = |mask: &[u8], x: usize, y: usize| mask[y * KOFI_MASK_WIDTH + x];
 
-        // The cup is a solid shape in the icon colour...
-        let egui::Shape::Rect(cup) = &shapes[0] else {
-            panic!("the cup is a rectangle");
+        // The cup's wall is solid where it should be, a fifth of the way in from the left...
+        assert!(at(KOFI_CUP_ALPHA, 10, 40) > 240, "the cup's left wall");
+        // ...and the face inside is empty, so the footer's panel shows through it.
+        assert_eq!(at(KOFI_CUP_ALPHA, 48, 20), 0, "the face above the heart");
+        assert_eq!(at(KOFI_CUP_ALPHA, 48, 60), 0, "the face below it");
+        // The handle's loop sits inside the right edge, above the middle.
+        assert!(at(KOFI_CUP_ALPHA, 66, 24) > 200, "the handle's loop");
+        // The heart has a mask of its own, and the cup is empty where it sits, so the accent
+        // goes on the panel rather than over another colour.
+        assert!(at(KOFI_HEART_ALPHA, 40, 30) > 240, "the heart");
+        assert_eq!(at(KOFI_CUP_ALPHA, 40, 30), 0, "nothing under the heart");
+
+        // Nothing spills out of the mask, and the heart sits inside the cup.
+        let span = |mask: &[u8]| {
+            let mut box_ = (usize::MAX, 0, usize::MAX, 0);
+            for (index, value) in mask.iter().enumerate() {
+                if *value > 8 {
+                    let (x, y) = (index % KOFI_MASK_WIDTH, index / KOFI_MASK_WIDTH);
+                    box_ = (box_.0.min(x), box_.1.max(x), box_.2.min(y), box_.3.max(y));
+                }
+            }
+            box_
         };
-        assert_eq!(cup.fill, cup_colour);
-        let cup_rect = cup.rect;
+        let cup = span(KOFI_CUP_ALPHA);
+        let heart = span(KOFI_HEART_ALPHA);
+        assert!(
+            cup.0 > 0 && cup.1 < KOFI_MASK_WIDTH - 1 && cup.2 > 0 && cup.3 < KOFI_MASK_HEIGHT - 1,
+            "the cup stays inside its mask: {cup:?}"
+        );
+        assert!(
+            heart.0 > cup.0 && heart.1 < cup.1 && heart.2 > cup.2 && heart.3 < cup.3,
+            "the heart sits inside the cup: {heart:?} in {cup:?}"
+        );
+    }
 
-        // ... and the heart is painted over it in the panel colour, which is what makes it a
-        // hole rather than a mark sitting in the middle of a solid block.
-        let egui::Shape::Circle(lobe) = &shapes[3] else {
-            panic!("a lobe is a circle");
+    /// The mark keeps the symbol's proportions and fits the space the footer gives it.
+    #[test]
+    fn test_the_kofi_mark_fits_its_button() {
+        let button = Rect::from_min_size(Pos2::new(4.0, 6.0), Vec2::new(20.0, 18.0));
+        let mark = kofi_mark_rect(button);
+        assert!(button.contains_rect(mark), "the mark stays in the button");
+        let ratio = mark.width() / mark.height();
+        let expected = KOFI_MASK_WIDTH as f32 / KOFI_MASK_HEIGHT as f32;
+        assert!(
+            (ratio - expected).abs() < 0.01,
+            "the symbol's own proportions: {ratio} against {expected}"
+        );
+        assert!((mark.width() - 19.0).abs() < 0.01);
+        assert!((mark.center() - button.center()).length() < 0.01);
+    }
+
+    /// The button paints both halves of the mark, each from its own texture, in a box of the
+    /// size the footer was laid out for.
+    #[test]
+    fn test_the_kofi_button_paints_both_masks() {
+        let ctx = egui::Context::default();
+        install_tabler_icons(&ctx);
+        let mark = KofiMark::load(&ctx).expect("the masks are embedded");
+        let p = ThemeMode::Obsidian.palette();
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(120.0, 40.0))),
+            ..Default::default()
         };
-        assert_eq!(lobe.fill, background, "the heart shows the panel through");
+        let mut size = Vec2::ZERO;
+        let output = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                size = kofi_button(ui, &p, Some(&mark)).rect.size();
+            });
+        });
+        assert_eq!(size, Vec2::new(20.0, 18.0));
+        let textured = output
+            .shapes
+            .iter()
+            .filter(|clipped| {
+                matches!(&clipped.shape, egui::Shape::Mesh(mesh) if mesh.texture_id != egui::TextureId::default())
+            })
+            .count();
+        assert_eq!(textured, 2, "the cup and the heart are each drawn");
+    }
 
-        let inside_cup = cup_rect.shrink(1.0);
-        for heart in &shapes[2..] {
-            assert!(
-                inside_cup.contains_rect(heart.visual_bounding_rect()),
-                "the heart sits on the cup, not on its rim: {:?}",
-                heart.visual_bounding_rect()
-            );
-        }
-
-        // Two lobes level with each other, and a point hanging below them.
-        let left = shapes[2].visual_bounding_rect();
-        let right = shapes[3].visual_bounding_rect();
-        let point = shapes[4].visual_bounding_rect();
-        assert!((left.center().y - right.center().y).abs() < 0.5);
-        assert!(
-            left.center().x < right.center().x,
-            "the lobes sit side by side"
-        );
-        assert!(
-            left.right() > right.left(),
-            "they meet in the middle, so the heart is one shape"
-        );
-        assert!(
-            point.bottom() > left.bottom() + 1.5,
-            "the point hangs below the lobes"
-        );
-
-        // The handle reaches past the cup's right wall, and starts on the cup so the two join.
-        let handle = shapes[1].visual_bounding_rect();
-        assert!(
-            handle.right() > cup_rect.right() + 1.0,
-            "the handle is on the outside: {handle:?}"
-        );
-        assert!(
-            handle.left() < cup_rect.right(),
-            "and its ends tuck inside the cup: {handle:?}"
-        );
+    /// Both masks load as textures of their own size, and a mask of the wrong length is refused
+    /// instead of being painted as a stretched line.
+    #[test]
+    fn test_the_kofi_textures_load() {
+        let ctx = egui::Context::default();
+        install_tabler_icons(&ctx);
+        let mark = KofiMark::load(&ctx).expect("the masks are embedded");
+        assert_eq!(mark.cup.size(), [KOFI_MASK_WIDTH, KOFI_MASK_HEIGHT]);
+        assert_eq!(mark.heart.size(), [KOFI_MASK_WIDTH, KOFI_MASK_HEIGHT]);
+        assert!(mask_texture(&ctx, "short", &[0, 1, 2]).is_none());
     }
 
     /// The footer's Ko-fi button hands the browser the page it advertises, on every platform.

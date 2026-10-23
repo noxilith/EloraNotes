@@ -355,7 +355,9 @@ impl Collab {
     }
 
     /// Starts a worker thread for `profile`. Any previous connection is dropped first.
-    pub fn connect(&mut self, profile: ServerProfile, username: String) {
+    /// Opens a connection as one person: `username` is the display name everybody sees, and
+    /// `identifier` is the secret key only the server reads. Both come from Settings.
+    pub fn connect(&mut self, profile: ServerProfile, username: String, identifier: String) {
         self.disconnect();
         if !profile.is_configured() {
             self.state = ConnectionState::Offline;
@@ -369,7 +371,7 @@ impl Collab {
         };
         std::thread::Builder::new()
             .name("elora-collab".to_string())
-            .spawn(move || worker(profile, username, command_rx, notify))
+            .spawn(move || worker(profile, username, identifier, command_rx, notify))
             .ok();
         self.commands = Some(command_tx);
         self.events = event_rx;
@@ -653,7 +655,13 @@ fn connect_socket(address: &str, timeout: Duration) -> Result<std::net::TcpStrea
     ))
 }
 
-fn worker(profile: ServerProfile, name: String, commands: Receiver<Command>, events: Notify) {
+fn worker(
+    profile: ServerProfile,
+    name: String,
+    identifier: String,
+    commands: Receiver<Command>,
+    events: Notify,
+) {
     let mut delay = FIRST_RETRY;
     loop {
         if matches!(
@@ -662,7 +670,7 @@ fn worker(profile: ServerProfile, name: String, commands: Receiver<Command>, eve
         ) {
             return;
         }
-        match Session::start(&profile, &name, &events, &commands) {
+        match Session::start(&profile, &name, &identifier, &events, &commands) {
             Ok(mut session) => {
                 delay = FIRST_RETRY;
                 let reason = session.run(&commands, &events);
@@ -690,6 +698,7 @@ impl Session {
     fn start(
         profile: &ServerProfile,
         name: &str,
+        identifier: &str,
         events: &Notify,
         commands: &Receiver<Command>,
     ) -> Result<Session, String> {
@@ -712,11 +721,12 @@ impl Session {
             .map_err(|e| format!("could not start TLS: {e}"))?;
         let mut stream = rustls::StreamOwned::new(connection, socket);
 
-        // The same word is the name others see and the identifier private notes are keyed to,
-        // which is why there is only one of them.
+        // Two different things: the name is what everybody sees, the identifier is the key only
+        // the server reads. Sending the name twice, as older builds did, would make the key as
+        // public as the name.
         let hello = ClientMsg::Hello {
             v: PROTOCOL_VERSION,
-            id: name.to_string(),
+            id: identifier.to_string(),
             name: name.to_string(),
             password: profile.password.clone(),
         };

@@ -25,6 +25,33 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.9.20" date="2026-10-23">
+      <description>
+        <p>
+          Who you are on a shared library is now two things instead of one. Your name is public:
+          it is what others see next to your caret and what they add to a note to share it with
+          you. Behind it is an identifier — 32 random characters that only the server ever reads
+          — kept in Settings under “Your name” and “Identifier”, with a Copy button for your
+          other computer. The same identifier there makes you the same person, so a note closed
+          to everybody else follows you between machines.
+        </p>
+        <p>
+          The server binds each name to the first identifier that claims it and never stores the
+          identifier itself. Somebody who types a name that is already taken is refused at the
+          handshake with a message saying so, instead of being let in as that person. A note now
+          carries display names, not secrets: the server works out who may read it.
+        </p>
+        <p>
+          The protocol is version 5 because of that, so the app and the server both need this
+          release to connect to each other. A server that has just been updated begins with an
+          empty list, so connect with your own name once before handing it out.
+        </p>
+        <p>
+          The Ko-fi button in the sidebar footer now draws Ko-fi’s own symbol, recoloured to the
+          theme: the cup in the icon colour, the heart in the accent.
+        </p>
+      </description>
+    </release>
     <release version="0.9.19" date="2026-10-23">
       <description>
         <p>

@@ -89,11 +89,19 @@ pub struct AppSettings {
     /// The shared library this client connects to, if any.
     #[serde(default)]
     pub server: crate::collab::ServerProfile,
-    /// The identifier this client goes by: the name others see next to its caret, and the word
-    /// a private note is opened to. A fresh install fills it with one, so it is only empty in a
-    /// settings file from before the shared library had identifiers.
+    /// The name everybody else sees: next to this client's caret, and the word somebody types
+    /// to share a note with it. Public, and kept unique by the server.
     #[serde(default)]
     pub display_name: String,
+    /// This client's key: a secret only the server ever reads, which proves the connection is
+    /// the person the name belongs to and decides which restricted notes it is shown. A fresh
+    /// install makes one; it is the same string on another computer to be the same person there.
+    ///
+    /// A settings file from before names and keys were separate had no key, and the old
+    /// `display_name` was doing both jobs; an empty key is replaced with a generated one at
+    /// startup.
+    #[serde(default)]
+    pub identifier: String,
     /// Whether a card in the sidebar shows the first lines of its note. Off unless it is turned
     /// on, which leaves just the title, the date and the tags, so more notes fit in the list.
     ///
@@ -141,6 +149,7 @@ impl Default for AppSettings {
             collapsed_folders: Vec::new(),
             server: Default::default(),
             display_name: String::new(),
+            identifier: String::new(),
             show_card_previews: default_show_card_previews(),
         }
     }
@@ -159,14 +168,15 @@ pub struct Note {
     pub icon: Option<String>,
     /// Optional folder the note is filed under, stored in frontmatter.
     pub folder: Option<String>,
-    /// The identifier of the person the note belongs to. Notes created in the shared library
-    /// carry one, so the same identifier on another computer finds them again; notes on this
-    /// computer are never owned by anybody.
+    /// The display name of the person the note belongs to. Notes created in the shared library
+    /// carry one, so whoever is behind that name on the server finds them again; notes on this
+    /// computer are never owned by anybody. The secret that proves which person that is never
+    /// reaches a note: the server resolves the name through its own list.
     pub owner: Option<String>,
     /// True when only the owner and the people named in `shared_with` may see the note. Stored
     /// in the shared library's frontmatter, where the server reads it.
     pub private: bool,
-    /// Identifiers allowed to see a private note.
+    /// Display names allowed to see a private note.
     pub shared_with: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

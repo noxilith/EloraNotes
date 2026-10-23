@@ -122,6 +122,12 @@ fn settle(
 /// take turns instead of starting servers over each other's files.
 static SERVER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The secret key a test person's name is bound to. The server never hands this to anybody, and
+/// two clients built with the same one are the same person on two machines.
+fn key(name: &str) -> String {
+    format!("{name}-0123456789abcdef0123456789abcdef")
+}
+
 #[test]
 fn test_two_clients_edit_the_same_note() {
     let _turn = SERVER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -129,7 +135,7 @@ fn test_two_clients_edit_the_same_note() {
     let note_id = harness.note_id.clone();
 
     let mut alice = Collab::new();
-    alice.connect(profile(harness.port), "alice".into());
+    alice.connect(profile(harness.port), "alice".into(), key("alice"));
     settle(&mut alice, &mut String::new(), "alice", |c, _| {
         c.is_connected() && !c.notes().is_empty()
     });
@@ -157,7 +163,7 @@ fn test_two_clients_edit_the_same_note() {
     bob.set_waker(Arc::new(move || {
         woken.fetch_add(1, Ordering::SeqCst);
     }));
-    bob.connect(profile(harness.port), "bob".into());
+    bob.connect(profile(harness.port), "bob".into(), key("bob"));
     let mut bob_body = String::new();
     settle(&mut bob, &mut bob_body, "bob", |c, _| c.is_connected());
     bob.open_note(&note_id, "hello");
@@ -228,7 +234,7 @@ fn test_two_clients_edit_the_same_note() {
     // Two machines with the same account name: one leaving must not take the other's presence
     // away with it. Bob is the one looking, since Alice does not show herself.
     let mut twin = Collab::new();
-    twin.connect(profile(harness.port), "alice".into());
+    twin.connect(profile(harness.port), "alice".into(), key("alice"));
     settle(&mut twin, &mut String::new(), "twin", |c, _| {
         c.is_connected()
     });
@@ -249,7 +255,7 @@ fn test_two_clients_edit_the_same_note() {
 
     // A third client is the neutral observer of the merged result.
     let mut viewer = Collab::new();
-    viewer.connect(profile(harness.port), "viewer".into());
+    viewer.connect(profile(harness.port), "viewer".into(), key("viewer"));
     let mut viewer_body = String::new();
     settle(&mut viewer, &mut viewer_body, "viewer", |c, _| {
         c.is_connected()
@@ -434,6 +440,78 @@ fn test_two_clients_edit_the_same_note() {
     viewer.disconnect();
 }
 
+/// Drains a client until `done` holds. Unlike `settle` this tolerates the "reconnecting" notice
+/// a refused handshake produces, because that refusal is what some tests are waiting for.
+fn wait_until(collab: &mut Collab, label: &str, done: impl Fn(&Collab) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        collab.poll();
+        if done(collab) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!(
+        "{label} did not settle; state is {:?}, last error is {:?}",
+        collab.state(),
+        collab.last_error()
+    );
+}
+
+/// The name is public and the identifier is the key. Knowing what somebody is called is not
+/// enough to be them: the first key to claim a name keeps it, and every other key is refused at
+/// the handshake with a reason the person can act on. The same key on a second machine is the
+/// same person again, which is how their notes follow them.
+#[test]
+fn test_a_name_cannot_be_taken_by_another_key() {
+    let _turn = SERVER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let harness = start_server();
+
+    let mut alice = Collab::new();
+    alice.connect(profile(harness.port), "alice".into(), key("alice"));
+    settle(&mut alice, &mut String::new(), "alice", |c, _| {
+        c.is_connected()
+    });
+
+    // Somebody who knows the name but not the key is turned away — and told why, rather than
+    // being let in as the person a note might be shared with.
+    let mut impostor = Collab::new();
+    impostor.connect(profile(harness.port), "alice".into(), key("mallory"));
+    wait_until(&mut impostor, "the impostor", |c| {
+        c.last_error()
+            .is_some_and(|error| error.contains("belongs to somebody else"))
+    });
+    assert!(
+        !impostor.is_connected(),
+        "a taken name must not get in at all"
+    );
+    assert!(
+        alice.is_connected(),
+        "the real alice keeps her name and her connection"
+    );
+
+    // A key too short to be a secret is refused before it can own anything, so a typo in
+    // Settings cannot quietly turn a private note into a guessable one.
+    let mut vague = Collab::new();
+    vague.connect(profile(harness.port), "bob".into(), "short".into());
+    wait_until(&mut vague, "the short key", |c| {
+        c.last_error()
+            .is_some_and(|error| error.contains("too short"))
+    });
+    assert!(!vague.is_connected());
+
+    // Alice's second computer carries the same key, so it is Alice, with her notes.
+    let mut laptop = Collab::new();
+    laptop.connect(profile(harness.port), "alice".into(), key("alice"));
+    settle(&mut laptop, &mut String::new(), "alice's laptop", |c, _| {
+        c.is_connected()
+    });
+    assert!(
+        laptop.notes().iter().any(|note| note.id == harness.note_id),
+        "the second computer finds the same library"
+    );
+}
+
 /// A picture added to a shared note goes to the server, so somebody who never had the file can
 /// see it — including after the computer that added it has gone.
 #[test]
@@ -445,7 +523,7 @@ fn test_a_shared_notes_picture_outlives_the_computer_that_added_it() {
     let picture: Vec<u8> = b"\x89PNG fake picture bytes".to_vec();
 
     let mut alice = Collab::new();
-    alice.connect(profile(harness.port), "alice".into());
+    alice.connect(profile(harness.port), "alice".into(), key("alice"));
     settle(&mut alice, &mut String::new(), "alice", |c, _| {
         c.is_connected()
     });
@@ -461,7 +539,7 @@ fn test_a_shared_notes_picture_outlives_the_computer_that_added_it() {
 
     // Bob has never had the file; he asks the library for what the note names.
     let mut bob = Collab::new();
-    bob.connect(profile(harness.port), "bob".into());
+    bob.connect(profile(harness.port), "bob".into(), key("bob"));
     settle(&mut bob, &mut String::new(), "bob", |c, _| c.is_connected());
     bob.fetch_attachment(file);
     assert_eq!(

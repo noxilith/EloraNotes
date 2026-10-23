@@ -27,7 +27,7 @@ A calm, minimalistic cross-platform desktop notes application written in **Rust*
 - **Quick Formatting Bar**: One-click insertion for `# H1`, `## H2`, `**bold**`, `*italic*`, bullet lists, `- [ ]` task checkboxes, blockquotes, code blocks, and `[[Wiki Links]]`.
 - **Safe Trash & Restore**: Deleted notes move to the **Trash** view first where they can be restored with one click or permanently deleted.
 - **Import Markdown Folder**: Copy `.md` files into an `Import` folder inside your notes folder, then run **Import Markdown From Import Folder** from the Command Palette. Each file becomes a new note with its frontmatter kept. Importing the same files twice creates duplicates.
-- **Shared Notes (Google-Docs style)**: Point the app at an EloraNotes server — address, port, password — and the server's notes appear in the sidebar under its name. Everyone with a note open sees each other's edits as they are typed, with a coloured caret and a name tag at each person's cursor, a dot on the note's card while somebody is in it, and a presence list above the editor. Each person goes by an **identifier** from Settings, which also lets a note be closed to everybody but its owner or opened to a few names on it.
+- **Shared Notes (Google-Docs style)**: Point the app at an EloraNotes server — address, port, password — and the server's notes appear in the sidebar under its name. Everyone with a note open sees each other's edits as they are typed, with a coloured caret and a name tag at each person's cursor, a dot on the note's card while somebody is in it, and a presence list above the editor. Each person has a **name** everyone sees and a secret **identifier** only the server ever reads, both from Settings, which is what lets a note be closed to everybody but its owner or opened to a few names on it.
 - **Color Themes**: Choose **Obsidian** (dark slate), **Paper** (warm light), **Nordic** (arctic dark), **Matcha** (soft sage light), or **Matugen** (colors from your wallpaper). Preferences and folded folders persist automatically.
 
 ## Install
@@ -187,7 +187,7 @@ next note directly on the server.
 
 Pictures in a shared note are kept on the server too, in an `attachments` folder inside its notes folder, so everyone with the library sees them and they are still there after the computer that added them is gone. A picture added before a note is moved to the server goes with it, and **Copy to this computer** brings copies of its pictures along. The server's notes folder stays an ordinary EloraNotes library, pictures included, so copying or backing it up keeps everything.
 
-Everyone in the library, and the server itself, needs a build that speaks the same protocol (0.9.19 or newer). An older server used to drop a shared note's pictures without saying anything, so a client that can share them refuses to connect to one and says to update whichever side is older. The same check now covers note privacy: a server from before it could not keep a note to itself, so the two are never paired.
+Everyone in the library, and the server itself, needs a build that speaks the same protocol (0.9.20 or newer). An older server used to drop a shared note's pictures without saying anything, so a client that can share them refuses to connect to one and says to update whichever side is older. The same check covers note privacy, and the newest one covers who is who: a 0.9.19 client sends its name as its key, which is exactly what makes a name unguessable now, so those clients are turned away rather than trusted.
 
 ### Connecting from the app
 
@@ -205,10 +205,21 @@ While a shared note is open, **New** (and the daily-note, template and wiki-link
 the note in that library instead of on your disk: it joins the same folder, keeps the tag you are
 filtering by, and appears on everyone's sidebar straight away.
 
-Your username is your **identifier** from Settings: a fresh install makes one up (the account name
-with a short random tail), and it can be replaced with any word. It is the name others see next to
-your caret, it is what a note is opened to, and the same identifier on another computer is you
-there too, so a note closed to everybody else follows you between machines.
+You go by two things, both in **Settings → Shared library** under **Your name** and
+**Identifier**:
+
+- **Your name** is public. It is what others see next to your caret and what they type to put you
+  on a note. A fresh install makes one up (the account name with a short random tail), and it can
+  be replaced with any word — but not one somebody else on that server already uses.
+- **The identifier** is the secret behind it: 32 random hex characters, kept in this computer's
+  settings file, and given to the server and nobody else. The server compares it to remember that
+the name is really you, so knowing what somebody is called does not let anyone connect as them.
+
+To use the same identity on a second computer, press **Copy** beside the identifier here and
+paste it into the same box there — you arrive as the same person, and notes closed to everybody
+else follow you between machines. **New** makes a fresh secret if the old one may have leaked;
+the other computers then need the new one as well, and this one comes back under a new name
+unless you type the old one in.
 
 While somebody else has a note open, its card shows a coloured dot; when you open it too you see
 their caret with their name, and the words they type appear as they type them.
@@ -224,18 +235,33 @@ in the note's header opens **Who can see this note**:
 - **Everyone on <server>** — the whole library, which is where a new note starts.
 - **Only me** — nobody else's sidebar lists it, nobody else can open it, and anyone reading it
   when it is closed is taken out of it, so nothing typed afterwards reaches them.
-- **Only these people** — the same, plus any identifiers added to the list. Adding a name is all
-  it takes: **Their identifier, e.g. SuperSaiyan**. Removing the chip takes the note away again.
+- **Only these people** — the same, plus anyone named on the list. Adding a person is all it
+  takes: type the **name** they go by, as it appears next to their caret — **Their name, e.g.
+  SuperSaiyan**. The server knows which identifier owns that name, so the note reaches the person
+  and not whoever else types the same word. Removing the chip takes the note away again.
 
 Only the note's owner changes this; everybody else sees whose note it is and that it was shared
 with them. Ownership is recorded on every note the library creates, in its frontmatter
 (`owner:`, `private:`, `shared_with:`) which the server keeps in the `.md` file, so a restriction
 survives a restart and stays visible to anyone who edits the folder by hand.
 
-Two things this is not: the identifiers are chosen by the people using them, not proven, and the
-server password is still what decides who may connect at all. Treat the lock as *which notes the
-server hands out*, for a household or a group who trust each other with the password — not as
-protection against somebody who has it and wants to pretend to be you.
+How the names are kept safe: the first identifier to claim a name keeps it. The server remembers
+`name → SHA-256 of that identifier` in a `people.json` beside its config, never the identifier
+itself, so somebody who types a taken name is refused at the handshake with a message saying the
+name belongs to somebody else, instead of being let in as that person. A name that is already
+claimed stays bound to its owner even after they change it, so notes they wrote before still find
+them.
+
+One thing to do after updating a server: connect with your own name before other people do. A
+server that has just been updated has no list yet, so each name is bound to the key that claims it
+first — which is you, as long as you get there first. Nothing else is lost either way: the notes
+keep the names they were written with, and whoever owns a name sees what that name was given.
+
+Two limits worth knowing: the server password is still what decides who may connect at all, and
+whoever runs the server can read its files. Within that, knowing somebody's name is not enough to
+be them. Treat the lock as *which notes the server hands out*, plus the identity behind that — for
+a household or a group who trust each other with the password — and keep the identifier to
+yourself the way you keep the password.
 
 ### If it stays on "Connecting…"
 

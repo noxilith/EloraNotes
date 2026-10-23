@@ -969,7 +969,7 @@ dependencies = [
 
 [[package]]
 name = "elora-notes"
-version = "0.9.19"
+version = "0.9.20"
 dependencies = [
  "arboard",
  "base64 0.22.1",
