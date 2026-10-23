@@ -32,6 +32,8 @@ const SIDEBAR_MARGIN_Y: i8 = 10;
 
 /// Height kept free at the bottom of the sidebar for the footer action row.
 const SIDEBAR_FOOTER_HEIGHT: f32 = 34.0;
+/// Space kept between the footer icons and the panel's right edge.
+const FOOTER_ICON_INSET: f32 = 5.0;
 
 /// Smallest gap between the window edge (or the sidebar) and the note column. The column is
 /// centred in wider windows and keeps at least this much air on both sides when it is not,
@@ -2087,6 +2089,9 @@ impl EloraApp {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                // Pull the row off the panel edge a little, so the footer icons line up with
+                // the note cards above them instead of hugging the divider.
+                ui.add_space(FOOTER_ICON_INSET);
                 if ui
                     .add(
                         egui::Button::new(
