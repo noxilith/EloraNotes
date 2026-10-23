@@ -139,15 +139,13 @@ fn test_two_clients_edit_the_same_note() {
     });
 
     let mut bob = Collab::new();
-    // Bob's window only draws when egui is asked to, and an idle one is never asked, so a remote
+    // Bob's window only draws when it is asked to, and an idle one never asks, so a remote
     // keystroke has to wake it; otherwise the other person's words wait for Bob's next mouse move.
     let repaints = Arc::new(AtomicUsize::new(0));
-    let counter = repaints.clone();
-    let window = egui::Context::default();
-    window.set_request_repaint_callback(move |_| {
-        counter.fetch_add(1, Ordering::SeqCst);
-    });
-    bob.attach_ui(window.clone());
+    let woken = repaints.clone();
+    bob.set_waker(Arc::new(move || {
+        woken.fetch_add(1, Ordering::SeqCst);
+    }));
     bob.connect(profile(harness.port), "bob".into());
     let mut bob_body = String::new();
     settle(&mut bob, &mut bob_body, "bob", |c, _| c.is_connected());
@@ -174,18 +172,7 @@ fn test_two_clients_edit_the_same_note() {
         body == "hello from alice"
     });
 
-    // Let the empty window settle into its idle state, then count from zero: anything after this
-    // is a wake-up from the connection.
-    for _ in 0..2 {
-        let raw = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(640.0, 480.0),
-            )),
-            ..Default::default()
-        };
-        let _ = window.run(raw, |_| {});
-    }
+    // Nothing is happening now, so the count starts from zero: anything after this is a wake-up.
     std::thread::sleep(Duration::from_millis(100));
     repaints.store(0, Ordering::SeqCst);
     alice_body.push('!');

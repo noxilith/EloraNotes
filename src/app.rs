@@ -346,6 +346,12 @@ impl EloraApp {
             quiet_update: false,
         };
         app.start_update_check(&cc.egui_ctx, false);
+        // A remote keystroke asks for a frame the moment it arrives; an idle window is never
+        // asked to draw on its own, so without this the other person's words would only appear
+        // the next time this window happened to repaint.
+        let repaint = cc.egui_ctx.clone();
+        app.collab
+            .set_waker(std::sync::Arc::new(move || repaint.request_repaint()));
         // A configured shared library reconnects on its own at launch.
         if app.server.is_configured() {
             let profile = app.server.clone();
@@ -4348,7 +4354,6 @@ impl eframe::App for EloraApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_shortcuts(ctx);
         self.poll_update();
-        self.collab.attach_ui(ctx.clone());
         self.poll_collab(ctx);
         self.sync_open_note();
         self.settings_window(ctx);

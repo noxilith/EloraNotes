@@ -145,20 +145,23 @@ pub enum Incoming {
     Offline(String),
 }
 
-/// Wakes the window when something arrives. The UI only redraws when egui is asked to, and the
-/// worker is the one place that knows a remote keystroke turned up, so without this the other
-/// person's words land in the channel and wait for the local mouse to move before they show.
+/// What the UI wants to happen when a message arrives. The server binary builds without a window
+/// at all, so this is a plain callback rather than a handle on egui: the app passes a function
+/// that asks for a frame. Without it a remote keystroke would sit in the channel until the local
+/// mouse moved, because an idle window is never asked to draw.
+pub type Waker = std::sync::Arc<dyn Fn() + Send + Sync>;
+
 #[derive(Clone)]
 struct Notify {
     events: Sender<Incoming>,
-    ui: Option<egui::Context>,
+    wake: Option<Waker>,
 }
 
 impl Notify {
     fn send(&self, event: Incoming) {
         let _ = self.events.send(event);
-        if let Some(ui) = &self.ui {
-            ui.request_repaint();
+        if let Some(wake) = &self.wake {
+            wake();
         }
     }
 }
@@ -207,8 +210,8 @@ pub struct Collab {
     sent_body: Option<(String, String)>,
     /// True once a failure has been reported, so the retry loop below it stays quiet.
     offline_reported: bool,
-    /// The window, for the worker to wake when a remote edit arrives.
-    ui: Option<egui::Context>,
+    /// Called by the worker when a message arrives, to redraw the window straight away.
+    wake: Option<Waker>,
 }
 
 impl Default for Collab {
@@ -232,14 +235,14 @@ impl Collab {
             open: None,
             sent_body: None,
             offline_reported: false,
-            ui: None,
+            wake: None,
         }
     }
 
-    /// Remembers the window so the worker can ask for a frame the moment a message arrives.
-    /// Called every frame, because the connection may be made long after this is first set.
-    pub fn attach_ui(&mut self, ui: egui::Context) {
-        self.ui = Some(ui);
+    /// Registers what wakes the window when a message arrives. The app passes a function that
+    /// asks for a new frame; the server binary, with no window, passes nothing at all.
+    pub fn set_waker(&mut self, wake: Waker) {
+        self.wake = Some(wake);
     }
 
     pub fn state(&self) -> &ConnectionState {
@@ -301,7 +304,7 @@ impl Collab {
         let (event_tx, event_rx) = mpsc::channel();
         let notify = Notify {
             events: event_tx,
-            ui: self.ui.clone(),
+            wake: self.wake.clone(),
         };
         std::thread::Builder::new()
             .name("elora-collab".to_string())
