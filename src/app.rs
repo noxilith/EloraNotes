@@ -32,8 +32,10 @@ const SIDEBAR_FOOTER_HEIGHT: f32 = 34.0;
 
 /// Smallest gap between the window edge (or the sidebar) and the note column. The column is
 /// centred in wider windows and keeps at least this much air on both sides when it is not,
-/// so resizing never pushes the text against one edge.
-const NOTE_SIDE_MARGIN: f32 = 24.0;
+/// so resizing never pushes the text against one edge. It matches the sidebar's own inner
+/// margin closely enough that the divider sits between two even gaps instead of hugging one
+/// side and leaving a wide empty band on the other.
+const NOTE_SIDE_MARGIN: f32 = 16.0;
 
 /// Space reserved for the colour controls in the formatting bar, measured at the current text
 /// sizes with a few pixels of slack. They are drawn inside a child layout of this size so the
@@ -3369,7 +3371,21 @@ impl EloraApp {
         let mut clicked_backlink_id: Option<String> = None;
         let mut toggled_task_idx: Option<usize> = None;
 
-        match self.view_mode {
+        // Two panes need roughly this much room each before their text stops wrapping every
+        // other word; in a narrow window the split view shows the editor alone instead of two
+        // cramped columns (the chosen mode is kept, so widening the window brings it back).
+        const MIN_SPLIT_PANE_WIDTH: f32 = 240.0;
+        let view_mode = match self.view_mode {
+            EditorViewMode::Split
+                if ((ui.available_width() - NOTE_SIDE_MARGIN) * 0.5).max(80.0)
+                    < MIN_SPLIT_PANE_WIDTH =>
+            {
+                EditorViewMode::Edit
+            }
+            other => other,
+        };
+
+        match view_mode {
             EditorViewMode::Edit => {
                 ScrollArea::vertical()
                     .id_salt("elora_editor_scroll")
@@ -3542,13 +3558,15 @@ impl eframe::App for EloraApp {
             let rect = sidebar.response.rect;
             let ppp = ctx.pixels_per_point();
             let right = (rect.right() * ppp).round() / ppp;
+            // A full-strength border line between two dark fills reads as a bright seam, so
+            // the divider is mixed towards the sidebar side of it.
             ctx.layer_painter(egui::LayerId::background()).rect_filled(
                 egui::Rect::from_min_max(
                     Pos2::new(right - 1.0 / ppp, rect.top()),
                     Pos2::new(right, rect.bottom()),
                 ),
                 0.0,
-                p.border,
+                mix_color(p.border, p.bg_sidebar, 0.55),
             );
         }
 
@@ -3598,6 +3616,13 @@ impl eframe::App for EloraApp {
 enum CardAction {
     SelectNote(String),
     FilterTag(String),
+}
+
+/// Blends `b` into `a`: `0.0` keeps `a`, `1.0` gives `b`.
+fn mix_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
 }
 
 /// A section pill in the sidebar: glyph, label and count on one line. The pills are drawn at a

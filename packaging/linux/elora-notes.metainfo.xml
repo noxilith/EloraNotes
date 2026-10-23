@@ -25,6 +25,15 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.7.9" date="2026-10-22">
+      <description>
+        <p>
+          The divider beside the note list is softer and sits between even margins instead of
+          leaving a wide empty band, and a window too narrow for two columns shows the editor
+          alone rather than two cramped panes. The README screenshot shows the current look.
+        </p>
+      </description>
+    </release>
     <release version="0.7.8" date="2026-10-22">
       <description>
         <p>
