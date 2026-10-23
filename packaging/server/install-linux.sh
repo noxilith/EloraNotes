@@ -102,17 +102,34 @@ install -m 0755 "$STAGED" "$BINARY" || fail "could not install the server to $BI
     || fail "$BINARY does not run on this machine (wrong CPU architecture or a corrupt download)"
 
 # --- a user and folder of its own, so the server never runs as root -------------------------
-if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
-    useradd --system --home-dir "$DATA_DIR" --shell /usr/sbin/nologin "$SERVICE_USER"
+# `useradd --system` does not give the user a group of its own on Debian and Ubuntu (that is
+# adduser's behaviour), so the group is created first instead of assuming it exists.
+if ! getent group "$SERVICE_USER" >/dev/null 2>&1; then
+    groupadd --system "$SERVICE_USER" || fail "could not create the $SERVICE_USER group"
 fi
-install -d -m 0750 "$DATA_DIR"
+if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
+    useradd --system --gid "$SERVICE_USER" --home-dir "$DATA_DIR" \
+        --shell /usr/sbin/nologin "$SERVICE_USER" \
+        || fail "could not create the $SERVICE_USER user"
+fi
+SERVICE_GROUP=$(id -gn "$SERVICE_USER")
+if [ "$SERVICE_GROUP" != "$SERVICE_USER" ]; then
+    # An install from an older release left the user on `nogroup`; move it to its own group.
+    usermod -g "$SERVICE_USER" "$SERVICE_USER" \
+        || fail "could not move $SERVICE_USER to its own group"
+    SERVICE_GROUP="$SERVICE_USER"
+fi
+install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$DATA_DIR"
 
 # The settings, certificate and notes are written here as root and handed to the service user
 # afterwards, so the script never has to switch users (sudo is not always installed).
 say "Writing the settings and the certificate…"
 printf '%s\n' "$PASSWORD" | ELORA_SERVER_DIR="$DATA_DIR" \
     "$BINARY" init --name "$SERVER_NAME" --port "$PORT" --password-stdin
-chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR"
+chown -R "$SERVICE_USER:$SERVICE_GROUP" "$DATA_DIR"
+# The password and the private key are for the service only; a missing file is not fatal.
+chmod 0600 "$DATA_DIR/config.json" "$DATA_DIR/key.pem" 2>/dev/null || true
+chmod 0644 "$DATA_DIR/cert.pem" 2>/dev/null || true
 
 # --- service -------------------------------------------------------------------------------
 cat >"$SERVICE" <<UNIT
@@ -124,7 +141,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=$SERVICE_USER
-Group=$SERVICE_USER
+Group=$SERVICE_GROUP
 Environment=ELORA_SERVER_DIR=$DATA_DIR
 ExecStart=$BINARY run
 Restart=on-failure

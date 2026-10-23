@@ -25,6 +25,16 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.9.2" date="2026-10-22">
+      <description>
+        <p>
+          The server installer creates the service group before the service user, so it no longer
+          stops with "chown: invalid group" on systems where useradd does not make a group of its
+          own, and an install left over from an earlier release is moved onto that group. The
+          settings and key are readable only by the service user.
+        </p>
+      </description>
+    </release>
     <release version="0.9.1" date="2026-10-22">
       <description>
         <p>
