@@ -81,11 +81,15 @@ def main() -> int:
     # single square as the base for every size.
     geometry = f"{args.size}x{args.size}"
     base = OUT / ".icon-square.png"
+    # `-background` has to come before the input: it is the colour the SVG is rasterised onto,
+    # and once the file has been read the settings are no longer applied to it. Given afterwards,
+    # the transparent areas around the tile were painted opaque white, which is what a taskbar
+    # then drew as a white square around the icon.
     run(
         "magick",
-        str(source),
         "-background",
         "none",
+        str(source),
         "-gravity",
         "center",
         "-resize",

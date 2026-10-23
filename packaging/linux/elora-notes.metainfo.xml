@@ -25,6 +25,18 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.9.14" date="2026-10-23">
+      <description>
+        <p>
+          The app icon no longer sits on a white square in taskbars and window lists. The icons
+          were rasterised from the tile artwork with the transparent background requested after
+          the file had already been read, so the rounded corners were filled in with opaque white
+          and every place that drew the icon showed the square around it. The icon set — PNGs,
+          the Windows .ico, the macOS .icns and the pixels the window hands to the window
+          manager — is generated again with a real transparent background.
+        </p>
+      </description>
+    </release>
     <release version="0.9.13" date="2026-10-23">
       <description>
         <p>
