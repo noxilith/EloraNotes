@@ -26,6 +26,9 @@ use std::time::{Duration, Instant};
 /// and the editor stop shifting around while the window is resized. It only has to fit
 /// the logo, title and New button now that the other actions live in the footer.
 const SIDEBAR_WIDTH: f32 = 210.0;
+/// Inset of the sidebar's content, in points. Also used to place the divider at the panel edge.
+const SIDEBAR_MARGIN_X: i8 = 12;
+const SIDEBAR_MARGIN_Y: i8 = 10;
 
 /// Height kept free at the bottom of the sidebar for the footer action row.
 const SIDEBAR_FOOTER_HEIGHT: f32 = 34.0;
@@ -2197,73 +2200,79 @@ impl EloraApp {
         let mut picked = CardSelection::default();
         let mut toggled_folder: Option<String> = None;
 
-        ScrollArea::vertical()
-            .id_salt("notes_sidebar_scroll")
-            .max_height(max_height)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                if !pinned_indices.is_empty() {
-                    section_heading(ui, icon::PINNED, "PINNED", p.pin_color);
-                    render_note_rows(
-                        ui,
-                        &self.notes,
-                        &pinned_indices,
-                        self.selected_id.as_deref(),
-                        p,
-                        &self.search_query,
-                        &mut picked,
-                    );
-                    ui.add_space(4.0);
-                }
-
-                for (name, indices) in &folder_groups {
-                    let collapsed = !folders_open && self.collapsed_folders.contains(name);
-                    if folder_header(ui, name, indices.len(), collapsed, p).clicked() {
-                        toggled_folder = Some(name.clone());
-                    }
-                    if !collapsed {
-                        ui.add_space(2.0);
+        // egui puts a floating scroll bar against the right edge of its scroll area, which
+        // inside the panel's margin is the very edge the divider is drawn on. Inset the bar by
+        // the panel margin so it reads as a scrollbar in the note column, not a line on the seam.
+        ui.scope(|ui| {
+            ui.spacing_mut().scroll.bar_outer_margin = SIDEBAR_MARGIN_X as f32;
+            ScrollArea::vertical()
+                .id_salt("notes_sidebar_scroll")
+                .max_height(max_height)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if !pinned_indices.is_empty() {
+                        section_heading(ui, icon::PINNED, "PINNED", p.pin_color);
                         render_note_rows(
                             ui,
                             &self.notes,
-                            indices,
+                            &pinned_indices,
                             self.selected_id.as_deref(),
                             p,
                             &self.search_query,
                             &mut picked,
                         );
-                        ui.add_space(3.0);
+                        ui.add_space(4.0);
                     }
-                }
 
-                if !unfiled.is_empty() {
-                    if has_folders || !pinned_indices.is_empty() {
-                        section_heading(ui, icon::NOTES, "ALL NOTES", p.fg_muted);
+                    for (name, indices) in &folder_groups {
+                        let collapsed = !folders_open && self.collapsed_folders.contains(name);
+                        if folder_header(ui, name, indices.len(), collapsed, p).clicked() {
+                            toggled_folder = Some(name.clone());
+                        }
+                        if !collapsed {
+                            ui.add_space(2.0);
+                            render_note_rows(
+                                ui,
+                                &self.notes,
+                                indices,
+                                self.selected_id.as_deref(),
+                                p,
+                                &self.search_query,
+                                &mut picked,
+                            );
+                            ui.add_space(3.0);
+                        }
                     }
-                    render_note_rows(
-                        ui,
-                        &self.notes,
-                        &unfiled,
-                        self.selected_id.as_deref(),
-                        p,
-                        &self.search_query,
-                        &mut picked,
-                    );
-                }
 
-                if !trashed_indices.is_empty() {
-                    section_heading(ui, icon::TRASH, "TRASH", p.fg_muted);
-                    render_note_rows(
-                        ui,
-                        &self.notes,
-                        &trashed_indices,
-                        self.selected_id.as_deref(),
-                        p,
-                        &self.search_query,
-                        &mut picked,
-                    );
-                }
-            });
+                    if !unfiled.is_empty() {
+                        if has_folders || !pinned_indices.is_empty() {
+                            section_heading(ui, icon::NOTES, "ALL NOTES", p.fg_muted);
+                        }
+                        render_note_rows(
+                            ui,
+                            &self.notes,
+                            &unfiled,
+                            self.selected_id.as_deref(),
+                            p,
+                            &self.search_query,
+                            &mut picked,
+                        );
+                    }
+
+                    if !trashed_indices.is_empty() {
+                        section_heading(ui, icon::TRASH, "TRASH", p.fg_muted);
+                        render_note_rows(
+                            ui,
+                            &self.notes,
+                            &trashed_indices,
+                            self.selected_id.as_deref(),
+                            p,
+                            &self.search_query,
+                            &mut picked,
+                        );
+                    }
+                });
+        });
 
         if let Some(folder) = toggled_folder {
             if !self.collapsed_folders.remove(&folder) {
@@ -3541,33 +3550,41 @@ impl eframe::App for EloraApp {
         let p = self.theme.palette_with(&self.colors, self.glow_strength);
 
         if !self.focus_mode {
-            let sidebar = egui::SidePanel::left("elora_sidebar")
+            egui::SidePanel::left("elora_sidebar")
                 .resizable(false)
                 .exact_width(SIDEBAR_WIDTH)
+                // The panel's own separator line is a full border-coloured stroke at the very
+                // edge; the divider drawn below replaces it with one mixed towards the sidebar,
+                // so the two do not stack into a thick, bright seam.
+                .show_separator_line(false)
                 // The divider is painted inside the panel below instead of as a frame stroke:
                 // a stroke straddles the panel boundary, which at fractional display scales
                 // leaves a canvas-coloured pixel between the fill and the line.
                 .frame(
                     Frame::new()
                         .fill(p.bg_sidebar)
-                        .inner_margin(Margin::symmetric(12, 10)),
+                        .inner_margin(Margin::symmetric(SIDEBAR_MARGIN_X, SIDEBAR_MARGIN_Y)),
                 )
                 .show(ctx, |ui| {
                     self.render_sidebar(ui, &p);
+
+                    // The panel's fill is painted before this closure runs, so a divider drawn
+                    // here stays on top of it. The content ui clips to the panel, which is the
+                    // rect the line belongs to: full height, on the panel's right edge.
+                    let ppp = ctx.pixels_per_point();
+                    let panel = ui.clip_rect();
+                    let right = (panel.right() * ppp).round() / ppp;
+                    // A full-strength border line between two dark fills reads as a bright
+                    // seam, so it is mixed towards the sidebar side of it.
+                    ui.painter().with_clip_rect(panel).rect_filled(
+                        egui::Rect::from_min_max(
+                            Pos2::new(right - 1.0 / ppp, panel.top()),
+                            Pos2::new(right, panel.bottom()),
+                        ),
+                        0.0,
+                        mix_color(p.border, p.bg_sidebar, 0.55),
+                    );
                 });
-            let rect = sidebar.response.rect;
-            let ppp = ctx.pixels_per_point();
-            let right = (rect.right() * ppp).round() / ppp;
-            // A full-strength border line between two dark fills reads as a bright seam, so
-            // the divider is mixed towards the sidebar side of it.
-            ctx.layer_painter(egui::LayerId::background()).rect_filled(
-                egui::Rect::from_min_max(
-                    Pos2::new(right - 1.0 / ppp, rect.top()),
-                    Pos2::new(right, rect.bottom()),
-                ),
-                0.0,
-                mix_color(p.border, p.bg_sidebar, 0.55),
-            );
         }
 
         egui::CentralPanel::default()

@@ -336,6 +336,19 @@ impl ThemeMode {
         style.spacing.button_padding = egui::vec2(10.0, 5.0);
         style.spacing.window_margin = Margin::same(12);
 
+        // egui's default floating scroll bar paints its handle in the widget text colour at 60%
+        // opacity, which over a dark panel reads as a bright line — on the sidebar it hugs the
+        // panel edge and looks like a seam. Keep the same shape, but make the resting handle
+        // faint; it only brightens while it is actually hovered or dragged.
+        let mut scroll = egui::style::ScrollStyle::floating();
+        scroll.floating_width = 3.0;
+        scroll.bar_width = 9.0;
+        scroll.active_handle_opacity = 0.18;
+        scroll.interact_handle_opacity = 0.55;
+        scroll.active_background_opacity = 0.0;
+        scroll.interact_background_opacity = 0.3;
+        style.spacing.scroll = scroll;
+
         let mut visuals = if self.is_dark() {
             Visuals::dark()
         } else {
