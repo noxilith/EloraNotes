@@ -118,8 +118,18 @@ pub enum ClientMsg {
     },
     /// Leave the current room but stay connected to the library.
     Close,
+    /// Create a note in the shared library. Folder, tags and body are optional, so a client that
+    /// only knows a title still works against this server.
     Create {
         title: String,
+        #[serde(default)]
+        folder: Option<String>,
+        #[serde(default)]
+        tags: Vec<String>,
+        #[serde(default)]
+        body: String,
+        #[serde(default)]
+        pinned: bool,
     },
     /// Update the fields that live in the note's frontmatter. `None` means "leave as is".
     Update {
@@ -160,6 +170,10 @@ pub enum ServerMsg {
     /// The whole library after a change, so a client never has to merge metadata itself.
     Notes {
         notes: Vec<NoteMeta>,
+    },
+    /// Sent to the client that asked for a new note, so it can open it straight away.
+    Created {
+        note: NoteMeta,
     },
     /// Who is editing which note, so the sidebar can show a dot on the card.
     Presence {

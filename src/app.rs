@@ -126,6 +126,9 @@ pub struct EloraApp {
     collab_open: Option<String>,
     /// A certificate the server presented that has not been pinned yet: `(fingerprint, address)`.
     trust_prompt: Option<(String, String)>,
+    /// True while waiting for the server to answer a new-note request, so the title field can be
+    /// focused once the note exists.
+    pending_new_note_focus: bool,
     confirm_delete_id: Option<String>,
     command_palette_open: bool,
     icon_picker_open: bool,
@@ -307,6 +310,7 @@ impl EloraApp {
             remote_bodies: BTreeMap::new(),
             collab_open: None,
             trust_prompt: None,
+            pending_new_note_focus: false,
             edit_history: BTreeMap::new(),
             last_seen_body: None,
             confirm_delete_id: None,
@@ -1229,6 +1233,43 @@ impl EloraApp {
                     library_changed = true;
                 }
                 Incoming::Notes(_) => library_changed = true,
+                Incoming::Created(note) => {
+                    // Open it straight away: the library broadcast that follows makes it a
+                    // normal shared note in the list.
+                    if !self.notes.iter().any(|n| n.id == note.id) {
+                        self.remote_ids.insert(note.id.clone());
+                        let updated = chrono::TimeZone::timestamp_opt(&Utc, note.updated_at, 0)
+                            .single()
+                            .unwrap_or_else(Utc::now);
+                        self.notes.push(Note {
+                            id: note.id.clone(),
+                            title: note.title.clone(),
+                            body: self
+                                .remote_bodies
+                                .get(&note.id)
+                                .cloned()
+                                .unwrap_or_default(),
+                            pinned: note.pinned,
+                            trashed: note.trashed,
+                            explicit_tags: note.tags.clone(),
+                            icon: note.icon.clone(),
+                            folder: note.folder.clone(),
+                            created_at: updated,
+                            updated_at: updated,
+                            file_path: PathBuf::new(),
+                        });
+                        self.resort();
+                    }
+                    self.selected_id = Some(note.id.clone());
+                    self.sidebar_section = SidebarSection::AllNotes;
+                    if self.pending_new_note_focus {
+                        self.focus_title_next_frame = true;
+                        self.pending_new_note_focus = false;
+                    }
+                    let server = self.collab.server_name().unwrap_or("the server");
+                    self.status_message = Some(format!("Created “{}” on {server}", note.title));
+                    library_changed = true;
+                }
                 Incoming::Offline(reason) => {
                     if self.collab.is_active() {
                         self.status_message = Some(format!("Server: {reason}"));
@@ -1615,6 +1656,30 @@ impl EloraApp {
         if self.sidebar_section == SidebarSection::Trash {
             self.sidebar_section = SidebarSection::AllNotes;
         }
+
+        // With a shared note open, the new note belongs in that library too: it lands in the same
+        // folder, with the same tag, and everyone connected sees it straight away.
+        let shared = self
+            .selected_id
+            .as_deref()
+            .is_some_and(|id| self.is_remote(id));
+        if shared && self.collab.is_connected() {
+            self.collab.create_note(
+                &note.title,
+                note.folder.as_deref(),
+                &note.explicit_tags,
+                &note.body,
+                note.pinned,
+            );
+            self.pending_new_note_focus = true;
+            if self.view_mode == EditorViewMode::Preview {
+                self.view_mode = EditorViewMode::Edit;
+            }
+            let server = self.collab.server_name().unwrap_or("the server");
+            self.status_message = Some(format!("Adding “{}” to {server}…", note.title));
+            return;
+        }
+
         if let Err(e) = self.storage.save_note(&note) {
             self.status_message = Some(format!("Failed to save note: {e}"));
         }
@@ -1660,11 +1725,34 @@ impl EloraApp {
             return;
         }
 
-        let note = Note::new(
-            target_trimmed,
-            "Linked from another note.\n\n#linked",
-            self.storage.root_dir(),
-        );
+        let body = "Linked from another note.\n\n#linked";
+        // A link made from a shared note creates the target in that library as well.
+        let shared_folder = self
+            .selected_id
+            .as_ref()
+            .filter(|id| self.is_remote(id))
+            .and_then(|id| self.notes.iter().find(|n| &n.id == id))
+            .and_then(|n| n.folder.clone());
+        if self.collab.is_connected()
+            && self
+                .selected_id
+                .as_deref()
+                .is_some_and(|id| self.is_remote(id))
+        {
+            self.collab.create_note(
+                target_trimmed,
+                shared_folder.as_deref(),
+                &["linked".to_string()],
+                body,
+                false,
+            );
+            self.pending_new_note_focus = false;
+            let server = self.collab.server_name().unwrap_or("the server");
+            self.status_message = Some(format!("Adding [[{target_trimmed}]] to {server}…"));
+            return;
+        }
+
+        let note = Note::new(target_trimmed, body, self.storage.root_dir());
         let _ = self.storage.save_note(&note);
         let id = note.id.clone();
         self.notes.push(note);
@@ -2391,7 +2479,17 @@ impl EloraApp {
                         .fill(p.accent)
                         .corner_radius(CornerRadius::same(6)),
                     )
-                    .on_hover_text("Create new note (Ctrl+N)");
+                    .on_hover_text(match self.collab.server_name() {
+                        Some(server)
+                            if self
+                                .selected_id
+                                .as_deref()
+                                .is_some_and(|id| self.is_remote(id)) =>
+                        {
+                            format!("Create a note in the shared library on {server} (Ctrl+N)")
+                        }
+                        _ => "Create new note (Ctrl+N)".to_string(),
+                    });
                 if new_btn.clicked() {
                     self.create_note_from_template(NoteTemplate::Blank);
                 }

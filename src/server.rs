@@ -297,12 +297,19 @@ impl Server {
                 self.leave_room(client);
                 Ok(())
             }
-            ClientMsg::Create { title } => {
-                {
+            ClientMsg::Create {
+                title,
+                folder,
+                tags,
+                body,
+                pinned,
+            } => {
+                let meta = {
                     let mut library = self.library.lock().map_err(|_| "library poisoned")?;
-                    library.create(&title)?;
-                }
+                    library.create(&title, folder, tags, &body, pinned)?
+                };
                 self.broadcast_library();
+                self.push(client, FRAME_JSON, json(&ServerMsg::Created { note: meta }));
                 Ok(())
             }
             ClientMsg::Update {
@@ -611,7 +618,14 @@ impl Library {
         notes
     }
 
-    fn create(&mut self, title: &str) -> Result<NoteMeta, String> {
+    fn create(
+        &mut self,
+        title: &str,
+        folder: Option<String>,
+        tags: Vec<String>,
+        body: &str,
+        pinned: bool,
+    ) -> Result<NoteMeta, String> {
         let title = title.trim();
         let title = if title.is_empty() { "Untitled" } else { title };
         let now = Utc::now();
@@ -619,15 +633,30 @@ impl Library {
         let meta = NoteMeta {
             id: id.clone(),
             title: title.to_string(),
-            folder: None,
-            tags: Vec::new(),
-            pinned: false,
+            folder: folder.filter(|f| !f.trim().is_empty()),
+            tags: tags
+                .into_iter()
+                .filter_map(|t| {
+                    let tag = crate::storage::normalize_tag(&t);
+                    if tag.is_empty() {
+                        None
+                    } else {
+                        Some(tag)
+                    }
+                })
+                .collect(),
+            pinned,
             trashed: false,
             icon: None,
             updated_at: now.timestamp(),
         };
-        self.notes.insert(id.clone(), meta.clone());
-        self.write(&id)?;
+        // Written straight to disk: there is no room for this note yet, and the first client to
+        // open it starts from this body.
+        let note = note_from_meta(&meta, body.to_string());
+        let path = self.dir.join(format!("{id}.md"));
+        std::fs::write(&path, note.to_markdown())
+            .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+        self.notes.insert(id, meta.clone());
         Ok(meta)
     }
 
@@ -889,7 +918,9 @@ mod tests {
     fn test_library_creates_and_persists_markdown() {
         let dir = temp_dir("library");
         let mut library = Library::load(&dir).unwrap();
-        let meta = library.create("Meeting notes").unwrap();
+        let meta = library
+            .create("Meeting notes", None, Vec::new(), "", false)
+            .unwrap();
         assert!(meta.id.starts_with("meeting-notes-"));
         let path = dir.join(format!("{}.md", meta.id));
         assert!(path.is_file());
@@ -900,10 +931,34 @@ mod tests {
     }
 
     #[test]
+    fn test_library_creates_with_folder_tags_and_body() {
+        let dir = temp_dir("create");
+        let mut library = Library::load(&dir).unwrap();
+        let meta = library
+            .create(
+                "Plan",
+                Some("Team".to_string()),
+                vec!["#plan".to_string(), "  ".to_string()],
+                "written by the client",
+                false,
+            )
+            .unwrap();
+        assert_eq!(meta.folder.as_deref(), Some("Team"));
+        assert_eq!(meta.tags, vec!["plan".to_string()]);
+        let raw = std::fs::read_to_string(dir.join(format!("{}.md", meta.id))).unwrap();
+        assert!(raw.contains("folder: \"Team\""), "frontmatter: {raw:?}");
+        assert!(raw.contains("tags: [plan]"), "frontmatter: {raw:?}");
+        assert!(raw.contains("written by the client"), "body: {raw:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_document_round_trips_through_the_server() {
         let dir = temp_dir("doc");
         let mut library = Library::load(&dir).unwrap();
-        let meta = library.create("Shared").unwrap();
+        let meta = library
+            .create("Shared", None, Vec::new(), "", false)
+            .unwrap();
         library.open(&meta.id).unwrap();
         {
             let room = library.rooms.get_mut(&meta.id).unwrap();
@@ -922,7 +977,7 @@ mod tests {
     fn test_metadata_update_survives_reload() {
         let dir = temp_dir("meta");
         let mut library = Library::load(&dir).unwrap();
-        let meta = library.create("Tags").unwrap();
+        let meta = library.create("Tags", None, Vec::new(), "", false).unwrap();
         library
             .update(
                 &meta.id,

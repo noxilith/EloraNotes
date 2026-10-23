@@ -191,6 +191,56 @@ fn test_two_clients_edit_the_same_note() {
         !body.is_empty() && body.ends_with('B')
     });
 
+    // Alice adds a note to a folder in the shared library; everyone sees it and the body and
+    // frontmatter land in a plain Markdown file.
+    alice.create_note(
+        "New Plan",
+        Some("Team"),
+        &["plan".to_string()],
+        "the body Alice wrote",
+        true,
+    );
+    let mut created_id = None;
+    let mut waited = 0;
+    while created_id.is_none() && waited < 800 {
+        for event in alice.poll() {
+            match event {
+                Incoming::Created(note) => {
+                    assert_eq!(note.title, "New Plan");
+                    assert_eq!(note.folder.as_deref(), Some("Team"));
+                    assert_eq!(note.tags, vec!["plan".to_string()]);
+                    assert!(note.pinned);
+                    created_id = Some(note.id);
+                }
+                Incoming::Body { .. } => {}
+                Incoming::Offline(reason) => panic!("alice went offline: {reason}"),
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        waited += 10;
+    }
+    let created_id = created_id.expect("the server should report the new note");
+    settle(&mut bob, &mut bob_body, "bob library", |c, _| {
+        c.notes()
+            .iter()
+            .any(|m| m.id == created_id && m.title == "New Plan")
+    });
+    let created_path = harness.dir.join("notes").join(format!("{created_id}.md"));
+    let created_raw = std::fs::read_to_string(&created_path).expect("the new note file");
+    assert!(
+        created_raw.contains("folder: \"Team\""),
+        "frontmatter: {created_raw:?}"
+    );
+    assert!(
+        created_raw.contains("tags: [plan]"),
+        "frontmatter: {created_raw:?}"
+    );
+    assert!(
+        created_raw.contains("the body Alice wrote"),
+        "body: {created_raw:?}"
+    );
+
     // Everyone left but the viewer: presence goes away again.
     alice.disconnect();
     bob.disconnect();

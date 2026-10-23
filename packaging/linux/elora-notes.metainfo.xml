@@ -25,6 +25,17 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.9.4" date="2026-10-22">
+      <description>
+        <p>
+          With a shared note open, New (and the daily-note, template and wiki-link actions) now
+          creates the note in the server's library instead of on your own disk: it joins the same
+          folder, keeps the tag you are filtering by, and appears on everyone's sidebar straight
+          away. The server writes it as an ordinary Markdown file with the folder, tags and body
+          the client sent.
+        </p>
+      </description>
+    </release>
     <release version="0.9.3" date="2026-10-22">
       <description>
         <p>

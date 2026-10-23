@@ -133,6 +133,8 @@ pub enum Incoming {
         fingerprint: String,
     },
     Notes(Vec<NoteMeta>),
+    /// The note this client just asked for, so it can be opened right away.
+    Created(NoteMeta),
     Presence(Vec<(String, Vec<PresenceUser>)>),
     /// The body of the open note, after a remote change.
     Body {
@@ -146,11 +148,25 @@ pub enum Incoming {
 enum Command {
     Open(String),
     Close,
-    Body { text: String },
+    Body {
+        text: String,
+    },
     Cursor(usize),
-    Create(String),
-    Update { id: String, meta: NoteMeta },
-    Delete { id: String, permanent: bool },
+    Create {
+        title: String,
+        folder: Option<String>,
+        tags: Vec<String>,
+        body: String,
+        pinned: bool,
+    },
+    Update {
+        id: String,
+        meta: NoteMeta,
+    },
+    Delete {
+        id: String,
+        permanent: bool,
+    },
     Stop,
 }
 
@@ -344,7 +360,7 @@ impl Collab {
                 self.peers.clear();
                 self.presence.clear();
             }
-            Incoming::Body { .. } => {}
+            Incoming::Body { .. } | Incoming::Created(_) => {}
         }
     }
 
@@ -404,8 +420,22 @@ impl Collab {
         self.sent_body = Some((id.to_string(), body.to_string()));
     }
 
-    pub fn create_note(&mut self, title: &str) {
-        self.send(Command::Create(title.to_string()));
+    /// Asks the server for a new note. The answer arrives as [`Incoming::Created`].
+    pub fn create_note(
+        &mut self,
+        title: &str,
+        folder: Option<&str>,
+        tags: &[String],
+        body: &str,
+        pinned: bool,
+    ) {
+        self.send(Command::Create {
+            title: title.to_string(),
+            folder: folder.map(str::to_string),
+            tags: tags.to_vec(),
+            body: body.to_string(),
+            pinned,
+        });
     }
 
     pub fn update_note(&mut self, meta: &NoteMeta) {
@@ -639,7 +669,19 @@ impl Session {
                 self.last_cursor_sent = Some(byte);
                 self.publish_awareness(events, false);
             }
-            Command::Create(title) => self.send_msg(&ClientMsg::Create { title })?,
+            Command::Create {
+                title,
+                folder,
+                tags,
+                body,
+                pinned,
+            } => self.send_msg(&ClientMsg::Create {
+                title,
+                folder,
+                tags,
+                body,
+                pinned,
+            })?,
             Command::Update { id, meta } => self.send_msg(&ClientMsg::Update {
                 id,
                 title: Some(meta.title),
@@ -671,6 +713,9 @@ impl Session {
                 match message {
                     ServerMsg::Notes { notes } => {
                         let _ = events.send(Incoming::Notes(notes));
+                    }
+                    ServerMsg::Created { note } => {
+                        let _ = events.send(Incoming::Created(note));
                     }
                     ServerMsg::Presence { notes } => {
                         let _ = events.send(Incoming::Presence(notes));

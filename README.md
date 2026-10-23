@@ -175,9 +175,15 @@ match the code the installer printed. After that the key is remembered and a dif
 is refused, which is what makes a self-signed server safe to use over the internet.
 
 The server's notes appear in the sidebar in a group titled with the server's name, marked with a
-cloud glyph. Your username is the account you are logged into on your computer. While somebody
-else has a note open, its card shows a coloured dot; when you open it too you see their caret with
-their name, and the words they type appear as they type them.
+cloud glyph.
+
+While a shared note is open, **New** (and the daily-note, template and wiki-link actions) creates
+the note in that library instead of on your disk: it joins the same folder, keeps the tag you are
+filtering by, and appears on everyone's sidebar straight away.
+
+Your username is the account you are logged into on your computer. While somebody else has a note
+open, its card shows a coloured dot; when you open it too you see their caret with their name, and
+the words they type appear as they type them.
 
 Which notes are synced: the note bodies and the library structure (titles, folders, tags, pins,
 trash). Settings, themes and the update check stay on your own machine.
