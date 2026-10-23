@@ -131,7 +131,8 @@ powershell -ExecutionPolicy Bypass -File .\install-elora-server.ps1
 ```
 
 The installer asks for the name people see in their sidebar, the port, and the password everyone
-connects with. It then installs the binary, creates the notes folder, generates the certificate and
+connects with. It installs the binary to `/usr/local/bin/elora-server`, or to
+`/opt/elora-server/elora-server` on a system where `/usr/local` is not writable. It then installs the binary, creates the notes folder, generates the certificate and
 reaches the server at boot (a systemd service on Linux, a startup task on Windows). The server
 listens on all interfaces, so it answers on the LAN and on a public address; the installer opens
 the port in `ufw`, `firewalld` or Windows Firewall when one of those is in charge. Finally it

@@ -25,6 +25,17 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.9.1" date="2026-10-22">
+      <description>
+        <p>
+          The server installer now downloads to a temporary folder before installing, so a
+          read-only /usr/local or a full disk gets a clear message instead of a failed transfer,
+          falls back to /opt/elora-server when /usr/local/bin cannot be written, and checks that
+          the binary it installed actually runs. Settings are written without relying on sudo
+          being present, and the network download reports the reason when it cannot complete.
+        </p>
+      </description>
+    </release>
     <release version="0.9.0" date="2026-10-22">
       <description>
         <p>

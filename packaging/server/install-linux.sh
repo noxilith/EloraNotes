@@ -10,17 +10,20 @@
 set -euo pipefail
 
 RELEASE_URL="https://github.com/noxilith/EloraNotes/releases/latest/download/elora-server-linux-x86_64"
-BINARY="/usr/local/bin/elora-server"
+BINARY=${ELORA_SERVER_BIN:-/usr/local/bin/elora-server}
 SERVICE="/etc/systemd/system/elora-server.service"
 SERVICE_USER="elora"
-DATA_DIR="/var/lib/elora-server"
+DATA_DIR=${ELORA_SERVER_DATA_DIR:-/var/lib/elora-server}
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 if [ "$(id -u)" -ne 0 ]; then
-    fail "run this with sudo: sudo $0"
+    fail "run this with root rights (for example: sudo bash $0)"
 fi
+
+command -v systemctl >/dev/null 2>&1 \
+    || fail "this machine has no systemd, so the installer cannot register the service"
 
 # --- what the server should be called ------------------------------------------------------
 read -r -p "Server name (shown in everyone's sidebar) [EloraNotes]: " SERVER_NAME
@@ -45,39 +48,71 @@ read -r -s -p "Repeat the password: " PASSWORD_AGAIN; say
 [ -n "$PASSWORD" ] || fail "the password cannot be empty"
 [ "$PASSWORD" = "$PASSWORD_AGAIN" ] || fail "the passwords did not match"
 
+# --- where the binary goes -----------------------------------------------------------------
+# /usr/local/bin is not writable on every system (immutable roots, NixOS), and a failed download
+# must not be the way people find that out, so the destination is checked first.
+BIN_DIR=$(dirname -- "$BINARY")
+mkdir -p "$BIN_DIR" 2>/dev/null || true
+if [ ! -d "$BIN_DIR" ] || ! touch "$BIN_DIR/.elora-write-test" 2>/dev/null; then
+    rm -f "$BIN_DIR/.elora-write-test" 2>/dev/null || true
+    BINARY="/opt/elora-server/elora-server"
+    BIN_DIR=$(dirname -- "$BINARY")
+    say "$ELORA_SERVER_BIN is not writable here; installing the server to $BINARY instead."
+    mkdir -p "$BIN_DIR" || fail "could not create $BIN_DIR"
+fi
+rm -f "$BIN_DIR/.elora-write-test" 2>/dev/null || true
+
 # --- the binary ----------------------------------------------------------------------------
+# The download goes to a temporary folder first: writing next to the destination fails on a
+# read-only filesystem, and a half-written file must never end up being installed.
+WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/elora-server.XXXXXX") \
+    || fail "could not create a temporary folder in ${TMPDIR:-/tmp}"
+trap 'rm -rf "$WORK_DIR"' EXIT
+
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+STAGED=""
 if [ -x "$SCRIPT_DIR/elora-server" ]; then
     say "Using $SCRIPT_DIR/elora-server"
-    install -m 0755 "$SCRIPT_DIR/elora-server" "$BINARY"
+    STAGED="$SCRIPT_DIR/elora-server"
 elif [ -x "$SCRIPT_DIR/elora-server-linux-x86_64" ]; then
     say "Using $SCRIPT_DIR/elora-server-linux-x86_64"
-    install -m 0755 "$SCRIPT_DIR/elora-server-linux-x86_64" "$BINARY"
+    STAGED="$SCRIPT_DIR/elora-server-linux-x86_64"
 else
+    free_mb=$(df -Pk "$WORK_DIR" | awk 'NR == 2 { print int($4 / 1024) }')
+    if [ -n "$free_mb" ] && [ "$free_mb" -lt 20 ]; then
+        fail "only ${free_mb} MB free in $WORK_DIR; the server needs about 20 MB while it downloads"
+    fi
     say "Downloading the server from the latest EloraNotes release…"
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --retry 3 -o "$BINARY.download" "$RELEASE_URL" \
-            || fail "could not download $RELEASE_URL (pass the binary next to this script instead)"
+        curl -fsSL --retry 3 --retry-delay 2 \
+            -o "$WORK_DIR/elora-server" "$RELEASE_URL" \
+            || fail "could not download $RELEASE_URL (check that this machine can reach github.com; you can also put the elora-server binary next to this script and run it again)"
     elif command -v wget >/dev/null 2>&1; then
-        wget -q -O "$BINARY.download" "$RELEASE_URL" \
-            || fail "could not download $RELEASE_URL (pass the binary next to this script instead)"
+        wget -q -O "$WORK_DIR/elora-server" "$RELEASE_URL" \
+            || fail "could not download $RELEASE_URL (check that this machine can reach github.com; you can also put the elora-server binary next to this script and run it again)"
     else
         fail "neither curl nor wget is installed; put the elora-server binary next to this script"
     fi
-    install -m 0755 "$BINARY.download" "$BINARY"
-    rm -f "$BINARY.download"
+    STAGED="$WORK_DIR/elora-server"
 fi
+
+[ -s "$STAGED" ] || fail "the server binary is empty; something went wrong while fetching it"
+install -m 0755 "$STAGED" "$BINARY" || fail "could not install the server to $BINARY"
+"$BINARY" --help >/dev/null 2>&1 \
+    || fail "$BINARY does not run on this machine (wrong CPU architecture or a corrupt download)"
 
 # --- a user and folder of its own, so the server never runs as root -------------------------
 if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
     useradd --system --home-dir "$DATA_DIR" --shell /usr/sbin/nologin "$SERVICE_USER"
 fi
-install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$DATA_DIR"
+install -d -m 0750 "$DATA_DIR"
 
+# The settings, certificate and notes are written here as root and handed to the service user
+# afterwards, so the script never has to switch users (sudo is not always installed).
 say "Writing the settings and the certificate…"
-printf '%s\n' "$PASSWORD" | sudo -u "$SERVICE_USER" \
-    env ELORA_SERVER_DIR="$DATA_DIR" \
+printf '%s\n' "$PASSWORD" | ELORA_SERVER_DIR="$DATA_DIR" \
     "$BINARY" init --name "$SERVER_NAME" --port "$PORT" --password-stdin
+chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR"
 
 # --- service -------------------------------------------------------------------------------
 cat >"$SERVICE" <<UNIT
@@ -139,6 +174,7 @@ if [ -n "$FINGERPRINT" ]; then
     say "  Certificate code clients confirm: $FINGERPRINT"
 fi
 say ""
+say "Server binary: $BINARY"
 say "Notes live in $DATA_DIR/notes. Manage the service with:"
 say "  systemctl status elora-server     systemctl restart elora-server"
 say "  journalctl -u elora-server -f     (live log)"

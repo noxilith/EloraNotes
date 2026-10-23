@@ -63,16 +63,28 @@ $localBinary = Join-Path $PSScriptRoot "elora-server.exe"
 if (-not (Test-Path $localBinary)) {
     $localBinary = Join-Path $PSScriptRoot "elora-server-windows-x86_64.exe"
 }
+# The download goes to a temporary file first, so a failed transfer can never leave a
+# half-written server in place.
+$staged = Join-Path $env:TEMP "elora-server-download.exe"
 if (Test-Path $localBinary) {
     Write-Host "Using $localBinary"
-    Copy-Item -Force $localBinary $Binary
+    Copy-Item -Force $localBinary $staged
 } else {
     Write-Host "Downloading the server from the latest EloraNotes release..."
     try {
-        Invoke-WebRequest -Uri $ReleaseUrl -OutFile $Binary -UseBasicParsing
+        Invoke-WebRequest -Uri $ReleaseUrl -OutFile $staged -UseBasicParsing
     } catch {
         Fail "could not download the server: $($_.Exception.Message). Put elora-server.exe next to this script instead."
     }
+}
+if (-not (Test-Path $staged) -or (Get-Item $staged).Length -lt 1000000) {
+    Fail "the downloaded server looks incomplete; check the connection and try again"
+}
+Copy-Item -Force $staged $Binary
+Remove-Item -Force $staged -ErrorAction SilentlyContinue
+& $Binary --help *> $null
+if ($LASTEXITCODE -ne 0) {
+    Fail "$Binary does not run on this machine (wrong CPU architecture or a corrupt download)"
 }
 
 # Stop an older install before replacing its files.
@@ -128,5 +140,6 @@ if ($fingerprint) {
     Write-Host "  Certificate code clients confirm: $fingerprint"
 }
 Write-Host ""
+Write-Host "Server binary: $Binary"
 Write-Host "Notes live in $InstallDir\notes."
 Write-Host "Manage it with: Start-ScheduledTask -TaskName `"$TaskName`" / Stop-ScheduledTask -TaskName `"$TaskName`""
