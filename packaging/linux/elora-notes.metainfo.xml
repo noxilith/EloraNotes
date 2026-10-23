@@ -25,6 +25,22 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.9.18" date="2026-10-23">
+      <description>
+        <p>
+          Pictures in shared notes now travel reliably. The frames that carry them were added
+          without a protocol version bump, so a server from before picture sharing accepted the
+          connection and dropped every picture without saying anything: the note’s text arrived
+          for everyone, the picture only for the computer that added it. The protocol is now
+          version 3, so an older server is refused at connect with a message to update it (and an
+          older client is refused the same way) instead of losing the picture quietly.
+        </p>
+        <p>
+          Note cards in the sidebar can drop their preview line from Settings, leaving the title,
+          date and tags on a shorter card, so more notes fit in the list at once.
+        </p>
+      </description>
+    </release>
     <release version="0.9.17" date="2026-10-23">
       <description>
         <p>

@@ -93,6 +93,10 @@ pub struct AppSettings {
     /// name on this computer".
     #[serde(default)]
     pub display_name: String,
+    /// Whether a card in the sidebar shows the first lines of its note. Turning it off leaves
+    /// just the title, the date and the tags, so more notes fit in the list.
+    #[serde(default = "default_show_card_previews")]
+    pub show_card_previews: bool,
 }
 
 fn default_highlight_rgb() -> [u8; 3] {
@@ -111,6 +115,10 @@ fn default_glow_strength() -> f32 {
     0.6
 }
 
+fn default_show_card_previews() -> bool {
+    true
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -125,6 +133,7 @@ impl Default for AppSettings {
             collapsed_folders: Vec::new(),
             server: Default::default(),
             display_name: String::new(),
+            show_card_previews: default_show_card_previews(),
         }
     }
 }

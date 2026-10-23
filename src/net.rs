@@ -50,7 +50,11 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Field<T> {
 
 /// Bumped whenever a message changes shape in a way an older peer cannot read.
 /// Version 2 tags every Yjs sync frame with the note it belongs to.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// Version 3 adds the frames that carry a shared note's pictures. A version-2 server has no
+/// handler for them and drops them without a word, so a client that can share pictures must
+/// not pair with one: the picture would quietly never reach the library, which is why this
+/// went to 3 rather than staying at 2.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Prefixes a Yjs sync payload with the id of the note it belongs to.
 ///

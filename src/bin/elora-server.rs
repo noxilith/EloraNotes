@@ -19,11 +19,13 @@ USAGE:
     elora-server run
     elora-server fingerprint
     elora-server show
+    elora-server version
 
 COMMANDS:
     init         Ask for (or take) the settings, write the config, create the TLS certificate.
     run          Serve the notes. This is what the installers start at boot.
     fingerprint  Print the short code clients are asked to confirm.
+    version      Print the version of this server, so the build in use can be checked.
     show         Print the saved settings and the addresses other machines can use.
 ";
 
@@ -41,6 +43,10 @@ fn main() -> ExitCode {
         "init" => init(rest),
         "fingerprint" | "fp" => fingerprint(),
         "show" | "info" => show(),
+        "version" | "--version" | "-V" => {
+            println!("elora-server {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         "-h" | "--help" | "help" => {
             print!("{USAGE}");
             Ok(())

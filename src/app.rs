@@ -108,6 +108,8 @@ pub struct EloraApp {
     focus_mode: bool,
     view_mode: EditorViewMode,
     show_formatting_bar: bool,
+    /// Whether note cards in the sidebar show a line of the note's text under the title.
+    show_card_previews: bool,
     /// Current glow highlight color `[R, G, B]` selected by the user's color picker.
     highlight_rgb: [u8; 3],
     /// Color used by the toolbar's "Text Color" button for the next wrapped selection.
@@ -356,6 +358,7 @@ impl EloraApp {
             focus_mode: false,
             view_mode: EditorViewMode::Split,
             show_formatting_bar: settings.show_formatting_bar,
+            show_card_previews: settings.show_card_previews,
             highlight_rgb: settings.highlight_rgb,
             colors: settings.colors,
             font_size: settings.font_size,
@@ -409,6 +412,7 @@ impl EloraApp {
         let settings = AppSettings {
             theme_name: self.theme.name().to_string(),
             show_formatting_bar: self.show_formatting_bar,
+            show_card_previews: self.show_card_previews,
             highlight_rgb: self.highlight_rgb,
             text_color_rgb: self.text_color_rgb,
             font_size: self.font_size,
@@ -837,6 +841,16 @@ impl EloraApp {
                         changed |= ui
                             .checkbox(&mut self.show_formatting_bar, "Show formatting bar")
                             .changed();
+                        changed |= ui
+                            .checkbox(
+                                &mut self.show_card_previews,
+                                "Show a preview line on note cards",
+                            )
+                            .on_hover_text(
+                                "Turn this off to leave just the title, date and tags, so the \
+                                 sidebar's cards are shorter and more notes fit at once",
+                            )
+                            .changed();
                         ui.separator();
 
                         ui.label(RichText::new("Notes folder").strong());
@@ -904,6 +918,7 @@ impl EloraApp {
                             self.glow_strength = d.glow_strength;
                             self.highlight_rgb = d.highlight_rgb;
                             self.show_formatting_bar = d.show_formatting_bar;
+                            self.show_card_previews = d.show_card_previews;
                             changed = true;
                         }
                     });
@@ -3333,6 +3348,7 @@ impl EloraApp {
                             Some(&self.collab),
                             &mut picked,
                             0,
+                            self.show_card_previews,
                         );
                         ui.add_space(4.0);
                     }
@@ -3371,6 +3387,7 @@ impl EloraApp {
                                     Some(&self.collab),
                                     &mut picked,
                                     SIDEBAR_INDENT_STEP,
+                                    self.show_card_previews,
                                 );
                             }
                             for (name, indices) in &remote_folders {
@@ -3394,6 +3411,7 @@ impl EloraApp {
                                         Some(&self.collab),
                                         &mut picked,
                                         SIDEBAR_INDENT_STEP * 2,
+                                        self.show_card_previews,
                                     );
                                 }
                             }
@@ -3418,6 +3436,7 @@ impl EloraApp {
                                 Some(&self.collab),
                                 &mut picked,
                                 SIDEBAR_INDENT_STEP,
+                                self.show_card_previews,
                             );
                             ui.add_space(3.0);
                         }
@@ -3437,6 +3456,7 @@ impl EloraApp {
                             Some(&self.collab),
                             &mut picked,
                             0,
+                            self.show_card_previews,
                         );
                     }
 
@@ -3452,6 +3472,7 @@ impl EloraApp {
                             Some(&self.collab),
                             &mut picked,
                             0,
+                            self.show_card_previews,
                         );
                     }
                 });
@@ -5509,6 +5530,7 @@ fn render_note_rows(
     collab: Option<&Collab>,
     picked: &mut CardSelection,
     indent: i8,
+    show_preview: bool,
 ) {
     indented(ui, indent, |ui| {
         for &idx in indices {
@@ -5516,7 +5538,9 @@ fn render_note_rows(
             let is_selected = selected_id == Some(note.id.as_str());
             let watchers: &[PresenceUser] =
                 collab.map(|c| c.watchers(&note.id)).unwrap_or_default();
-            if let Some(action) = render_note_card(ui, note, is_selected, p, query, watchers) {
+            if let Some(action) =
+                render_note_card(ui, note, is_selected, p, query, watchers, show_preview)
+            {
                 match action {
                     CardAction::SelectNote(id) => picked.note_id = Some(id),
                     CardAction::FilterTag(t) => picked.tag = Some(t),
@@ -5534,6 +5558,7 @@ fn render_note_card(
     p: &Palette,
     query: &str,
     watchers: &[PresenceUser],
+    show_preview: bool,
 ) -> Option<CardAction> {
     let mut action = None;
     let bg = if is_selected {
@@ -5594,11 +5619,15 @@ fn render_note_card(
                 }
             });
 
-            let excerpt = note.body_snippet(query).unwrap_or_else(|| note.snippet());
-            ui.add(
-                egui::Label::new(RichText::new(excerpt).size(11.5).color(p.fg_secondary))
-                    .truncate(),
-            );
+            // The preview line is what makes a card tall; without it the title, date and tags
+            // are all that is left, so more notes fit in the list.
+            if show_preview {
+                let excerpt = note.body_snippet(query).unwrap_or_else(|| note.snippet());
+                ui.add(
+                    egui::Label::new(RichText::new(excerpt).size(11.5).color(p.fg_secondary))
+                        .truncate(),
+                );
+            }
 
             let tags = note.all_tags();
             let (done_tasks, total_tasks) = note.task_progress();
@@ -6312,6 +6341,54 @@ mod tests {
         assert!(
             strip >= 9.0,
             "the bar needs a strip of its own at the right, but only {strip} points are kept free"
+        );
+    }
+
+    /// Turning the preview line off leaves a shorter card, so more notes fit in the sidebar.
+    #[test]
+    fn test_hiding_the_preview_line_makes_note_cards_shorter() {
+        let ctx = egui::Context::default();
+        install_tabler_icons(&ctx);
+        let p = ThemeMode::Obsidian.palette();
+        let now = Utc::now();
+        let note = Note {
+            id: "card".into(),
+            title: "Card".into(),
+            body: "A line of the note that the card preview would show.".into(),
+            pinned: false,
+            trashed: false,
+            explicit_tags: vec!["tag".into()],
+            icon: None,
+            folder: None,
+            created_at: now,
+            updated_at: now,
+            file_path: PathBuf::new(),
+        };
+        let height = |show_preview: bool| {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(210.0, 300.0))),
+                ..Default::default()
+            };
+            let mut drawn = 0.0;
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default()
+                    .frame(Frame::new().inner_margin(Margin::ZERO))
+                    .show(ctx, |ui| {
+                        render_note_card(ui, &note, false, &p, "", &[], show_preview);
+                        drawn = ctx
+                            .read_response(Id::new(("note_card", &note.id)))
+                            .map(|response| response.rect.height())
+                            .unwrap_or(0.0);
+                    });
+            });
+            drawn
+        };
+
+        let with = height(true);
+        let without = height(false);
+        assert!(
+            with - without > 8.0,
+            "the preview line should account for a line of the card: {with} against {without}"
         );
     }
 
@@ -7070,6 +7147,88 @@ mod tests {
         });
 
         app.collab.disconnect();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A picture put into a shared note reaches the other computer: the note's text names it,
+    /// the library keeps its bytes, and the other app asks for what it has not got and writes
+    /// the answer into its own pictures folder, where the preview looks.
+    #[test]
+    fn test_a_picture_added_to_a_shared_note_reaches_the_other_computer() {
+        let (dir, port, shared_id) = start_shared_server("shared-picture");
+        let ctx = egui::Context::default();
+        let storage = |who: &str| NoteStorage::new(dir.join(who)).unwrap();
+        let profile = || ServerProfile {
+            host: "127.0.0.1".into(),
+            port,
+            password: "letmein".into(),
+            fingerprint: None,
+        };
+
+        let mut alice = EloraApp::with_context(&ctx, storage("alice"));
+        let mut bob = EloraApp::with_context(&ctx, storage("bob"));
+        for (app, who) in [(&mut alice, "alice"), (&mut bob, "bob")] {
+            app.server_form = profile();
+            app.connect_server();
+            wait_for_shared(app, &ctx, who, |a| {
+                a.collab.is_connected() && !a.collab.notes().is_empty()
+            });
+            app.selected_id = Some(shared_id.clone());
+            app.sync_open_note();
+            wait_for_shared(app, &ctx, who, |a| shared_body(a, &shared_id) == "hello");
+        }
+
+        // Alice puts a picture into the shared note, the way the picture button does.
+        let picture = b"\x89PNG a little picture".to_vec();
+        let idx = alice
+            .notes
+            .iter()
+            .position(|n| n.id == shared_id)
+            .expect("the shared note");
+        alice
+            .insert_picture(idx, &picture, "holiday", "png")
+            .expect("the picture is added to the note");
+
+        let body = shared_body(&alice, &shared_id);
+        let name = picture_references(&body)
+            .into_iter()
+            .next()
+            .expect("the note should name the picture it just gained");
+
+        // The library keeps the bytes, so the picture outlives this computer.
+        let stored = dir.join("notes").join("attachments").join(&name);
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline && !stored.is_file() {
+            alice.poll_collab(&ctx);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            stored.is_file(),
+            "the picture should be in the library: {} was never written",
+            stored.display()
+        );
+
+        // Bob's copy of the note names the picture, though his computer has never had it.
+        wait_for_shared(&mut bob, &ctx, "bob's note text", |a| {
+            shared_body(a, &shared_id).contains(&name)
+        });
+        assert!(!bob.attachments_dir().join(&name).is_file());
+
+        // Opening the note asks the library for it, and the answer is kept beside Bob's notes.
+        bob.request_shared_pictures(&body);
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline && !bob.attachments_dir().join(&name).is_file() {
+            bob.poll_collab(&ctx);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let arrived = std::fs::read(bob.attachments_dir().join(&name)).unwrap_or_default();
+        assert_eq!(
+            arrived, picture,
+            "the picture should arrive byte for byte on the other computer"
+        );
+
+        alice.collab.disconnect();
+        bob.collab.disconnect();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
