@@ -25,6 +25,32 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.9.15" date="2026-10-23">
+      <description>
+        <p>
+          Pictures can now be put into a note without writing Markdown by hand: the new picture
+          button in the formatting bar opens the file chooser, a picture dropped on the window
+          joins the note, and a screenshot pasted with Ctrl+V lands at the caret. Pictures keep
+          their proportions and are resized by dragging the square in their bottom-right corner
+          in Preview or Split; the size is written into the note as {width=…} so it survives a
+          restart. Each picture is copied into an attachments folder beside the notes and named
+          after its contents, so the same picture is stored once and two people's screenshots
+          never collide.
+        </p>
+        <p>
+          Pictures in a shared note are now stored on the server too, so everyone with the
+          library sees them and they are still there after the computer that added them is gone.
+          A picture added before a note is moved to the server goes with it, and Copy to this
+          computer brings the pictures along. The server’s notes folder stays an ordinary
+          EloraNotes library, pictures included.
+        </p>
+        <p>
+          A connection that cannot be made now gives up after a few seconds and says why in
+          Settings (timeout, refused, unknown host) instead of staying on “Connecting…” for
+          minutes, with a note about the port, the firewall and the router.
+        </p>
+      </description>
+    </release>
     <release version="0.9.14" date="2026-10-23">
       <description>
         <p>

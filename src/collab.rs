@@ -8,8 +8,8 @@
 //! Events come back through a channel and are drained once per frame by [`Collab::poll`].
 
 use crate::net::{
-    self, ClientMsg, Field, NoteMeta, PresenceUser, ServerMsg, FRAME_AWARENESS, FRAME_JSON,
-    FRAME_SYNC, PROTOCOL_VERSION,
+    self, ClientMsg, Field, NoteMeta, PresenceUser, ServerMsg, ATTACHMENT_ASK, ATTACHMENT_DATA,
+    ATTACHMENT_SEND, FRAME_ATTACHMENT, FRAME_AWARENESS, FRAME_JSON, FRAME_SYNC, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -28,6 +28,10 @@ const FIRST_RETRY: Duration = Duration::from_secs(2);
 const MAX_RETRY: Duration = Duration::from_secs(15);
 /// Cursor updates are throttled: a caret that moves every keystroke does not need every frame.
 const CURSOR_INTERVAL: Duration = Duration::from_millis(120);
+/// How long an address is given to answer when the connection is opened. A port that is
+/// filtered rather than refused (the usual result of a missing port forward) would otherwise
+/// leave the app in "Connecting…" for minutes, which looks like it has hung.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Colours handed out to people editing together, picked to stay readable on both themes.
 pub const PEER_COLORS: [[u8; 3]; 8] = [
@@ -142,6 +146,24 @@ pub enum Incoming {
         text: String,
     },
     Peers(Vec<RemotePeer>),
+    /// A picture the library sent, because this client asked for it.
+    Attachment {
+        name: String,
+        bytes: Vec<u8>,
+    },
+    /// The library does not have that picture (or refused to keep one this client sent).
+    AttachmentMissing {
+        name: String,
+    },
+    /// A picture this client sent is in the library now, so everybody can see it.
+    AttachmentStored {
+        name: String,
+    },
+    /// Somebody else put a picture in the library; a request made before it arrived is worth
+    /// making again.
+    AttachmentAdded {
+        name: String,
+    },
     Offline(String),
 }
 
@@ -202,6 +224,15 @@ enum Command {
         id: String,
         permanent: bool,
     },
+    /// A picture for a shared note, sent to the library.
+    UploadAttachment {
+        name: String,
+        bytes: Vec<u8>,
+    },
+    /// A picture named by a shared note that this computer has not seen yet.
+    FetchAttachment {
+        name: String,
+    },
     Stop,
 }
 
@@ -223,6 +254,8 @@ pub struct Collab {
     sent_body: Option<(String, String)>,
     /// True once a failure has been reported, so the retry loop below it stays quiet.
     offline_reported: bool,
+    /// Why the last connection attempt failed, for Settings to show while it retries.
+    last_error: Option<String>,
     /// Called by the worker when a message arrives, to redraw the window straight away.
     wake: Option<Waker>,
 }
@@ -248,6 +281,7 @@ impl Collab {
             open: None,
             sent_body: None,
             offline_reported: false,
+            last_error: None,
             wake: None,
         }
     }
@@ -296,6 +330,11 @@ impl Collab {
 
     pub fn peers(&self) -> &[RemotePeer] {
         &self.peers
+    }
+
+    /// Why the last connection attempt failed, when it did.
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
     }
 
     pub fn pending_fingerprint(&self) -> Option<&str> {
@@ -378,6 +417,7 @@ impl Collab {
                 };
                 self.you = Some(you.clone());
                 self.offline_reported = false;
+                self.last_error = None;
                 self.notes = notes.clone();
                 self.pending_fingerprint = Some(fingerprint.clone());
             }
@@ -403,12 +443,18 @@ impl Collab {
                     .collect();
             }
             Incoming::Peers(peers) => self.peers = peers.clone(),
-            Incoming::Offline(_) => {
+            Incoming::Offline(reason) => {
                 self.state = ConnectionState::Offline;
+                self.last_error = Some(reason.clone());
                 self.peers.clear();
                 self.presence.clear();
             }
-            Incoming::Body { .. } | Incoming::Created(_) => {}
+            Incoming::Body { .. }
+            | Incoming::Created(_)
+            | Incoming::Attachment { .. }
+            | Incoming::AttachmentMissing { .. }
+            | Incoming::AttachmentStored { .. }
+            | Incoming::AttachmentAdded { .. } => {}
         }
     }
 
@@ -511,6 +557,24 @@ impl Collab {
         });
     }
 
+    /// Sends a picture to the library, so everyone with the note can see it and it stays after
+    /// this computer is gone. The answer arrives as [`Incoming::AttachmentStored`] or
+    /// [`Incoming::AttachmentMissing`].
+    pub fn upload_attachment(&mut self, name: &str, bytes: Vec<u8>) {
+        self.send(Command::UploadAttachment {
+            name: name.to_string(),
+            bytes,
+        });
+    }
+
+    /// Asks the library for a picture this computer does not have; it arrives as
+    /// [`Incoming::Attachment`].
+    pub fn fetch_attachment(&mut self, name: &str) {
+        self.send(Command::FetchAttachment {
+            name: name.to_string(),
+        });
+    }
+
     pub fn delete_note(&mut self, id: &str, permanent: bool) {
         self.send(Command::Delete {
             id: id.to_string(),
@@ -540,6 +604,32 @@ struct Session {
     last_cursor_sent: Option<usize>,
     name: String,
     color: [u8; 3],
+}
+
+/// Opens the socket to the server, trying each address it resolves to and giving up on one that
+/// never answers. The error says what a failed attempt usually means, because the app has no
+/// other way to tell somebody their router is not forwarding the port.
+fn connect_socket(address: &str, timeout: Duration) -> Result<std::net::TcpStream, String> {
+    use std::net::ToSocketAddrs;
+    let candidates: Vec<std::net::SocketAddr> = address
+        .to_socket_addrs()
+        .map_err(|e| format!("could not look up {address}: {e}"))?
+        .collect();
+    if candidates.is_empty() {
+        return Err(format!("{address} did not resolve to an address"));
+    }
+    let mut last = None;
+    for candidate in candidates.into_iter().take(4) {
+        match std::net::TcpStream::connect_timeout(&candidate, timeout) {
+            Ok(socket) => return Ok(socket),
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(format!(
+        "could not reach {address}: {}. Check that the server is running, that its port is \
+         allowed through its firewall, and that your router forwards that port to it.",
+        last.map(|e| e.to_string()).unwrap_or_default()
+    ))
 }
 
 fn worker(profile: ServerProfile, name: String, commands: Receiver<Command>, events: Notify) {
@@ -583,8 +673,7 @@ impl Session {
         commands: &Receiver<Command>,
     ) -> Result<Session, String> {
         let address = profile.address();
-        let socket = std::net::TcpStream::connect(&address)
-            .map_err(|e| format!("could not reach {address}: {e}"))?;
+        let socket = connect_socket(&address, CONNECT_TIMEOUT)?;
         socket.set_nodelay(true).ok();
         socket
             .set_read_timeout(Some(POLL))
@@ -800,6 +889,14 @@ impl Session {
             Command::Delete { id, permanent } => {
                 self.send_msg(&ClientMsg::Delete { id, permanent })?
             }
+            Command::UploadAttachment { name, bytes } => self.send_frame(
+                FRAME_ATTACHMENT,
+                &net::encode_attachment(ATTACHMENT_SEND, &name, &bytes),
+            )?,
+            Command::FetchAttachment { name } => self.send_frame(
+                FRAME_ATTACHMENT,
+                &net::encode_attachment(ATTACHMENT_ASK, &name, b""),
+            )?,
         }
         Ok(())
     }
@@ -815,6 +912,9 @@ impl Session {
                     ServerMsg::Notes { notes } => events.send(Incoming::Notes(notes)),
                     ServerMsg::Created { note } => events.send(Incoming::Created(note)),
                     ServerMsg::Presence { notes } => events.send(Incoming::Presence(notes)),
+                    ServerMsg::Attachment { name } => {
+                        events.send(Incoming::AttachmentAdded { name })
+                    }
                     ServerMsg::Error { message } => events.send(Incoming::Offline(message)),
                     _ => {}
                 }
@@ -864,6 +964,26 @@ impl Session {
                         self.apply_remote(update)?;
                         self.emit_body(events);
                     }
+                    _ => {}
+                }
+            }
+            FRAME_ATTACHMENT => {
+                let Some((op, name, bytes)) = net::decode_attachment(&payload) else {
+                    return Ok(());
+                };
+                match op {
+                    ATTACHMENT_DATA if bytes.is_empty() => {
+                        events.send(Incoming::AttachmentStored {
+                            name: name.to_string(),
+                        })
+                    }
+                    ATTACHMENT_DATA => events.send(Incoming::Attachment {
+                        name: name.to_string(),
+                        bytes: bytes.to_vec(),
+                    }),
+                    net::ATTACHMENT_MISSING => events.send(Incoming::AttachmentMissing {
+                        name: name.to_string(),
+                    }),
                     _ => {}
                 }
             }
@@ -1220,6 +1340,29 @@ mod tests {
         assert_eq!(profile.address(), "10.0.0.4:9000");
         profile.host = "::1".into();
         assert_eq!(profile.address(), "[::1]:7331");
+    }
+
+    #[test]
+    fn test_a_silent_address_is_given_up_on_with_a_reason() {
+        // TEST-NET-1 is reserved and never answers, which is the shape of a port that is
+        // filtered because nothing forwards it.
+        let error = connect_socket("192.0.2.1:7331", Duration::from_millis(300)).unwrap_err();
+        assert!(error.contains("could not reach 192.0.2.1:7331"), "{error}");
+        assert!(error.contains("firewall"), "{error}");
+        assert!(error.contains("router"), "{error}");
+    }
+
+    #[test]
+    fn test_a_refused_port_says_so_at_once() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let error =
+            connect_socket(&format!("127.0.0.1:{port}"), Duration::from_secs(2)).unwrap_err();
+        assert!(
+            error.contains(&format!("could not reach 127.0.0.1:{port}")),
+            "{error}"
+        );
     }
 
     #[test]

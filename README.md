@@ -21,7 +21,7 @@ A calm, minimalistic cross-platform desktop notes application written in **Rust*
 - **Command Palette & Quick Switcher (`Ctrl+K`)**: Fuzzy-jump to any note, create notes from templates, switch color themes, or toggle views without leaving the keyboard.
 - **Bi-Directional `[[Wiki Links]]` & Backlinks**: Reference other notes with `[[Note Title]]` or `[[Note Title|Alias]]`. Click any wiki-link in Preview/Split mode to jump to that note (or create it on the fly), and see all referencing notes in the **Linked from** footer.
 - **Edit, Split & Preview Modes**: Toggle between raw Markdown editing, side-by-side **Split View** (`Ctrl+Shift+E`), and clean **Preview Mode** (`Ctrl+E`).
-- **Embedded Images**: `![alt](picture.png)` is drawn in Preview and Split mode the way GitHub draws it — paths are relative to the note's folder, absolute paths and `file://` work too, and `http(s)` links are downloaded in the background. PNG, JPEG and GIF.
+- **Pictures, Added by Button, Drop or Paste and Resized by Dragging**: the picture button in the formatting bar opens the system's file chooser; drop a picture file on the window, or paste a screenshot with `Ctrl+V` while writing, and either way it is copied into an `attachments` folder beside your notes and written into the note at the caret. In a shared note the picture is also sent to the server, so everyone with the library sees it (up to 12 MB each). In Preview or Split mode, drag the square in a picture's bottom-right corner to resize it, the way a picture on a OneNote page behaves; the size is kept in the note as `{width=…}` after the picture, so it is there again next time. `![alt](picture.png)` is drawn the way GitHub draws it — paths are relative to the note's folder, absolute paths and `file://` work too, and `http(s)` links are downloaded in the background. PNG, JPEG and GIF.
 - **Interactive Task Checklists**: Click `- [ ]` and `- [x]` checkboxes directly in Preview or Split mode to toggle completion, with live task progress badges (`2/3`) on note cards and the editor header.
 - **Daily Note & Templates (`Ctrl+D`)**: Open or create today's dated journal note in one keystroke, or start from **Meeting Notes** and **Project Spec** templates via the Command Palette.
 - **Quick Formatting Bar**: One-click insertion for `# H1`, `## H2`, `**bold**`, `*italic*`, bullet lists, `- [ ]` task checkboxes, blockquotes, code blocks, and `[[Wiki Links]]`.
@@ -185,6 +185,8 @@ The other way round, a shared note's folder menu offers **Copy to this computer*
 local copy and leaves the shared note in place. While a shared note is open, **New** creates the
 next note directly on the server.
 
+Pictures in a shared note are kept on the server too, in an `attachments` folder inside its notes folder, so everyone with the library sees them and they are still there after the computer that added them is gone. A picture added before a note is moved to the server goes with it, and **Copy to this computer** brings copies of its pictures along. The server's notes folder stays an ordinary EloraNotes library, pictures included, so copying or backing it up keeps everything.
+
 ### Connecting from the app
 
 **Settings → Shared library**: enter the address (IP or DNS name), the port and the password, and
@@ -205,6 +207,30 @@ the words they type appear as they type them.
 
 Which notes are synced: the note bodies and the library structure (titles, folders, tags, pins,
 trash). Settings, themes and the update check stay on your own machine.
+
+### If it stays on "Connecting…"
+
+A wrong password or an outdated client says so by itself, so being stuck at *Connecting…* means
+the connection never got through. The app now gives up on an address after a few seconds and
+shows why under the state line in Settings; the usual reasons, in the order worth checking:
+
+1. **The server is not running.** On the server machine: `systemctl status elora-server`, then
+   `journalctl -u elora-server -n 30 --no-pager`.
+2. **It is listening on the wrong address.** `ss -ltn | grep 7331` should show `0.0.0.0:7331`
+   (or `[::]:7331`). `127.0.0.1:7331` means only that machine can reach it: reinstall with
+   `--bind 0.0.0.0`, or fix `bind` in `~/.config/elora-server/config.json` and restart it.
+3. **A firewall drops the port.** The installer opens it in ufw or firewalld; check
+   `sudo ufw status` on the server if you use another one.
+4. **The router does not forward it.** Forward TCP 7331 to the server machine's LAN address, and
+   give that machine a fixed address so the rule keeps pointing at it.
+5. **Your connection is behind carrier-grade NAT.** If the WAN address in the router differs from
+   `curl -4 ifconfig.me`, no port forward can work; put both machines on a VPN such as Tailscale
+   and use the server's address there instead.
+6. **The public IP does not work from inside your own network.** Many routers cannot loop back to
+   their own WAN address; test from a phone on mobile data before assuming the port is closed.
+
+A DNS name works anywhere an IP does, and the app takes `address:port` in the address field if
+you would rather type the port there.
 
 ## Running From Source
 

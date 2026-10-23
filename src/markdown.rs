@@ -110,33 +110,48 @@ pub enum InlineSpan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinePiece {
     Text(String),
-    /// `![alt](src)`: the picture GitHub would show, with its alt text and address.
+    /// `![alt](src)`: the picture GitHub would show, with its alt text and address. `width` is
+    /// the size a `{width=320}` group after it asks for, which is how a picture keeps the size
+    /// it was dragged to.
     Image {
         alt: String,
         src: String,
+        width: Option<u32>,
     },
 }
 
-/// Splits a line into text and GitHub-style `![alt](src)` pictures. A line without pictures comes
-/// back as a single piece of text, so rendering it is unchanged. An empty address (`![]()`) or a
-/// half-written marker stays as text instead of turning into a broken picture.
-pub fn split_images(line: &str) -> Vec<LinePiece> {
-    let mut pieces = Vec::new();
-    let mut text = String::new();
-    let mut rest = line;
+/// A `![alt](src)` picture found in a line, and where it sits in that line.
+pub(crate) struct ImageMarker {
+    /// Index of the `!` that starts the marker.
+    pub start: usize,
+    /// Index just past the closing `)`.
+    pub body_end: usize,
+    /// Index just past a `{…}` attribute group that follows the marker, when there is one.
+    pub end: usize,
+    pub alt: String,
+    pub src: String,
+    /// The width the attributes ask for, in points.
+    pub width: Option<u32>,
+}
 
-    while let Some(start) = rest.find("![") {
+/// Finds every `![alt](src){…}` picture in a line, in order. An empty address (`![]()`), a
+/// half-written marker and an escaped one (`\![…`) are not pictures, so they are not returned.
+pub(crate) fn image_markers(line: &str) -> Vec<ImageMarker> {
+    let mut markers = Vec::new();
+    let bytes = line.as_bytes();
+    let mut from = 0usize;
+
+    while let Some(offset) = line[from..].find("![") {
+        let start = from + offset;
         // `\![…` is literal text, not a picture.
-        if start > 0 && rest.as_bytes()[start - 1] == b'\\' {
-            text.push_str(&rest[..start + 2]);
-            rest = &rest[start + 2..];
+        if start > 0 && bytes[start - 1] == b'\\' {
+            from = start + 2;
             continue;
         }
-        let after = &rest[start + 2..];
+        let after = &line[start + 2..];
         let Some(close) = after.find(']') else { break };
         if !after[close + 1..].starts_with('(') {
-            text.push_str(&rest[..start + 2]);
-            rest = &rest[start + 2..];
+            from = start + 2;
             continue;
         }
         let inside = &after[close + 2..];
@@ -149,26 +164,132 @@ pub fn split_images(line: &str) -> Vec<LinePiece> {
             .unwrap_or(target)
             .trim();
         if src.is_empty() {
-            text.push_str(&rest[..start + 2]);
-            rest = &rest[start + 2..];
+            from = start + 2;
             continue;
         }
-        text.push_str(&rest[..start]);
-        if !text.is_empty() {
-            pieces.push(LinePiece::Text(std::mem::take(&mut text)));
-        }
-        pieces.push(LinePiece::Image {
+        let body_end = start + close + end + 5;
+        let attributes = &line[body_end..];
+        let (end_of_marker, width) = match attributes.starts_with('{') {
+            true => match attributes.find('}') {
+                Some(group_end) => (
+                    body_end + group_end + 1,
+                    width_attribute(&attributes[..=group_end]),
+                ),
+                None => (body_end, None),
+            },
+            false => (body_end, None),
+        };
+        markers.push(ImageMarker {
+            start,
+            body_end,
+            end: end_of_marker,
             alt: after[..close].replace("\\]", "]"),
             src: src.to_string(),
+            width,
         });
-        rest = &inside[end + 1..];
+        from = end_of_marker;
     }
 
-    text.push_str(rest);
-    if !text.is_empty() || pieces.is_empty() {
-        pieces.push(LinePiece::Text(text));
+    markers
+}
+
+/// Splits a line into text and GitHub-style `![alt](src)` pictures. A line without pictures comes
+/// back as a single piece of text, so rendering it is unchanged. An empty address (`![]()`) or a
+/// half-written marker stays as text instead of turning into a broken picture.
+pub fn split_images(line: &str) -> Vec<LinePiece> {
+    let markers = image_markers(line);
+    let mut pieces = Vec::new();
+    let mut text_from = 0usize;
+
+    for marker in markers {
+        if marker.start > text_from {
+            pieces.push(LinePiece::Text(line[text_from..marker.start].to_string()));
+        }
+        pieces.push(LinePiece::Image {
+            alt: marker.alt,
+            src: marker.src,
+            width: marker.width,
+        });
+        text_from = marker.end;
+    }
+
+    if text_from < line.len() || pieces.is_empty() {
+        pieces.push(LinePiece::Text(line[text_from..].to_string()));
     }
     pieces
+}
+
+/// The width in a `{width=320}` group, which may sit beside other attributes
+/// (`{width=320 align=left}`) and may write its unit out (`{width=320px}`).
+fn width_attribute(group: &str) -> Option<u32> {
+    let inner = group.strip_prefix('{')?.strip_suffix('}')?;
+    inner.split_whitespace().find_map(|attribute| {
+        let (key, value) = attribute.split_once('=')?;
+        if !key.eq_ignore_ascii_case("width") {
+            return None;
+        }
+        let digits = value.trim().trim_end_matches("px");
+        digits.parse::<u32>().ok().filter(|width| *width > 0)
+    })
+}
+
+/// Sets the width of the `image_index`th picture in `markdown` (counting the same way the preview
+/// draws them), keeping any other attributes it already carries. Returns the new text, or `None`
+/// when there is no such picture or it already has that width.
+pub fn set_image_width(markdown: &str, image_index: usize, width: u32) -> Option<String> {
+    let mut out = String::with_capacity(markdown.len() + 16);
+    let mut seen = 0usize;
+    let mut changed = false;
+
+    for line in markdown.split_inclusive('\n') {
+        let without_newline = line.strip_suffix('\n').unwrap_or(line);
+        let (content, carriage) = match without_newline.strip_suffix('\r') {
+            Some(rest) => (rest, "\r"),
+            None => (without_newline, ""),
+        };
+        let ending = if line.ends_with('\n') {
+            format!("{carriage}\n")
+        } else {
+            String::new()
+        };
+
+        let markers = image_markers(content);
+        let target = image_index.checked_sub(seen).filter(|i| *i < markers.len());
+        match target {
+            Some(i) => {
+                let marker = &markers[i];
+                let group = &content[marker.body_end..marker.end];
+                let mut attributes: Vec<String> = group
+                    .strip_prefix('{')
+                    .and_then(|inner| inner.strip_suffix('}'))
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .filter(|attribute| {
+                        !attribute
+                            .split_once('=')
+                            .is_some_and(|(key, _)| key.eq_ignore_ascii_case("width"))
+                    })
+                    .map(str::to_string)
+                    .collect();
+                attributes.push(format!("width={width}"));
+                out.push_str(&content[..marker.body_end]);
+                out.push('{');
+                out.push_str(&attributes.join(" "));
+                out.push('}');
+                out.push_str(&content[marker.end..]);
+                out.push_str(&ending);
+                changed |= marker.width != Some(width);
+                seen += i + 1;
+                continue;
+            }
+            None => {
+                seen += markers.len();
+                out.push_str(line);
+            }
+        }
+    }
+
+    changed.then_some(out)
 }
 
 /// Parses inline Markdown spans from a single line of text:
@@ -1884,6 +2005,7 @@ mod tests {
             vec![LinePiece::Image {
                 alt: "a cat".to_string(),
                 src: "pics/cat.png".to_string(),
+                width: None,
             }]
         );
         // The optional title after the address is not part of the path.
@@ -1892,6 +2014,7 @@ mod tests {
             vec![LinePiece::Image {
                 alt: "cat".to_string(),
                 src: "pics/cat.png".to_string(),
+                width: None,
             }]
         );
         // Text around a picture is kept on both sides.
@@ -1902,6 +2025,7 @@ mod tests {
                 LinePiece::Image {
                     alt: "x".to_string(),
                     src: "y.png".to_string(),
+                    width: None,
                 },
                 LinePiece::Text(" now".to_string()),
             ]
@@ -1921,5 +2045,81 @@ mod tests {
             split_images("\\![not](x.png)"),
             vec![LinePiece::Text("\\![not](x.png)".to_string())]
         );
+    }
+
+    #[test]
+    fn test_split_images_reads_a_width_after_the_picture() {
+        // The size a picture was dragged to lives in a group after it, where other Markdown
+        // renderers simply ignore it.
+        assert_eq!(
+            split_images("![cat](cat.png){width=320}"),
+            vec![LinePiece::Image {
+                alt: "cat".to_string(),
+                src: "cat.png".to_string(),
+                width: Some(320),
+            }]
+        );
+        // A unit and other attributes are allowed, and the text after the group stays text.
+        assert_eq!(
+            split_images("![cat](cat.png){width=320px align=left} after"),
+            vec![
+                LinePiece::Image {
+                    alt: "cat".to_string(),
+                    src: "cat.png".to_string(),
+                    width: Some(320),
+                },
+                LinePiece::Text(" after".to_string()),
+            ]
+        );
+        // A group without a usable width leaves the picture at its own size.
+        assert_eq!(
+            split_images("![cat](cat.png){align=left}"),
+            vec![LinePiece::Image {
+                alt: "cat".to_string(),
+                src: "cat.png".to_string(),
+                width: None,
+            }]
+        );
+        assert_eq!(
+            split_images("![cat](cat.png){width=wide}"),
+            vec![LinePiece::Image {
+                alt: "cat".to_string(),
+                src: "cat.png".to_string(),
+                width: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_set_image_width_writes_into_the_chosen_picture() {
+        // No group yet: one is added after the marker.
+        assert_eq!(
+            set_image_width("before\n![cat](cat.png)\nafter", 0, 320),
+            Some("before\n![cat](cat.png){width=320}\nafter".to_string())
+        );
+        // An existing width is replaced, and the other attributes are kept.
+        assert_eq!(
+            set_image_width("![cat](cat.png){width=200 align=left}", 0, 480),
+            Some("![cat](cat.png){align=left width=480}".to_string())
+        );
+        // The title inside the address is left exactly as it was.
+        assert_eq!(
+            set_image_width("![cat](cat.png \"A cat\")", 0, 250),
+            Some("![cat](cat.png \"A cat\"){width=250}".to_string())
+        );
+        // Only the picture at the chosen index changes.
+        assert_eq!(
+            set_image_width("![a](a.png) ![b](b.png)", 1, 120),
+            Some("![a](a.png) ![b](b.png){width=120}".to_string())
+        );
+        // A trailing newline and Windows line endings survive.
+        assert_eq!(
+            set_image_width("![a](a.png)\r\n", 0, 90),
+            Some("![a](a.png){width=90}\r\n".to_string())
+        );
+        // Asking for the width it already has, or for a picture that is not there, changes nothing.
+        assert_eq!(set_image_width("![a](a.png){width=90}", 0, 90), None);
+        assert_eq!(set_image_width("![a](a.png)", 3, 90), None);
+        assert_eq!(set_image_width("plain text", 0, 90), None);
     }
 }

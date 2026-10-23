@@ -9,8 +9,9 @@
 //! server's folder stays an ordinary EloraNotes library.
 
 use crate::net::{
-    self, ClientMsg, Field, NoteMeta, PresenceUser, ServerConfig, ServerMsg, FRAME_AWARENESS,
-    FRAME_JSON, FRAME_SYNC, PROTOCOL_VERSION,
+    self, ClientMsg, Field, NoteMeta, PresenceUser, ServerConfig, ServerMsg, ATTACHMENT_ASK,
+    ATTACHMENT_DATA, ATTACHMENT_MISSING, ATTACHMENT_SEND, FRAME_ATTACHMENT, FRAME_AWARENESS,
+    FRAME_JSON, FRAME_SYNC, MAX_ATTACHMENT, PROTOCOL_VERSION,
 };
 use crate::storage::Note;
 use chrono::{TimeZone, Utc};
@@ -212,6 +213,8 @@ impl Server {
                             }),
                         );
                     }
+                } else if kind == FRAME_ATTACHMENT {
+                    self.handle_attachment(client, &payload);
                 } else {
                     self.handle_doc_frame(client, kind, payload);
                 }
@@ -474,6 +477,87 @@ impl Server {
             }
         }
         self.broadcast_presence();
+    }
+
+    /// Pictures named by shared notes. A client sends one when it adds a picture to a note the
+    /// server owns, and asks for one it has not seen before. The bytes live in the library
+    /// folder beside the notes, so anybody with the library can see the picture and it stays
+    /// there after the computer that added it goes away.
+    fn handle_attachment(&self, client: &Arc<Client>, payload: &[u8]) {
+        let Some((op, name, bytes)) = net::decode_attachment(payload) else {
+            return;
+        };
+        if !net::valid_attachment_name(name) {
+            self.push(
+                client,
+                FRAME_ATTACHMENT,
+                net::encode_attachment(ATTACHMENT_MISSING, name, b""),
+            );
+            return;
+        }
+
+        match op {
+            ATTACHMENT_SEND => {
+                if bytes.is_empty() || bytes.len() > MAX_ATTACHMENT {
+                    self.push(
+                        client,
+                        FRAME_ATTACHMENT,
+                        net::encode_attachment(ATTACHMENT_MISSING, name, b""),
+                    );
+                    return;
+                }
+                let stored = self
+                    .library
+                    .lock()
+                    .map_err(|_| "library poisoned".to_string())
+                    .and_then(|library| library.write_attachment(name, bytes));
+                match stored {
+                    // An empty answer with the name is the acknowledgement: the picture is in
+                    // the library now, so this client can tell the user it was shared.
+                    Ok(()) => {
+                        self.push(
+                            client,
+                            FRAME_ATTACHMENT,
+                            net::encode_attachment(ATTACHMENT_DATA, name, b""),
+                        );
+                        // Everybody else who has the note open can now see the picture, and a
+                        // client that asked for it a moment too early asks again.
+                        self.broadcast_except(
+                            0,
+                            FRAME_JSON,
+                            json(&ServerMsg::Attachment {
+                                name: name.to_string(),
+                            }),
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!("could not store the picture {name}: {error}");
+                        self.push(
+                            client,
+                            FRAME_ATTACHMENT,
+                            net::encode_attachment(ATTACHMENT_MISSING, name, b""),
+                        );
+                    }
+                }
+            }
+            ATTACHMENT_ASK => {
+                let bytes = self
+                    .library
+                    .lock()
+                    .ok()
+                    .and_then(|library| library.read_attachment(name));
+                let (op, bytes) = match bytes {
+                    Some(bytes) => (ATTACHMENT_DATA, bytes),
+                    None => (ATTACHMENT_MISSING, Vec::new()),
+                };
+                self.push(
+                    client,
+                    FRAME_ATTACHMENT,
+                    net::encode_attachment(op, name, &bytes),
+                );
+            }
+            _ => {}
+        }
     }
 
     fn handle_doc_frame(&self, client: &Arc<Client>, kind: u8, payload: Vec<u8>) {
@@ -891,6 +975,35 @@ impl Library {
         Ok(())
     }
 
+    /// Pictures the notes name with `![alt](attachments/…)`. They sit in the library folder
+    /// beside the notes, so the server's folder stays an ordinary EloraNotes library that can be
+    /// copied or backed up whole, and a picture outlives whoever added it.
+    fn attachments_dir(&self) -> PathBuf {
+        self.dir.join("attachments")
+    }
+
+    fn attachment_path(&self, name: &str) -> Option<PathBuf> {
+        net::valid_attachment_name(name).then(|| self.attachments_dir().join(name))
+    }
+
+    fn write_attachment(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
+        let Some(path) = self.attachment_path(name) else {
+            return Err(format!("{name} is not a picture name"));
+        };
+        std::fs::create_dir_all(self.attachments_dir())
+            .map_err(|e| format!("could not create the pictures folder: {e}"))?;
+        std::fs::write(&path, bytes).map_err(|e| format!("could not save {name}: {e}"))
+    }
+
+    fn read_attachment(&self, name: &str) -> Option<Vec<u8>> {
+        let path = self.attachment_path(name)?;
+        let size = std::fs::metadata(&path).ok()?.len() as usize;
+        if size == 0 || size > MAX_ATTACHMENT {
+            return None;
+        }
+        std::fs::read(path).ok()
+    }
+
     fn body(&self, id: &str) -> String {
         match self.rooms.get(id) {
             Some(room) => {
@@ -1058,6 +1171,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn test_pictures_live_in_the_library_folder() {
+        let dir = temp_dir("attachments");
+        let library = Library::load(&dir).unwrap();
+        assert!(library.read_attachment("cat-1234abcd.png").is_none());
+
+        library
+            .write_attachment("cat-1234abcd.png", b"\x89PNG picture")
+            .unwrap();
+        assert_eq!(
+            library.read_attachment("cat-1234abcd.png").as_deref(),
+            Some(&b"\x89PNG picture"[..])
+        );
+        // An ordinary file beside the notes, so copying or backing up the folder keeps it.
+        assert!(dir.join("attachments/cat-1234abcd.png").is_file());
+
+        // Nothing can be stored outside the pictures folder.
+        assert!(library.write_attachment("../escape.png", b"x").is_err());
+        assert!(!dir.join("escape.png").exists());
+        assert!(library.write_attachment("notes.md", b"x").is_err());
+        // An empty file is not a picture and is never handed out.
+        assert!(library.write_attachment("empty-00000000.png", b"").is_ok());
+        assert!(library.read_attachment("empty-00000000.png").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

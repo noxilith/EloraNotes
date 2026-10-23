@@ -65,6 +65,42 @@ pub fn encode_sync(note_id: &str, message: &[u8]) -> Vec<u8> {
     out
 }
 
+/// An attachment frame: `[op][name len: u16 big endian][name][bytes…]`.
+pub fn encode_attachment(op: u8, name: &str, bytes: &[u8]) -> Vec<u8> {
+    let name = name.as_bytes();
+    let mut out = Vec::with_capacity(3 + name.len() + bytes.len());
+    out.push(op);
+    out.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    out.extend_from_slice(name);
+    out.extend_from_slice(bytes);
+    out
+}
+
+/// Splits an attachment frame back into its op, name and bytes.
+pub fn decode_attachment(payload: &[u8]) -> Option<(u8, &str, &[u8])> {
+    let op = *payload.first()?;
+    let len = u16::from_be_bytes([*payload.get(1)?, *payload.get(2)?]) as usize;
+    let name = payload.get(3..3 + len)?;
+    Some((op, std::str::from_utf8(name).ok()?, payload.get(3 + len..)?))
+}
+
+/// A picture's name inside the library's `attachments` folder: one plain file name, one of the
+/// formats the preview can draw, and nothing that could point outside the folder.
+pub fn valid_attachment_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 96
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        && name.rsplit_once('.').is_some_and(|(_, extension)| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif"
+            )
+        })
+}
+
 /// Splits a sync payload back into its note id and the Yjs message.
 pub fn decode_sync(payload: &[u8]) -> Option<(&str, &[u8])> {
     let len = u16::from_be_bytes([*payload.first()?, *payload.get(1)?]) as usize;
@@ -77,10 +113,23 @@ pub fn decode_sync(payload: &[u8]) -> Option<(&str, &[u8])> {
 pub const FRAME_JSON: u8 = 0;
 pub const FRAME_SYNC: u8 = 1;
 pub const FRAME_AWARENESS: u8 = 2;
+/// Pictures. A shared note names one with `![alt](attachments/…)`, and the bytes live on the
+/// server so everyone with the library can see it and it outlives the computer that added it.
+pub const FRAME_ATTACHMENT: u8 = 3;
+
+/// What an attachment frame asks for or answers.
+pub const ATTACHMENT_SEND: u8 = 0;
+pub const ATTACHMENT_ASK: u8 = 1;
+pub const ATTACHMENT_DATA: u8 = 2;
+pub const ATTACHMENT_MISSING: u8 = 3;
+
+/// The largest picture the library moves in one frame. Comfortably above a phone photo, and
+/// below the frame limit so one picture always fits.
+pub const MAX_ATTACHMENT: usize = 12 * 1024 * 1024;
 
 /// Largest frame accepted from a peer, so a bad length cannot make the other side allocate
-/// gigabytes.
-pub const MAX_FRAME: usize = 8 * 1024 * 1024;
+/// gigabytes. One attachment frame has to fit inside it.
+pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 
 /// Writes one frame; the caller flushes.
 pub fn write_frame<W: std::io::Write>(
@@ -240,6 +289,11 @@ pub enum ServerMsg {
     Created {
         note: NoteMeta,
     },
+    /// A picture has joined the library, so a client that asked for it before the upload
+    /// finished can ask again instead of waiting for the note to be reopened.
+    Attachment {
+        name: String,
+    },
     /// Who is editing which note, so the sidebar can show a dot on the card.
     Presence {
         /// note id -> names of everyone with it open
@@ -371,6 +425,41 @@ mod tests {
         assert_eq!(frames[0].1, b"{\"type\":\"ping\"}");
         assert_eq!(frames[1].0, FRAME_SYNC);
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn test_attachment_frames_carry_a_name_and_its_bytes() {
+        let frame = encode_attachment(ATTACHMENT_DATA, "holiday-1a2b3c4d.png", b"\x89PNG bytes");
+        assert_eq!(
+            decode_attachment(&frame),
+            Some((
+                ATTACHMENT_DATA,
+                "holiday-1a2b3c4d.png",
+                &b"\x89PNG bytes"[..]
+            ))
+        );
+        // An empty picture (the answer to a successful upload) is still a frame with its name.
+        let ack = encode_attachment(ATTACHMENT_DATA, "a.png", b"");
+        assert_eq!(
+            decode_attachment(&ack),
+            Some((ATTACHMENT_DATA, "a.png", &b""[..]))
+        );
+        assert_eq!(decode_attachment(b"\x02"), None);
+    }
+
+    #[test]
+    fn test_attachment_names_stay_inside_the_folder() {
+        assert!(valid_attachment_name("holiday-1a2b3c4d.png"));
+        assert!(valid_attachment_name("My_Cat.JPEG"));
+        // Nothing that could name a file somewhere else, hide it, or point at another type.
+        assert!(!valid_attachment_name("../secrets.png"));
+        assert!(!valid_attachment_name("sub/dir/cat.png"));
+        assert!(!valid_attachment_name("/etc/passwd"));
+        assert!(!valid_attachment_name(".hidden.png"));
+        assert!(!valid_attachment_name("notes.md"));
+        assert!(!valid_attachment_name("cat"));
+        assert!(!valid_attachment_name(""));
+        assert!(!valid_attachment_name(&format!("{}.png", "a".repeat(100))));
     }
 
     #[test]

@@ -13,6 +13,7 @@ struct Harness {
     dir: std::path::PathBuf,
     port: u16,
     note_id: String,
+    notes_dir: std::path::PathBuf,
 }
 
 impl Drop for Harness {
@@ -72,7 +73,12 @@ fn start_server() -> Harness {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    Harness { dir, port, note_id }
+    Harness {
+        dir,
+        port,
+        note_id,
+        notes_dir,
+    }
 }
 
 fn profile(port: u16) -> ServerProfile {
@@ -112,8 +118,13 @@ fn settle(
     );
 }
 
+/// The certificate folder follows `ELORA_SERVER_DIR`, which is process-wide, so the tests here
+/// take turns instead of starting servers over each other's files.
+static SERVER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn test_two_clients_edit_the_same_note() {
+    let _turn = SERVER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let harness = start_server();
     let note_id = harness.note_id.clone();
 
@@ -421,4 +432,144 @@ fn test_two_clients_edit_the_same_note() {
     );
 
     viewer.disconnect();
+}
+
+/// A picture added to a shared note goes to the server, so somebody who never had the file can
+/// see it — including after the computer that added it has gone.
+#[test]
+fn test_a_shared_notes_picture_outlives_the_computer_that_added_it() {
+    let _turn = SERVER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let harness = start_server();
+    let file = "holiday-1a2b3c4d.png";
+    // Not a real PNG: the shared library moves bytes and never decodes them.
+    let picture: Vec<u8> = b"\x89PNG fake picture bytes".to_vec();
+
+    let mut alice = Collab::new();
+    alice.connect(profile(harness.port), "alice".into());
+    settle(&mut alice, &mut String::new(), "alice", |c, _| {
+        c.is_connected()
+    });
+    alice.upload_attachment(file, picture.clone());
+    assert!(
+        wait_for_stored(&mut alice, file),
+        "the server never confirmed the picture"
+    );
+    assert!(
+        harness.notes_dir.join("attachments").join(file).is_file(),
+        "the picture should sit in the server's own library folder"
+    );
+
+    // Bob has never had the file; he asks the library for what the note names.
+    let mut bob = Collab::new();
+    bob.connect(profile(harness.port), "bob".into());
+    settle(&mut bob, &mut String::new(), "bob", |c, _| c.is_connected());
+    bob.fetch_attachment(file);
+    assert_eq!(
+        wait_for_picture(&mut bob, file).as_deref(),
+        Some(&picture[..]),
+        "a picture added on another computer should arrive byte for byte"
+    );
+
+    // A picture that has not been uploaded yet is reported as missing, and when it is uploaded
+    // a moment later the clients waiting for it are told to ask again.
+    let later = "later-9f8e7d6c.png";
+    bob.fetch_attachment(later);
+    assert!(
+        wait_for_missing(&mut bob, later),
+        "an unknown picture should be reported as missing"
+    );
+    alice.upload_attachment(later, picture.clone());
+    assert!(
+        wait_for_stored(&mut alice, later),
+        "the second picture was not stored"
+    );
+    assert!(
+        wait_for_added(&mut bob, later),
+        "bob should hear that the picture he was waiting for has arrived"
+    );
+    bob.fetch_attachment(later);
+    assert_eq!(
+        wait_for_picture(&mut bob, later).as_deref(),
+        Some(&picture[..]),
+        "asking again after the upload should hand the picture over"
+    );
+
+    // Alice's computer goes away entirely; the picture is still served from the library.
+    alice.disconnect();
+    drop(alice);
+    bob.fetch_attachment(file);
+    assert_eq!(
+        wait_for_picture(&mut bob, file).as_deref(),
+        Some(&picture[..]),
+        "the picture should still be there after its owner left"
+    );
+}
+
+fn wait_for_stored(collab: &mut Collab, file: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        for event in collab.poll() {
+            match event {
+                Incoming::AttachmentStored { name } => {
+                    assert_eq!(name, file);
+                    return true;
+                }
+                Incoming::AttachmentMissing { name } => panic!("the server refused {name}"),
+                Incoming::Offline(reason) => panic!("went offline: {reason}"),
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
+fn wait_for_picture(collab: &mut Collab, file: &str) -> Option<Vec<u8>> {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        for event in collab.poll() {
+            match event {
+                Incoming::Attachment { name, bytes } => {
+                    assert_eq!(name, file);
+                    return Some(bytes);
+                }
+                Incoming::AttachmentMissing { name } => {
+                    panic!("{name} is not in the library")
+                }
+                Incoming::Offline(reason) => panic!("went offline: {reason}"),
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    None
+}
+
+fn wait_for_missing(collab: &mut Collab, file: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        for event in collab.poll() {
+            if let Incoming::AttachmentMissing { name } = event {
+                assert_eq!(name, file);
+                return true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
+fn wait_for_added(collab: &mut Collab, file: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        for event in collab.poll() {
+            if let Incoming::AttachmentAdded { name } = event {
+                if name == file {
+                    return true;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
 }

@@ -5,7 +5,7 @@ use crate::images::NoteImages;
 use crate::markdown::{
     apply_highlight_selection, build_editor_layout_job, clear_formatting_selection,
     color_swatch_button, insert_at_selection, markdown_to_html, render_inline_spans_ui, rgb_to_hex,
-    split_images, wrap_selection, LinePiece, HIGHLIGHT_PRESETS,
+    set_image_width, split_images, wrap_selection, LinePiece, HIGHLIGHT_PRESETS,
 };
 use crate::net::{NoteMeta, PresenceUser};
 use crate::storage::{
@@ -20,6 +20,7 @@ use egui::{
     Align, Align2, Color32, CornerRadius, FontFamily, FontId, Frame, Id, Key, Layout, Margin, Pos2,
     Rect, RichText, ScrollArea, Sense, Stroke, TextEdit, TextStyle, Ui, UiBuilder, Vec2,
 };
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::f32::consts::TAU;
 use std::path::{Path, PathBuf};
@@ -171,6 +172,15 @@ pub struct EloraApp {
     quiet_update: bool,
     /// Pictures embedded in the preview, decoded once and kept as textures.
     note_images: NoteImages,
+    /// Note and character index the caret belongs at after a picture was inserted, so the
+    /// editor puts it after the new lines instead of leaving it where the picture was dropped in.
+    caret_after_insert: Option<(String, usize)>,
+    /// Pictures this computer has asked the library for, so a missing one is not requested on
+    /// every frame. Cleared when a connection is made, so a reconnect tries again.
+    requested_pictures: BTreeSet<String>,
+    /// Pictures this computer sent to the library and has not heard about yet, so a refusal can
+    /// be reported to the person who added the picture.
+    shared_uploads: BTreeSet<String>,
     /// The name other people see for this client, when the account name is not wanted.
     display_name: String,
 }
@@ -379,6 +389,9 @@ impl EloraApp {
             update_state: UpdateState::Idle,
             quiet_update: false,
             note_images: NoteImages::default(),
+            caret_after_insert: None,
+            requested_pictures: BTreeSet::new(),
+            shared_uploads: BTreeSet::new(),
         };
         app
     }
@@ -915,6 +928,20 @@ impl EloraApp {
         } else {
             p.fg_secondary
         }));
+        // Why it did not connect, kept in view instead of only flashing by in the toast: the
+        // usual answers are a port that is not forwarded and a firewall that drops it.
+        if !connected {
+            if let Some(problem) = self.collab.last_error() {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("{} {problem}", icon::ALERT_TRIANGLE))
+                            .size(11.0)
+                            .color(p.fg_muted),
+                    )
+                    .wrap(),
+                );
+            }
+        }
         let mut watchers: Vec<&str> = self
             .notes
             .iter()
@@ -1197,6 +1224,292 @@ impl EloraApp {
         Ok(())
     }
 
+    /// Where pictures dropped or pasted into a note are kept: a folder beside the note files, so
+    /// the Markdown can name them with a path relative to the note.
+    fn attachments_dir(&self) -> PathBuf {
+        self.storage.root_dir().join("attachments")
+    }
+
+    /// Files a picture away under a name that is safe to put in Markdown (no spaces to end the
+    /// address early, no characters a file system dislikes) and returns the path to write into
+    /// the note, with the plain file name beside it.
+    ///
+    /// The name carries a digest of the picture's bytes. That keeps two people's
+    /// `screenshot.png` apart in a shared library, makes the same picture file once however
+    /// often it is added, and lets a shared note ask the server for exactly the file it names.
+    fn store_picture(
+        &self,
+        bytes: &[u8],
+        name_hint: &str,
+        extension: &str,
+    ) -> Result<(String, String), String> {
+        let dir = self.attachments_dir();
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
+        let file = stored_picture_name(bytes, name_hint, extension);
+        let path = dir.join(&file);
+        // A name that already exists holds these very bytes, so there is nothing to write again.
+        if !path.is_file() {
+            std::fs::write(&path, bytes).map_err(|e| format!("Could not save the picture: {e}"))?;
+        }
+        Ok((format!("attachments/{file}"), file))
+    }
+
+    /// Puts a picture into a note at the caret: the file is copied into the vault's pictures
+    /// folder and a `![name](attachments/…)` line is written where the user is typing.
+    fn insert_picture(
+        &mut self,
+        note_idx: usize,
+        bytes: &[u8],
+        name_hint: &str,
+        extension: &str,
+    ) -> Result<(), String> {
+        let (src, file) = self.store_picture(bytes, name_hint, extension)?;
+        let alt = name_hint.trim();
+        let alt = if alt.is_empty() {
+            "picture".to_string()
+        } else {
+            alt.to_string()
+        };
+        let snippet = format!("![{alt}]({src})");
+        let note_id = self.notes[note_idx].id.clone();
+        self.insert_markdown_at_caret(note_idx, &snippet)?;
+
+        // A shared note is looked at by other people, and they have no access to this disk, so
+        // the picture itself goes to the library as well.
+        if self.is_remote(&note_id) {
+            if bytes.len() > crate::net::MAX_ATTACHMENT {
+                self.status_message = Some(format!(
+                    "Added {alt} — too large to share with the library (over 12 MB)"
+                ));
+            } else {
+                self.shared_uploads.insert(file.clone());
+                self.collab.upload_attachment(&file, bytes.to_vec());
+                self.status_message = Some(format!("Added {alt} — sharing it with the library"));
+            }
+        } else {
+            self.status_message = Some(format!(
+                "Added {alt} — drag its corner in Preview to resize it"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Stores a picture the library sent, where the preview looks for it. Only a plain picture
+    /// name is accepted, so a picture can never be written outside the pictures folder, and a
+    /// file that is already here is left alone.
+    fn save_shared_picture(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
+        if !crate::net::valid_attachment_name(name) {
+            return Err(format!("{name} is not a picture name"));
+        }
+        if bytes.is_empty() || bytes.len() > crate::net::MAX_ATTACHMENT {
+            return Err(format!("{name} is not a usable picture"));
+        }
+        let dir = self.attachments_dir();
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
+        let path = dir.join(name);
+        if path.is_file() {
+            return Ok(());
+        }
+        std::fs::write(&path, bytes).map_err(|e| format!("Could not save {name}: {e}"))
+    }
+
+    /// Asks the library for the pictures a shared note names that this computer has not got.
+    /// Each is asked for once per connection; when a picture arrives it is written into the
+    /// vault and the preview draws it on the next frame.
+    fn request_shared_pictures(&mut self, body: &str) {
+        for name in picture_references(body) {
+            if self.attachments_dir().join(&name).is_file() {
+                continue;
+            }
+            if !self.requested_pictures.insert(name.clone()) {
+                continue;
+            }
+            self.collab.fetch_attachment(&name);
+        }
+    }
+
+    /// Sends the pictures a note names to the library, for when a local note is moved there.
+    fn upload_pictures(&mut self, body: &str) {
+        for name in picture_references(body) {
+            let path = self.attachments_dir().join(&name);
+            match std::fs::read(&path) {
+                Ok(bytes) => self.collab.upload_attachment(&name, bytes),
+                Err(e) => {
+                    self.status_message = Some(format!("Could not share {}: {e}", path.display()));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Adds a picture that is already on this computer, chosen from the toolbar's picture
+    /// button: the file is read, filed away next to the notes and written into the note.
+    fn add_picture_file(&mut self, note_idx: usize, path: &Path) -> Result<(), String> {
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !is_picture_extension(&extension) {
+            return Err(format!(
+                "{} is not a picture EloraNotes can show (PNG, JPEG and GIF)",
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("That file")
+            ));
+        }
+        let name = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_string)
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "picture".to_string());
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("Could not read {}: {e}", path.display()))?;
+        self.insert_picture(note_idx, &bytes, &name, &extension)
+    }
+
+    /// The toolbar's picture button: the system's own file dialog, starting where pictures
+    /// usually are, then the chosen file goes into the note like a dropped one.
+    fn pick_picture(&mut self, note_idx: usize) {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Add a picture to this note")
+            .add_filter("Pictures", &["png", "jpg", "jpeg", "gif"]);
+        // Start where pictures usually are, but only if that folder really exists: a portal
+        // asked for a missing folder is left showing nothing useful.
+        if let Some(start) = dirs::picture_dir()
+            .filter(|dir| dir.is_dir())
+            .or_else(|| dirs::home_dir().filter(|dir| dir.is_dir()))
+        {
+            dialog = dialog.set_directory(start);
+        }
+        let Some(path) = dialog.pick_file() else {
+            return;
+        };
+        if let Err(e) = self.add_picture_file(note_idx, &path) {
+            self.status_message = Some(e);
+        }
+    }
+
+    /// Inserts a block on lines of its own at the caret (replacing the selection, when there is
+    /// one) and leaves the caret after it.
+    fn insert_markdown_at_caret(&mut self, note_idx: usize, snippet: &str) -> Result<(), String> {
+        let note_id = self.notes[note_idx].id.clone();
+        let body = self.notes[note_idx].body.clone();
+        let length = body.chars().count();
+        // The caret only means something for the note the editor is actually showing; after a
+        // switch (or from the list) the picture goes at the end instead of into an old position.
+        let editor_showing_note = self
+            .last_seen_body
+            .as_ref()
+            .is_some_and(|(seen, _)| seen == &note_id);
+        let (start_char, end_char) = match editor_showing_note {
+            true => self
+                .last_editor_selection
+                .map(|(start, end)| (start.min(length), end.min(length)))
+                .unwrap_or_else(|| {
+                    let caret = self.last_editor_caret.unwrap_or(length).min(length);
+                    (caret, caret)
+                }),
+            false => (length, length),
+        };
+        let (start_char, end_char) = (start_char.min(end_char), end_char.max(start_char));
+
+        let byte_at = |char_index: usize| {
+            body.char_indices()
+                .nth(char_index)
+                .map(|(byte, _)| byte)
+                .unwrap_or(body.len())
+        };
+        let (start_byte, end_byte) = (byte_at(start_char), byte_at(end_char));
+        let before = &body[..start_byte];
+        let after = &body[end_byte..];
+
+        let mut inserted = String::new();
+        if !before.is_empty() && !before.ends_with('\n') {
+            inserted.push('\n');
+        }
+        inserted.push_str(snippet);
+        let caret = start_char + inserted.chars().count();
+        if !after.starts_with('\n') {
+            inserted.push('\n');
+        }
+
+        self.notes[note_idx].body = format!("{before}{inserted}{after}");
+        self.notes[note_idx].updated_at = Utc::now();
+        self.last_editor_selection = Some((caret, caret));
+        self.last_editor_caret = Some(caret);
+        self.caret_after_insert = Some((note_id, caret));
+        self.persist_note(note_idx)
+    }
+
+    /// Pictures dropped onto the window, added to the open note in the order they arrived.
+    fn add_dropped_pictures(&mut self, files: Vec<egui::DroppedFile>) {
+        let Some(note_idx) = self
+            .selected_id
+            .as_ref()
+            .and_then(|id| self.notes.iter().position(|note| &note.id == id))
+        else {
+            self.status_message = Some("Open a note before dropping a picture into it".to_string());
+            return;
+        };
+
+        let mut added = 0usize;
+        let mut problems: Vec<String> = Vec::new();
+        for file in files {
+            let result = match (file.path.as_ref(), file.bytes) {
+                // Some desktops hand over the file's contents instead of, or as well as, its
+                // path; those do not need to be read again.
+                (_, Some(bytes)) => {
+                    let name = file
+                        .path
+                        .as_ref()
+                        .and_then(|path| path.file_stem())
+                        .and_then(|stem| stem.to_str())
+                        .map(str::to_string)
+                        .or_else(|| Some(file.name.clone()))
+                        .filter(|name| !name.trim().is_empty())
+                        .unwrap_or_else(|| "picture".to_string());
+                    let extension = file
+                        .path
+                        .as_ref()
+                        .and_then(|path| path.extension())
+                        .and_then(|extension| extension.to_str())
+                        .unwrap_or("png")
+                        .to_ascii_lowercase();
+                    match is_picture_extension(&extension) {
+                        true => self.insert_picture(note_idx, &bytes, &name, &extension),
+                        false => Err(format!(
+                            "{}: {extension} pictures are not supported",
+                            file.name
+                        )),
+                    }
+                }
+                (Some(path), None) => self.add_picture_file(note_idx, path),
+                (None, None) => Err(format!("{}: could not be read", file.name)),
+            };
+            match result {
+                Ok(()) => added += 1,
+                Err(e) => problems.push(e),
+            }
+        }
+
+        self.status_message = match (added, problems.first()) {
+            (0, Some(problem)) => Some(problem.clone()),
+            (0, None) => None,
+            (count, None) => Some(format!(
+                "Added {count} picture{}",
+                if count == 1 { "" } else { "s" }
+            )),
+            (count, Some(problem)) => Some(format!(
+                "Added {count} picture{}; {problem}",
+                if count == 1 { "" } else { "s" }
+            )),
+        };
+    }
+
     /// The name this client goes by: what was typed in Settings, or the account name when that
     /// is left empty.
     fn server_display_name(&self) -> String {
@@ -1299,6 +1612,10 @@ impl EloraApp {
         self.notes.push(note);
         self.resort();
         self.selected_id = Some(id);
+        // The copy names the same pictures; ones this computer has not got are fetched from the
+        // library, so the copy is not left with holes.
+        let body = shared.body.clone();
+        self.request_shared_pictures(&body);
         self.status_message = Some(format!("Copied “{}” to this computer", shared.title));
     }
 
@@ -1367,6 +1684,9 @@ impl EloraApp {
                     // note is reopened and re-synced.
                     self.collab_open = None;
                     self.awaiting_room_body = None;
+                    // Pictures asked for over a connection that has since dropped were never
+                    // answered, so they are asked for again.
+                    self.requested_pictures.clear();
                     library_changed = true;
                 }
                 Incoming::Notes(_) => library_changed = true,
@@ -1421,6 +1741,7 @@ impl EloraApp {
                         if let Some(local) = self.notes.iter_mut().find(|n| n.id == note.id) {
                             local.body = pending.body.clone();
                         }
+                        self.upload_pictures(&pending.body);
                         let server = self.collab.server_name().unwrap_or("the server");
                         self.status_message = Some(format!("Moved “{}” to {server}", note.title));
                     }
@@ -1481,6 +1802,36 @@ impl EloraApp {
                     }
                 }
                 Incoming::Presence(_) | Incoming::Peers(_) => {}
+                Incoming::Attachment { name, bytes } => {
+                    // The picture joins this vault, where the note's own relative address finds
+                    // it and every later run of the app still has it.
+                    match self.save_shared_picture(&name, &bytes) {
+                        Ok(()) => {
+                            self.requested_pictures.remove(&name);
+                        }
+                        Err(e) => self.status_message = Some(e),
+                    }
+                }
+                Incoming::AttachmentMissing { name } => {
+                    // The library does not have it (yet, or any more). It stays on the asked-for
+                    // list so it is not demanded every frame; the connection is new or the note
+                    // is opened again before it is asked for again.
+                    if self.shared_uploads.remove(&name) {
+                        self.status_message = Some(format!(
+                            "Could not share {name} with the library; it stays on this computer"
+                        ));
+                    }
+                }
+                Incoming::AttachmentStored { name } => {
+                    self.shared_uploads.remove(&name);
+                }
+                Incoming::AttachmentAdded { name } => {
+                    // A picture that was missing a moment ago (its owner was still uploading
+                    // it) is here now, so ask again.
+                    if self.requested_pictures.contains(&name) {
+                        self.collab.fetch_attachment(&name);
+                    }
+                }
             }
         }
 
@@ -3327,6 +3678,19 @@ impl EloraApp {
 
         self.last_seen_body = Some((note_id.clone(), self.notes[note_idx].body.clone()));
 
+        // Ctrl+V with a picture on the clipboard puts the picture into the note, the way a word
+        // processor pastes a screenshot. The key is not consumed: when the clipboard holds text
+        // instead, the editor pastes it exactly as before.
+        if ui.memory(|m| m.has_focus(editor_id))
+            && ui.input(|i| i.modifiers.command && i.key_pressed(Key::V))
+        {
+            if let Some((bytes, name)) = clipboard_picture() {
+                if let Err(e) = self.insert_picture(note_idx, &bytes, &name, "png") {
+                    self.status_message = Some(e);
+                }
+            }
+        }
+
         // Who else has this note open, with the colour of their caret.
         let peers: Vec<crate::collab::RemotePeer> = if self.is_remote(&note_id) {
             self.collab.peers().to_vec()
@@ -3381,6 +3745,22 @@ impl EloraApp {
             let b = cursor_range.secondary.ccursor.index;
             self.last_editor_selection = Some((a.min(b), a.max(b)));
             self.last_editor_caret = Some(a);
+        }
+
+        // A picture just inserted sits behind the caret, so the caret moves past it instead of
+        // being left in front of the picture it was dropped on.
+        if let Some((target, caret)) = self.caret_after_insert.clone() {
+            if target == note_id {
+                self.caret_after_insert = None;
+                if let Some(mut state) = TextEdit::load_state(ui.ctx(), editor_id) {
+                    state
+                        .cursor
+                        .set_char_range(Some(CCursorRange::one(CCursor::new(caret))));
+                    state.store(ui.ctx(), editor_id);
+                }
+                self.last_editor_selection = Some((caret, caret));
+                self.last_editor_caret = Some(caret);
+            }
         }
 
         // Where the caret is on screen. egui scrolls to the caret when it moves it itself, but a
@@ -4191,6 +4571,22 @@ impl EloraApp {
                     self.icon_search.clear();
                 }
 
+                // A picture from this computer. Dropping one on the window or pasting one works
+                // too, but the button is where people look for it.
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(icon::PHOTO).size(13.5).color(p.fg_secondary),
+                        )
+                        .fill(p.bg_elevated)
+                        .corner_radius(CornerRadius::same(5)),
+                    )
+                    .on_hover_text("Add a picture to this note (or drop one on the window)")
+                    .clicked()
+                {
+                    self.pick_picture(note_idx);
+                }
+
                 // The colour controls are their own fixed-size child layout, so this wrapping
                 // row moves the whole group down as one piece. Letting them wrap one by one
                 // left the glow swatch stranded under the markdown buttons at narrow widths.
@@ -4284,9 +4680,15 @@ impl EloraApp {
                 note.file_path.parent().map(Path::to_path_buf)
             }
         };
-        let mut clicked_wiki_link: Option<String> = None;
+        // A shared note's pictures live on the server; whoever opens it without them asks for
+        // those it does not have yet, and they are drawn a frame later.
+        if self.is_remote(&selected_id) {
+            let body = self.notes[note_idx].body.clone();
+            self.request_shared_pictures(&body);
+        }
+
+        let mut preview = PreviewActions::default();
         let mut clicked_backlink_id: Option<String> = None;
-        let mut toggled_task_idx: Option<usize> = None;
 
         // Two panes need roughly this much room each before their text stops wrapping every
         // other word; in a narrow window the split view shows the editor alone instead of two
@@ -4335,10 +4737,9 @@ impl EloraApp {
                             ui,
                             &body_snapshot,
                             p,
-                            &mut clicked_wiki_link,
-                            &mut toggled_task_idx,
                             note_dir.as_deref(),
                             &mut self.note_images,
+                            &mut preview,
                         );
                         render_backlinks_footer(ui, &backlinks, p, &mut clicked_backlink_id);
                     },
@@ -4388,10 +4789,9 @@ impl EloraApp {
                                     ui,
                                     &body_snapshot,
                                     p,
-                                    &mut clicked_wiki_link,
-                                    &mut toggled_task_idx,
                                     note_dir.as_deref(),
                                     &mut self.note_images,
+                                    &mut preview,
                                 );
 
                                 render_backlinks_footer(
@@ -4407,11 +4807,21 @@ impl EloraApp {
             }
         }
 
+        // A picture that was dragged to a new size keeps that size: it is written into the note
+        // as `{width=…}` after the picture, so it is there again next time the note is opened.
+        if let Some((index, width)) = preview.image {
+            if let Some(resized) = set_image_width(&self.notes[note_idx].body, index, width) {
+                self.notes[note_idx].body = resized;
+                self.notes[note_idx].updated_at = Utc::now();
+                needs_save = true;
+            }
+        }
+
         if let Some(op) = queued_format_op {
             self.apply_editor_format(note_idx, op);
         }
 
-        if let Some(task_i) = toggled_task_idx {
+        if let Some(task_i) = preview.toggled_task {
             if self.notes[note_idx].toggle_task_at(task_i) {
                 needs_save = true;
             }
@@ -4452,7 +4862,7 @@ impl EloraApp {
         if action_perm_delete {
             self.permanently_delete_by_id(&selected_id);
         }
-        if let Some(target) = clicked_wiki_link {
+        if let Some(target) = preview.wiki_link {
             self.open_or_create_wiki_link(&target);
         }
         if let Some(back_id) = clicked_backlink_id {
@@ -4554,6 +4964,28 @@ impl eframe::App for EloraApp {
                 });
             });
 
+        // Pictures dragged onto the window become part of the open note, and while they are
+        // being dragged the window says so instead of leaving the drop a guess.
+        let hovering = ctx.input(|i| i.raw.hovered_files.clone());
+        if !hovering.is_empty() {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                Id::new("elora_drop_hint"),
+            ));
+            painter.rect_filled(ctx.screen_rect(), 0.0, Color32::from_black_alpha(150));
+            painter.text(
+                ctx.screen_rect().center(),
+                Align2::CENTER_CENTER,
+                format!("{} Drop to add the picture to this note", icon::PHOTO),
+                FontId::proportional(17.0),
+                p.fg_primary,
+            );
+        }
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        if !dropped.is_empty() {
+            self.add_dropped_pictures(dropped);
+        }
+
         self.render_command_palette(ctx, &p);
         self.update_window(ctx, &p);
         self.status_toast(ctx, &p);
@@ -4648,6 +5080,103 @@ fn note_column(available: f32) -> (f32, f32) {
 
 /// Text colour that stays readable on a filled background: white on dark fills, near-black on
 /// light ones, so a pale caret colour does not get white-on-pale text.
+/// A file name for a stored picture: lower case letters and digits, with everything else folded
+/// into single dashes, so the Markdown address never ends at a space.
+fn picture_name(hint: &str) -> String {
+    let mut name = String::new();
+    for ch in hint.chars() {
+        if ch.is_ascii_alphanumeric() {
+            name.push(ch.to_ascii_lowercase());
+        } else if !name.is_empty() && !name.ends_with('-') {
+            name.push('-');
+        }
+        if name.len() >= 48 {
+            break;
+        }
+    }
+    let name = name.trim_matches('-').to_string();
+    if name.is_empty() {
+        "picture".to_string()
+    } else {
+        name
+    }
+}
+
+/// The formats the preview can decode; anything else is stored as PNG instead.
+fn picture_extension(extension: &str) -> String {
+    let extension = extension
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" => extension,
+        _ => "png".to_string(),
+    }
+}
+
+/// The name a picture is filed under: the name it was given, folded down to safe characters,
+/// with a short digest of its bytes, so the same picture always lands on the same file and two
+/// different pictures never can.
+fn stored_picture_name(bytes: &[u8], name_hint: &str, extension: &str) -> String {
+    let stem = picture_name(name_hint);
+    let extension = picture_extension(extension);
+    let digest = Sha256::digest(bytes);
+    let tag: String = digest
+        .iter()
+        .take(4)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("{stem}-{tag}.{extension}")
+}
+
+/// The pictures a note names with `![alt](attachments/…)`, as plain file names. Anything that is
+/// not a plain picture name is ignored: a note can only ask the library for what it could keep.
+fn picture_references(body: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for line in body.lines() {
+        for piece in split_images(line) {
+            let LinePiece::Image { src, .. } = piece else {
+                continue;
+            };
+            let Some(name) = src.trim().strip_prefix("attachments/") else {
+                continue;
+            };
+            if crate::net::valid_attachment_name(name) {
+                names.insert(name.to_string());
+            }
+        }
+    }
+    names
+}
+
+fn is_picture_extension(extension: &str) -> bool {
+    matches!(
+        extension
+            .trim_start_matches('.')
+            .to_ascii_lowercase()
+            .as_str(),
+        "png" | "jpg" | "jpeg" | "gif"
+    )
+}
+
+/// The picture on the clipboard, encoded as PNG, when this desktop offers one. Wayland sessions
+/// that do not bridge the clipboard to X11 simply report nothing here, and text pasting is left
+/// to the editor as usual.
+fn clipboard_picture() -> Option<(Vec<u8>, String)> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    let image = clipboard.get_image().ok()?;
+    let rgba = image::RgbaImage::from_raw(
+        u32::try_from(image.width).ok()?,
+        u32::try_from(image.height).ok()?,
+        image.bytes.into_owned(),
+    )?;
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(rgba)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .ok()?;
+    Some((png, "screenshot".to_string()))
+}
+
 fn readable_on(background: Color32) -> Color32 {
     let luma = 0.299 * background.r() as f32
         + 0.587 * background.g() as f32
@@ -5147,22 +5676,43 @@ fn folder_menu_ui(
 
 /// Interactive Markdown Preview renderer with full multi-word inline formatting,
 /// glowing highlights, clickable checkboxes, and `[[Wiki Links]]`.
+/// What the preview hands back to the editor: the things a reader can do to the text while it is
+/// being shown.
+#[derive(Default)]
+struct PreviewActions {
+    /// A `[[wiki link]]` that was clicked.
+    wiki_link: Option<String>,
+    /// The task list item that was ticked or unticked, counted over the whole note.
+    toggled_task: Option<usize>,
+    /// A picture dragged to a new size: which picture (counted over the whole note), and its
+    /// width in points.
+    image: Option<(usize, u32)>,
+}
+
 fn render_markdown_preview(
     ui: &mut Ui,
     markdown: &str,
     p: &Palette,
-    clicked_wiki_link: &mut Option<String>,
-    toggled_task_idx: &mut Option<usize>,
     note_dir: Option<&Path>,
     images: &mut NoteImages,
+    actions: &mut PreviewActions,
 ) {
     let mut in_code_block = false;
     let mut code_buffer = String::new();
     let mut task_counter = 0usize;
+    // Pictures are counted across the whole note, so a width the user drags is written back to
+    // the picture they dragged and not to one that merely looks like it (a code block also
+    // counts, because the note's own text is scanned the same way).
+    let mut image_count = 0usize;
 
     for line in markdown.lines() {
         let trimmed = line.trim_end();
+        let pictures_here = split_images(line)
+            .iter()
+            .filter(|piece| matches!(piece, LinePiece::Image { .. }))
+            .count();
         if trimmed.trim_start().starts_with("```") {
+            image_count += pictures_here;
             if in_code_block {
                 Frame::new()
                     .fill(p.bg_elevated)
@@ -5190,6 +5740,7 @@ fn render_markdown_preview(
         if in_code_block {
             code_buffer.push_str(line);
             code_buffer.push('\n');
+            image_count += pictures_here;
             continue;
         }
 
@@ -5217,13 +5768,17 @@ fn render_markdown_preview(
                                 14.5,
                                 p,
                                 p.fg_primary,
-                                clicked_wiki_link,
+                                &mut actions.wiki_link,
                                 false,
                             );
                         });
                     }
-                    LinePiece::Image { alt, src } => {
-                        images.show(ui, &src, &alt, note_dir, p);
+                    LinePiece::Image { alt, src, width } => {
+                        let index = image_count;
+                        image_count += 1;
+                        if let Some(kept) = images.show(ui, &src, &alt, width, note_dir, p) {
+                            actions.image = Some((index, kept));
+                        }
                         ui.add_space(4.0);
                     }
                     LinePiece::Text(_) => {}
@@ -5239,19 +5794,27 @@ fn render_markdown_preview(
         } else if let Some(h1) = trimmed_start.strip_prefix("# ") {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
-                render_inline_spans_ui(ui, h1, 21.5, p, p.fg_primary, clicked_wiki_link, true);
+                render_inline_spans_ui(ui, h1, 21.5, p, p.fg_primary, &mut actions.wiki_link, true);
             });
             ui.add_space(2.0);
         } else if let Some(h2) = trimmed_start.strip_prefix("## ") {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
-                render_inline_spans_ui(ui, h2, 18.0, p, p.fg_primary, clicked_wiki_link, true);
+                render_inline_spans_ui(ui, h2, 18.0, p, p.fg_primary, &mut actions.wiki_link, true);
             });
             ui.add_space(2.0);
         } else if let Some(h3) = trimmed_start.strip_prefix("### ") {
             ui.add_space(2.0);
             ui.horizontal_wrapped(|ui| {
-                render_inline_spans_ui(ui, h3, 16.0, p, p.fg_secondary, clicked_wiki_link, true);
+                render_inline_spans_ui(
+                    ui,
+                    h3,
+                    16.0,
+                    p,
+                    p.fg_secondary,
+                    &mut actions.wiki_link,
+                    true,
+                );
             });
         } else if let Some(quote) = trimmed_start.strip_prefix("> ") {
             Frame::new()
@@ -5267,7 +5830,7 @@ fn render_markdown_preview(
                             14.5,
                             p,
                             p.fg_secondary,
-                            clicked_wiki_link,
+                            &mut actions.wiki_link,
                             false,
                         );
                     });
@@ -5289,7 +5852,7 @@ fn render_markdown_preview(
                     .on_hover_text("Click to uncheck task")
                     .clicked()
                 {
-                    *toggled_task_idx = Some(this_idx);
+                    actions.toggled_task = Some(this_idx);
                 }
                 ui.add_space(4.0);
                 ui.label(
@@ -5313,10 +5876,18 @@ fn render_markdown_preview(
                     .on_hover_text("Click to complete task")
                     .clicked()
                 {
-                    *toggled_task_idx = Some(this_idx);
+                    actions.toggled_task = Some(this_idx);
                 }
                 ui.add_space(4.0);
-                render_inline_spans_ui(ui, todo, 14.5, p, p.fg_primary, clicked_wiki_link, false);
+                render_inline_spans_ui(
+                    ui,
+                    todo,
+                    14.5,
+                    p,
+                    p.fg_primary,
+                    &mut actions.wiki_link,
+                    false,
+                );
             });
         } else if let Some(bullet) = trimmed_start
             .strip_prefix("- ")
@@ -5325,7 +5896,15 @@ fn render_markdown_preview(
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("•").color(p.accent).size(15.0));
                 ui.add_space(5.0);
-                render_inline_spans_ui(ui, bullet, 14.5, p, p.fg_primary, clicked_wiki_link, false);
+                render_inline_spans_ui(
+                    ui,
+                    bullet,
+                    14.5,
+                    p,
+                    p.fg_primary,
+                    &mut actions.wiki_link,
+                    false,
+                );
             });
         } else {
             ui.horizontal_wrapped(|ui| {
@@ -5335,7 +5914,7 @@ fn render_markdown_preview(
                     14.5,
                     p,
                     p.fg_primary,
-                    clicked_wiki_link,
+                    &mut actions.wiki_link,
                     false,
                 );
             });
@@ -5669,27 +6248,349 @@ mod tests {
         let markdown = "Before the picture.\n\n![a blue dot](dot.png \"A dot\")\n\nAfter it.";
         let p = ThemeMode::Obsidian.palette();
         let mut images = NoteImages::default();
-        let mut clicked_wiki_link = None;
-        let mut toggled_task_idx = None;
+        let mut preview = PreviewActions::default();
         let raw = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0))),
             ..Default::default()
         };
         let _ = ctx.run(raw, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                render_markdown_preview(
-                    ui,
-                    markdown,
-                    &p,
-                    &mut clicked_wiki_link,
-                    &mut toggled_task_idx,
-                    Some(&dir),
-                    &mut images,
-                );
+                render_markdown_preview(ui, markdown, &p, Some(&dir), &mut images, &mut preview);
             });
         });
 
         assert_eq!(images.ready_pictures(), 1, "the picture should be decoded");
+        // Nothing was dragged, so the note's own width is untouched.
+        assert_eq!(preview.image, None);
+    }
+
+    fn png_bytes() -> Vec<u8> {
+        let pixels = image::RgbaImage::from_pixel(4, 3, image::Rgba([10, 200, 40, 255]));
+        let mut bytes = Vec::new();
+        pixels
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        bytes
+    }
+
+    /// An app over an empty vault holding one note with the given text open in the editor.
+    fn app_with_note(body: &str) -> (EloraApp, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "elora-pictures-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = NoteStorage::new(dir.join("notes")).unwrap();
+        let root = storage.root_dir().to_path_buf();
+        let ctx = egui::Context::default();
+        let mut app = EloraApp::with_context(&ctx, storage);
+
+        let mut note = Note::new("Pictures", body, &root);
+        note.body = body.to_string();
+        app.selected_id = Some(note.id.clone());
+        // As if the editor had drawn this note last frame: that is what makes the caret the
+        // insertion point.
+        app.last_seen_body = Some((note.id.clone(), note.body.clone()));
+        app.notes.push(note);
+        (app, dir, root)
+    }
+
+    #[test]
+    fn test_a_picture_is_kept_beside_the_note_and_written_where_the_caret_is() {
+        let (mut app, dir, root) = app_with_note("First line\nSecond line");
+        let index = app.notes.len() - 1;
+        app.last_editor_selection = Some((10, 10));
+
+        app.insert_picture(index, &png_bytes(), "My Cat Photo", "png")
+            .unwrap();
+
+        let file = stored_picture_name(&png_bytes(), "My Cat Photo", "png");
+        let marker = format!("![My Cat Photo](attachments/{file})");
+        assert_eq!(
+            app.notes[index].body,
+            format!("First line\n{marker}\nSecond line"),
+            "the picture goes on a line of its own, in the place being typed"
+        );
+        // The file lives in the vault, where the note's relative address finds it, and the note
+        // on disk already mentions it instead of waiting for the next keystroke.
+        assert!(root.join("attachments").join(&file).exists());
+        let saved =
+            std::fs::read_to_string(root.join(format!("{}.md", app.notes[index].id))).unwrap();
+        assert!(saved.contains(&marker), "the note was saved: {saved}");
+        // The caret sits behind the picture, ready for the next line.
+        assert_eq!(app.last_editor_caret, Some(10 + 1 + marker.chars().count()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Dragging a picture writes its size into the picture that was dragged, even when another
+    /// picture (here one sitting in a code block, which is not drawn) comes before it in the text.
+    #[test]
+    fn test_dragging_a_picture_writes_the_size_of_the_picture_that_was_dragged() {
+        let dir = std::env::temp_dir().join(format!(
+            "elora-picture-drag-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pixels = image::RgbaImage::from_pixel(400, 200, image::Rgba([90, 150, 210, 255]));
+        pixels.save(dir.join("wide.png")).unwrap();
+
+        let markdown = "A code block with a picture in it:\n\n```\n![inline](wide.png)\n```\n\n![first](wide.png)\n\n![second](wide.png)";
+        let p = ThemeMode::Obsidian.palette();
+        let ctx = egui::Context::default();
+        install_tabler_icons(&ctx);
+        let mut images = NoteImages::default();
+        let mut preview = PreviewActions::default();
+        let mut handles: Vec<Pos2> = Vec::new();
+
+        let frame = |events: Vec<egui::Event>,
+                     images: &mut NoteImages,
+                     preview: &mut PreviewActions,
+                     handles: &mut Vec<Pos2>| {
+            images.handles.clear();
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 900.0))),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_markdown_preview(ui, markdown, &p, Some(&dir), images, preview);
+                });
+            });
+            *handles = images
+                .handles
+                .iter()
+                .map(|(_, rect)| rect.center())
+                .collect();
+        };
+
+        frame(Vec::new(), &mut images, &mut preview, &mut handles);
+        assert_eq!(handles.len(), 2, "the code block's picture is not drawn");
+
+        // Grab the first drawn picture — the second picture in the text — and pull it 60 points.
+        let start = handles[0];
+        frame(
+            vec![
+                egui::Event::PointerMoved(start),
+                egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+            &mut images,
+            &mut preview,
+            &mut handles,
+        );
+        let moved_to = start + Vec2::new(60.0, 0.0);
+        frame(
+            vec![egui::Event::PointerMoved(moved_to)],
+            &mut images,
+            &mut preview,
+            &mut handles,
+        );
+        frame(
+            vec![egui::Event::PointerButton {
+                pos: moved_to,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+            &mut images,
+            &mut preview,
+            &mut handles,
+        );
+
+        assert_eq!(preview.image, Some((1, 460)));
+        // And that index is the drawn picture, not the one in the code block before it.
+        let reworded = set_image_width(markdown, 1, 460).unwrap();
+        assert!(reworded.contains("![first](wide.png){width=460}"));
+        assert!(reworded.contains("```\n![inline](wide.png)\n```"));
+        assert!(reworded.ends_with("![second](wide.png)"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_a_picture_goes_to_the_end_when_the_editor_showed_another_note() {
+        let (mut app, dir, _root) = app_with_note("One line");
+        let index = app.notes.len() - 1;
+        // The caret still remembers a position from the note that was open before this one.
+        app.last_seen_body = Some(("another-note".to_string(), String::new()));
+        app.last_editor_selection = Some((0, 0));
+
+        app.insert_picture(index, &png_bytes(), "cat", "png")
+            .unwrap();
+
+        let file = stored_picture_name(&png_bytes(), "cat", "png");
+        assert_eq!(
+            app.notes[index].body,
+            format!("One line\n![cat](attachments/{file})\n"),
+            "a stale caret must not put the picture in the middle of the note"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_a_picture_chosen_from_the_toolbar_is_added_like_a_dropped_one() {
+        let (mut app, dir, root) = app_with_note("Intro");
+        let index = app.notes.len() - 1;
+        let picture = dir.join("Kitchen.png");
+        std::fs::write(&picture, png_bytes()).unwrap();
+
+        app.add_picture_file(index, &picture).unwrap();
+
+        let file = stored_picture_name(&png_bytes(), "Kitchen", "png");
+        assert!(root.join("attachments").join(&file).exists());
+        assert!(app.notes[index]
+            .body
+            .contains(&format!("![Kitchen](attachments/{file})")));
+
+        // A file that is not a picture is refused with a reason, and the note is left alone.
+        let document = dir.join("recipe.pdf");
+        std::fs::write(&document, b"not a picture").unwrap();
+        let problem = app.add_picture_file(index, &document).unwrap_err();
+        assert!(
+            problem.contains("recipe.pdf") && problem.contains("PNG"),
+            "the refusal should say which file and which formats work: {problem}"
+        );
+        assert_eq!(app.notes[index].body.matches("![").count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_dropping_a_picture_file_adds_it_and_says_when_a_file_is_not_one() {
+        let (mut app, dir, root) = app_with_note("Intro");
+        let index = app.notes.len() - 1;
+        let picture = dir.join("Holiday Photo.png");
+        std::fs::write(&picture, png_bytes()).unwrap();
+        let document = dir.join("notes.pdf");
+        std::fs::write(&document, b"not a picture").unwrap();
+
+        app.add_dropped_pictures(vec![
+            egui::DroppedFile {
+                path: Some(picture),
+                name: "Holiday Photo.png".to_string(),
+                mime: String::new(),
+                last_modified: None,
+                bytes: None,
+            },
+            egui::DroppedFile {
+                path: Some(document),
+                name: "notes.pdf".to_string(),
+                mime: String::new(),
+                last_modified: None,
+                bytes: None,
+            },
+        ]);
+
+        let file = stored_picture_name(&png_bytes(), "Holiday Photo", "png");
+        assert!(root.join("attachments").join(&file).exists());
+        assert!(
+            app.notes[index]
+                .body
+                .contains(&format!("![Holiday Photo](attachments/{file})")),
+            "the dropped picture is written into the note: {}",
+            app.notes[index].body
+        );
+        let status = app.status_message.clone().unwrap();
+        assert!(
+            status.contains("Added 1 picture") && status.contains("pdf"),
+            "the report should mention the picture and the file that was not one: {status}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_the_same_picture_is_filed_once_and_different_ones_apart() {
+        let (app, dir, _root) = app_with_note("");
+        let first = app.store_picture(&png_bytes(), "cat", "png").unwrap();
+        let again = app.store_picture(&png_bytes(), "cat", "png").unwrap();
+        assert_eq!(first, again, "the same bytes belong to the same file");
+
+        // Two people's `screenshot.png` are two different pictures, so they get two files even
+        // though they were named the same.
+        let mut other = png_bytes();
+        other.push(7);
+        let different = app.store_picture(&other, "cat", "png").unwrap();
+        assert_ne!(first.1, different.1);
+        assert!(first.1.starts_with("cat-") && first.1.ends_with(".png"));
+        assert!(app.storage.root_dir().join(&first.0).exists());
+        assert!(app.storage.root_dir().join(&different.0).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_picture_names_survive_being_put_in_markdown() {
+        // A space would end the address early, so names are folded into dashes.
+        assert_eq!(picture_name("My Cat Photo (1)"), "my-cat-photo-1");
+        assert_eq!(picture_name("  ***  "), "picture");
+        assert_eq!(picture_name(&"a".repeat(80)).len(), 48);
+        // Only the formats the preview decodes are accepted as they are.
+        assert_eq!(picture_extension("JPEG"), "jpeg");
+        assert_eq!(picture_extension("webp"), "png");
+        assert!(is_picture_extension("PNG"));
+        assert!(!is_picture_extension("webp"));
+
+        // A stored name carries a digest of the picture, so it is stable and unique.
+        let named = stored_picture_name(b"bytes", "Holiday Photo", "PNG");
+        assert!(named.starts_with("holiday-photo-") && named.ends_with(".png"));
+        assert_eq!(named, stored_picture_name(b"bytes", "Holiday Photo", "PNG"));
+        assert_ne!(
+            named,
+            stored_picture_name(b"other bytes", "Holiday Photo", "PNG")
+        );
+    }
+
+    #[test]
+    fn test_a_picture_from_the_library_joins_the_vault_untouched() {
+        let (app, dir, root) = app_with_note("");
+        assert!(app
+            .save_shared_picture("holiday-1a2b3c4d.png", b"picture")
+            .is_ok());
+        assert_eq!(
+            std::fs::read(root.join("attachments/holiday-1a2b3c4d.png")).unwrap(),
+            b"picture"
+        );
+        // A file already here is left alone, so a local copy is never replaced by the library.
+        assert!(app
+            .save_shared_picture("holiday-1a2b3c4d.png", b"other")
+            .is_ok());
+        assert_eq!(
+            std::fs::read(root.join("attachments/holiday-1a2b3c4d.png")).unwrap(),
+            b"picture"
+        );
+        // Nothing outside the pictures folder, and nothing that is not a picture.
+        assert!(app.save_shared_picture("../escape.png", b"x").is_err());
+        assert!(!root.parent().unwrap().join("escape.png").exists());
+        assert!(app.save_shared_picture("notes.md", b"x").is_err());
+        assert!(app.save_shared_picture("empty-00000000.png", b"").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_a_note_names_the_pictures_it_wants_from_the_library() {
+        let body = "Text\n![a](attachments/holiday-1a2b3c4d.png)\n\
+                    ![b](attachments/my-cat.JPEG){width=200}\n\
+                    ![remote](https://example.com/x.png)\n\
+                    ![outside](../secrets.png)";
+        let names: Vec<String> = picture_references(body).into_iter().collect();
+        assert_eq!(
+            names,
+            vec!["holiday-1a2b3c4d.png", "my-cat.JPEG"],
+            "only pictures kept in the vault are asked for"
+        );
     }
 
     /// Runs the app's connection handling until `done` holds: this is what a window does every

@@ -1,6 +1,6 @@
 [package]
 name = "elora-notes"
-version = "0.9.14"
+version = "0.9.15"
 edition = "2021"
 description = "EloraNotes — A calm, minimalistic cross-platform Markdown notes desktop app"
 authors = ["EloraNotes"]
@@ -23,7 +23,7 @@ path = "src/bin/elora-server.rs"
 default = ["gui"]
 # Everything that draws a window. `cargo build --no-default-features --bin elora-server`
 # produces a server binary with no X11/GL/wayland dependency at all.
-gui = ["dep:eframe", "dep:egui", "dep:image"]
+gui = ["dep:eframe", "dep:egui", "dep:image", "dep:arboard", "dep:rfd"]
 
 [dependencies]
 eframe = { version = "0.31", optional = true, default-features = false, features = [
@@ -40,6 +40,15 @@ image = { version = "0.25", optional = true, default-features = false, features 
     "jpeg",
     "gif",
 ] }
+# The system's own "choose a file" dialog for the toolbar's picture button.
+rfd = { version = "0.15", optional = true, default-features = false, features = [
+    "xdg-portal",
+    "async-std",
+] }
+# Reads a picture copied to the clipboard, so a screenshot can be pasted into a note. The
+# Wayland feature lets a Wayland session offer its clipboard directly; elsewhere arboard falls
+# back to the X11 one on its own.
+arboard = { version = "3", optional = true, features = ["wayland-data-control"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6.0"
 serde = { version = "1.0", features = ["derive"] }
