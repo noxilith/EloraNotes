@@ -194,6 +194,10 @@ impl Server {
                         return Err("the first message must be the handshake".to_string());
                     }
                     if !self.handshake(client, &payload)? {
+                        // The reply explains why the connection is going away (an older client,
+                        // a wrong password). Dropping the socket here would leave the other
+                        // side with nothing but "disconnected".
+                        self.drain_outbox(client, tls)?;
                         return Ok(());
                     }
                     continue;
@@ -1153,5 +1157,85 @@ mod tests {
         assert!(constant_time_eq(b"secret", b"secret"));
         assert!(!constant_time_eq(b"secret", b"secreT"));
         assert!(!constant_time_eq(b"secret", b"secret "));
+    }
+
+    /// A client that speaks an older protocol is told why, instead of being dropped like a
+    /// broken connection: the two sides of a shared library can be updated days apart.
+    #[test]
+    fn test_older_client_is_told_which_side_to_update() {
+        let _guard = crate::tls::server_dir_lock();
+        let dir = temp_dir("older-client");
+        let notes = dir.join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        // SAFETY: the guard keeps the other tests that read this variable out of the way.
+        unsafe { std::env::set_var("ELORA_SERVER_DIR", dir.join("server")) };
+
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let config = ServerConfig {
+            name: "Version Check".into(),
+            port,
+            password: "letmein".into(),
+            notes_dir: notes,
+            bind: "127.0.0.1".into(),
+        };
+        let server = Arc::new(Server::new(config).expect("server"));
+        std::thread::spawn(move || {
+            let _ = server.run();
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline
+            && std::net::TcpStream::connect(("127.0.0.1", port)).is_err()
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let (config, _seen) = crate::tls::client_config(None);
+        let socket = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let name = rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap();
+        let connection = rustls::ClientConnection::new(config, name).expect("client tls");
+        let mut stream = rustls::StreamOwned::new(connection, socket);
+
+        let hello = ClientMsg::Hello {
+            v: PROTOCOL_VERSION - 1,
+            name: "older app".into(),
+            password: "letmein".into(),
+        };
+        let payload = serde_json::to_vec(&hello).unwrap();
+        net::write_frame(&mut stream, FRAME_JSON, &payload).expect("send hello");
+        stream.flush().expect("flush");
+
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let reply = loop {
+            let n = stream
+                .read(&mut chunk)
+                .expect("a reply, not a closed socket");
+            assert!(n > 0, "the server closed without explaining why");
+            buffer.extend_from_slice(&chunk[..n]);
+            if let Some((kind, payload)) = net::take_frames(&mut buffer).first() {
+                assert_eq!(*kind, FRAME_JSON);
+                break serde_json::from_slice::<ServerMsg>(payload).expect("a readable reply");
+            }
+        };
+        match reply {
+            ServerMsg::Error { message } => {
+                assert!(
+                    message.contains(&format!("speaks version {PROTOCOL_VERSION}")),
+                    "the reply should name the server's version: {message}"
+                );
+                assert!(
+                    message.contains("Update whichever side is older"),
+                    "the reply should say what to do: {message}"
+                );
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

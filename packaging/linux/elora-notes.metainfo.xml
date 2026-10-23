@@ -25,6 +25,18 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.9.12" date="2026-10-23">
+      <description>
+        <p>
+          A client that speaks a different protocol version is now told so. The refusal was
+          written to the socket but the connection was closed before it was sent, so an app left
+          behind by an update looked like a server that had gone away. This release is otherwise
+          0.9.11, and replaces it: shared notes no longer show each other's text, a note is not
+          overwritten by a copy the window was still showing, and a shared note can be taken out
+          of its folder again. Both the app and the server need it.
+        </p>
+      </description>
+    </release>
     <release version="0.9.11" date="2026-10-23">
       <description>
         <p>
