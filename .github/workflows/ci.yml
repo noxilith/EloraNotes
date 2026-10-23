@@ -23,6 +23,9 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --locked
+      # The server ships without the GUI stack, so make sure that configuration keeps building.
+      - name: Check the server without the GUI
+        run: cargo check --locked --no-default-features --bin elora-server
 
   # The installer and updater code has Windows-only and macOS-only branches that cannot be
   # compiled on Linux, so both are checked on their own runners as well.

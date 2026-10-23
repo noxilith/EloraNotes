@@ -1,16 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod app;
-mod icon_names;
-mod icons;
-mod markdown;
-mod storage;
-mod theme;
-mod update;
-
-use app::EloraApp;
+use elora_notes::app::EloraApp;
+use elora_notes::storage::{migrate_legacy_notes, NoteStorage};
 use std::path::PathBuf;
-use storage::{migrate_legacy_notes, NoteStorage};
 
 fn main() -> eframe::Result<()> {
     let cli_dir = parse_cli_dir();

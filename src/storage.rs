@@ -80,11 +80,15 @@ pub struct AppSettings {
     pub font_size: f32,
     #[serde(default = "default_glow_strength")]
     pub glow_strength: f32,
+    #[cfg(feature = "gui")]
     #[serde(default)]
     pub colors: crate::theme::ColorOverrides,
     /// Folders the user folded shut in the sidebar.
     #[serde(default)]
     pub collapsed_folders: Vec<String>,
+    /// The shared library this client connects to, if any.
+    #[serde(default)]
+    pub server: crate::collab::ServerProfile,
 }
 
 fn default_highlight_rgb() -> [u8; 3] {
@@ -112,8 +116,10 @@ impl Default for AppSettings {
             text_color_rgb: default_text_color_rgb(),
             font_size: default_font_size(),
             glow_strength: default_glow_strength(),
+            #[cfg(feature = "gui")]
             colors: Default::default(),
             collapsed_folders: Vec::new(),
+            server: Default::default(),
         }
     }
 }

@@ -26,6 +26,7 @@ A calm, minimalistic cross-platform desktop notes application written in **Rust*
 - **Quick Formatting Bar**: One-click insertion for `# H1`, `## H2`, `**bold**`, `*italic*`, bullet lists, `- [ ]` task checkboxes, blockquotes, code blocks, and `[[Wiki Links]]`.
 - **Safe Trash & Restore**: Deleted notes move to the **Trash** view first where they can be restored with one click or permanently deleted.
 - **Import Markdown Folder**: Copy `.md` files into an `Import` folder inside your notes folder, then run **Import Markdown From Import Folder** from the Command Palette. Each file becomes a new note with its frontmatter kept. Importing the same files twice creates duplicates.
+- **Shared Notes (Google-Docs style)**: Point the app at an EloraNotes server — address, port, password — and the server's notes appear in the sidebar under its name. Everyone with a note open sees each other's edits as they are typed, with a coloured caret and a name tag at each person's cursor, a dot on the note's card while somebody is in it, and a presence list above the editor. Usernames are the account each person is logged into on their computer.
 - **Color Themes**: Choose **Obsidian** (dark slate), **Paper** (warm light), **Nordic** (arctic dark), **Matcha** (soft sage light), or **Matugen** (colors from your wallpaper). Preferences and folded folders persist automatically.
 
 ## Install
@@ -98,6 +99,80 @@ On launch the app compares its version with the latest GitHub release and, when 
 
 **Settings → Updates** shows the version you are running, checks on demand and installs the result, so an update never has to wait for the next launch.
 
+## Shared Notes
+
+One machine runs a small server; everyone else connects to it from the app. The server keeps the
+notes as ordinary `.md` files in its own folder, and it speaks TLS with a self-signed certificate
+that the client pins on the first connection, so the password never crosses the network in the
+clear.
+
+### Hosting the server
+
+Every release ships the server binary plus an installer for Linux and Windows:
+
+| File | What it is |
+| :--- | :--- |
+| `elora-server-linux-x86_64` | The server binary (no GUI libraries needed) |
+| `install-elora-server.sh` | Linux installer |
+| `elora-server-windows-x86_64.exe` | The server binary |
+| `install-elora-server.ps1` | Windows installer |
+
+**Linux**
+
+```bash
+chmod +x install-elora-server.sh
+sudo ./install-elora-server.sh
+```
+
+**Windows** — open PowerShell as Administrator and run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install-elora-server.ps1
+```
+
+The installer asks for the name people see in their sidebar, the port, and the password everyone
+connects with. It then installs the binary, creates the notes folder, generates the certificate and
+reaches the server at boot (a systemd service on Linux, a startup task on Windows). The server
+listens on all interfaces, so it answers on the LAN and on a public address; the installer opens
+the port in `ufw`, `firewalld` or Windows Firewall when one of those is in charge. Finally it
+prints the addresses to hand out and a short certificate code the first client will ask you to
+confirm.
+
+From another network, forward the port on the router once and give people this machine's public IP
+or a DNS name. If the machine sits behind CGNAT, tunnel the port (for example with a small VPS
+reverse proxy or Tailscale) — the app only needs a host and port that reach it.
+
+Keeping the server running by hand:
+
+```bash
+# Linux
+systemctl status elora-server
+journalctl -u elora-server -f
+
+# Windows
+Start-ScheduledTask -TaskName "EloraNotes Server"
+Stop-ScheduledTask  -TaskName "EloraNotes Server"
+```
+
+On Linux the notes live in `/var/lib/elora-server/notes`; on Windows in
+`C:\ProgramData\EloraNotes Server\notes`. Editing those files directly works too — the server
+re-reads a note's body whenever it is next opened.
+
+### Connecting from the app
+
+**Settings → Shared library**: enter the address (IP or DNS name), the port and the password, and
+press **Connect**. On the first connection EloraNotes shows the server's certificate code; it must
+match the code the installer printed. After that the key is remembered and a different certificate
+is refused, which is what makes a self-signed server safe to use over the internet.
+
+The server's notes appear in the sidebar in a group titled with the server's name, marked with a
+cloud glyph. Your username is the account you are logged into on your computer. While somebody
+else has a note open, its card shows a coloured dot; when you open it too you see their caret with
+their name, and the words they type appear as they type them.
+
+Which notes are synced: the note bodies and the library structure (titles, folders, tags, pins,
+trash). Settings, themes and the update check stay on your own machine.
+
 ## Running From Source
 
 ### Quick Launch (Linux / NixOS / macOS)
@@ -110,6 +185,15 @@ On launch the app compares its version with the latest GitHub release and, when 
 
 ```bash
 cargo run --release
+```
+
+The collaboration server builds on its own, without the GUI libraries a headless machine would
+not have:
+
+```bash
+cargo build --release --no-default-features --bin elora-server
+ELORA_SERVER_DIR=~/.config/elora-server ./target/release/elora-server init
+./target/release/elora-server run
 ```
 
 Pass a custom notes folder via `--dir` or `ELORA_NOTES_DIR`:

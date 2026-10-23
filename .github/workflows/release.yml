@@ -50,6 +50,16 @@ jobs:
       - name: Build AppImage
         run: scripts/build-appimage.sh "$VERSION"
 
+      # The server goes on machines with no display, so it is built without the GUI stack.
+      - name: Build collaboration server
+        run: cargo build --release --locked --no-default-features --bin elora-server
+
+      - name: Package the server and its installer
+        run: |
+          cp target/release/elora-server dist/elora-server-linux-x86_64
+          cp packaging/server/install-linux.sh dist/install-elora-server.sh
+          chmod +x dist/elora-server-linux-x86_64 dist/install-elora-server.sh
+
       - name: Show what will be published
         run: ls -l dist
 
@@ -59,6 +69,8 @@ jobs:
           path: |
             dist/EloraNotes-*-linux-x86_64.tar.gz
             dist/EloraNotes-*-linux-x86_64.AppImage
+            dist/elora-server-linux-x86_64
+            dist/install-elora-server.sh
 
   flatpak:
     name: Linux (Flatpak installer)
@@ -121,6 +133,14 @@ jobs:
           mkdir -p dist
           cp target/release/elora.exe "dist/EloraNotes-$VERSION-windows-x86_64-portable.exe"
 
+      - name: Build collaboration server
+        shell: bash
+        run: |
+          cargo build --release --locked --no-default-features --bin elora-server
+          mkdir -p dist
+          cp target/release/elora-server.exe dist/elora-server-windows-x86_64.exe
+          cp packaging/server/install-windows.ps1 dist/install-elora-server.ps1
+
       - name: Install Inno Setup
         run: choco install innosetup --no-progress -y
 
@@ -138,7 +158,10 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: windows
-          path: dist/EloraNotes-*-windows-x86_64-*.exe
+          path: |
+            dist/EloraNotes-*-windows-x86_64-*.exe
+            dist/elora-server-windows-x86_64.exe
+            dist/install-elora-server.ps1
 
   macos:
     name: macOS (dmg + portable app)

@@ -141,4 +141,8 @@ pub mod icon {
     pub const INFO_CIRCLE: &str = "\u{eac5}";
     pub const REFRESH: &str = "\u{eb13}";
     pub const ALERT_TRIANGLE: &str = "\u{ea06}";
+    pub const CLOUD: &str = "\u{ea76}";
+    pub const SERVER: &str = "\u{eb1f}";
+    pub const USERS: &str = "\u{ebf2}";
+    pub const WIFI_OFF: &str = "\u{ecfa}";
 }

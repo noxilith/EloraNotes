@@ -6,23 +6,46 @@ description = "EloraNotes — A calm, minimalistic cross-platform Markdown notes
 authors = ["EloraNotes"]
 license = "GPL-3.0-or-later"
 
+[lib]
+name = "elora_notes"
+path = "src/lib.rs"
+
 [[bin]]
 name = "elora"
 path = "src/main.rs"
+required-features = ["gui"]
+
+[[bin]]
+name = "elora-server"
+path = "src/bin/elora-server.rs"
+
+[features]
+default = ["gui"]
+# Everything that draws a window. `cargo build --no-default-features --bin elora-server`
+# produces a server binary with no X11/GL/wayland dependency at all.
+gui = ["dep:eframe", "dep:egui"]
 
 [dependencies]
-eframe = { version = "0.31", default-features = false, features = [
+eframe = { version = "0.31", optional = true, default-features = false, features = [
     "default_fonts",
     "glow",
     "wayland",
     "x11",
 ] }
-egui = "0.31"
+egui = { version = "0.31", optional = true }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 ureq = { version = "2", default-features = false, features = ["tls"] }
+yrs = "0.28"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+rustls-pemfile = "2"
+rcgen = "0.14"
+sha2 = "0.10"
+rand = "0.9"
+base64 = "0.22"
+crossbeam-channel = "0.5"
 zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 
 [target."cfg(unix)".dependencies]

@@ -1,3 +1,4 @@
+use crate::collab::{Collab, ConnectionState, Incoming, ServerProfile};
 use crate::icon_names::TABLER_ICON_NAMES;
 use crate::icons::{icon, install_tabler_icons, tabler_glyph};
 use crate::markdown::{
@@ -5,6 +6,7 @@ use crate::markdown::{
     color_swatch_button, insert_at_selection, markdown_to_html, render_inline_spans_ui, rgb_to_hex,
     wrap_selection, HIGHLIGHT_PRESETS,
 };
+use crate::net::{NoteMeta, PresenceUser};
 use crate::storage::{
     extract_wiki_links, fuzzy_subsequence, normalize_folder, normalize_tag, sort_notes,
     AppSettings, Note, NoteStorage, NoteTemplate,
@@ -108,6 +110,22 @@ pub struct EloraApp {
     graph: Option<Vec<GraphNode>>,
     /// Tracks the latest character selection range `(start_char, end_char)` in the active note editor.
     last_editor_selection: Option<(usize, usize)>,
+    /// Caret position in the active note editor, in characters, for the presence cursor sent to
+    /// the other people in a shared note.
+    last_editor_caret: Option<usize>,
+    /// The shared library: connection, server notes and who is editing what.
+    collab: Collab,
+    /// The server saved in Settings, and the copy the Settings fields edit.
+    server: ServerProfile,
+    server_form: ServerProfile,
+    /// Ids of the notes that live on the server rather than on this disk.
+    remote_ids: BTreeSet<String>,
+    /// Bodies of the server notes as last received, so the list can be rebuilt without flicker.
+    remote_bodies: BTreeMap<String, String>,
+    /// The server note the connection currently mirrors.
+    collab_open: Option<String>,
+    /// A certificate the server presented that has not been pinned yet: `(fingerprint, address)`.
+    trust_prompt: Option<(String, String)>,
     confirm_delete_id: Option<String>,
     command_palette_open: bool,
     icon_picker_open: bool,
@@ -281,6 +299,14 @@ impl EloraApp {
             show_settings: false,
             graph: None,
             last_editor_selection: None,
+            last_editor_caret: None,
+            collab: Collab::new(),
+            server: settings.server.clone(),
+            server_form: settings.server.clone(),
+            remote_ids: BTreeSet::new(),
+            remote_bodies: BTreeMap::new(),
+            collab_open: None,
+            trust_prompt: None,
             edit_history: BTreeMap::new(),
             last_seen_body: None,
             confirm_delete_id: None,
@@ -303,6 +329,11 @@ impl EloraApp {
             quiet_update: false,
         };
         app.start_update_check(&cc.egui_ctx, false);
+        // A configured shared library reconnects on its own at launch.
+        if app.server.is_configured() {
+            let profile = app.server.clone();
+            app.collab.connect(profile, crate::net::os_username());
+        }
         app
     }
 
@@ -316,6 +347,7 @@ impl EloraApp {
             glow_strength: self.glow_strength,
             colors: self.colors,
             collapsed_folders: self.collapsed_folders.iter().cloned().collect(),
+            server: self.server.clone(),
         };
         self.storage.save_settings(&settings);
     }
@@ -784,6 +816,10 @@ impl EloraApp {
                             });
                         ui.separator();
 
+                        ui.label(RichText::new("Shared library").strong());
+                        self.shared_library_settings(ui, &defaults);
+                        ui.separator();
+
                         ui.label(RichText::new("Updates").strong());
                         self.update_settings_row(ui, &defaults);
                         ui.separator();
@@ -811,6 +847,114 @@ impl EloraApp {
             self.apply_look(ctx);
             self.persist_settings();
         }
+    }
+
+    /// The shared library section of Settings: where the server is and whether we are on it.
+    fn shared_library_settings(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let connected = self.collab.is_connected();
+        let state_line = match self.collab.state() {
+            ConnectionState::Offline => {
+                if self.collab.is_active() {
+                    "Reconnecting…".to_string()
+                } else {
+                    "Not connected".to_string()
+                }
+            }
+            ConnectionState::Connecting => "Connecting…".to_string(),
+            ConnectionState::Online { server, you } => format!("Connected to {server} as {you}"),
+        };
+        ui.label(RichText::new(state_line).size(11.5).color(if connected {
+            p.accent
+        } else {
+            p.fg_secondary
+        }));
+        let mut watchers: Vec<&str> = self
+            .notes
+            .iter()
+            .filter(|n| self.is_remote(&n.id))
+            .flat_map(|n| self.collab.watchers(&n.id).iter().map(|u| u.name.as_str()))
+            .collect();
+        watchers.sort_unstable();
+        watchers.dedup();
+        if !watchers.is_empty() {
+            ui.label(
+                RichText::new(format!(
+                    "{} In a note right now: {}",
+                    icon::USERS,
+                    watchers.join(", ")
+                ))
+                .size(11.0)
+                .color(p.fg_muted),
+            );
+        }
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            ui.label("Address");
+            ui.add(
+                TextEdit::singleline(&mut self.server_form.host)
+                    .hint_text("192.168.1.20 or notes.example.com")
+                    .desired_width(210.0),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("Port");
+            let mut port = self.server_form.port.to_string();
+            if ui
+                .add(TextEdit::singleline(&mut port).desired_width(70.0))
+                .changed()
+            {
+                if let Ok(parsed) = port.trim().parse::<u16>() {
+                    self.server_form.port = parsed;
+                }
+            }
+            ui.label("Password");
+            ui.add(
+                TextEdit::singleline(&mut self.server_form.password)
+                    .password(true)
+                    .desired_width(140.0),
+            );
+        });
+        ui.horizontal(|ui| {
+            if connected {
+                if ui
+                    .button(format!("{}  Disconnect", icon::WIFI_OFF))
+                    .clicked()
+                {
+                    self.disconnect_server();
+                }
+            } else if ui.button(format!("{}  Connect", icon::CLOUD)).clicked() {
+                self.connect_server();
+            }
+            if self.server.fingerprint.is_some()
+                && ui
+                    .small_button(format!("{}  Forget this server's key", icon::RESTORE))
+                    .on_hover_text("Ask for the certificate code again on the next connection")
+                    .clicked()
+            {
+                self.server.fingerprint = None;
+                self.server_form.fingerprint = None;
+                self.persist_settings();
+            }
+        });
+
+        if self.server.fingerprint.is_some() {
+            let short = crate::net::short_fingerprint(
+                self.server.fingerprint.as_deref().unwrap_or_default(),
+            );
+            ui.label(
+                RichText::new(format!("Trusted key {short}"))
+                    .size(10.5)
+                    .color(p.fg_muted),
+            );
+        }
+        ui.label(
+            RichText::new(
+                "The server's notes appear in the sidebar under its name. Your username comes from this computer's login.",
+            )
+            .size(10.5)
+            .color(p.fg_muted),
+        );
     }
 
     /// The update section of Settings: what is running, what the last check found, and the one
@@ -933,6 +1077,279 @@ impl EloraApp {
 
     fn resort(&mut self) {
         sort_notes(&mut self.notes);
+    }
+
+    /// True when the note lives on the server and must never be written to this disk.
+    fn is_remote(&self, id: &str) -> bool {
+        self.remote_ids.contains(id)
+    }
+
+    /// Saves a note where it belongs: to disk, or back to the server it came from.
+    fn persist_note(&mut self, note_idx: usize) -> Result<(), String> {
+        let note = self.notes[note_idx].clone();
+        if !self.is_remote(&note.id) {
+            return self.storage.save_note(&note).map_err(|e| e.to_string());
+        }
+        // Only the fields that live in the frontmatter; the body has its own live channel, and
+        // sending the metadata on every keystroke would spam every connection.
+        let unchanged = self
+            .collab
+            .notes()
+            .iter()
+            .find(|m| m.id == note.id)
+            .is_some_and(|m| {
+                m.title == note.title
+                    && m.folder == note.folder
+                    && m.tags == note.explicit_tags
+                    && m.pinned == note.pinned
+                    && m.trashed == note.trashed
+                    && m.icon == note.icon
+            });
+        if !unchanged {
+            self.collab.update_note(&NoteMeta {
+                id: note.id.clone(),
+                title: note.title,
+                folder: note.folder,
+                tags: note.explicit_tags,
+                pinned: note.pinned,
+                trashed: note.trashed,
+                icon: note.icon,
+                updated_at: note.updated_at.timestamp(),
+            });
+        }
+        if self.collab_open.as_deref() == Some(note.id.as_str()) {
+            self.collab.send_body(&note.id, &note.body);
+        }
+        Ok(())
+    }
+
+    /// Connects to the server in Settings and remembers the details.
+    fn connect_server(&mut self) {
+        self.server = self.server_form.clone();
+        self.persist_settings();
+        if !self.server.is_configured() {
+            self.status_message = Some("Enter the server address and password first".to_string());
+            return;
+        }
+        self.remote_bodies.clear();
+        self.collab
+            .connect(self.server.clone(), crate::net::os_username());
+        self.status_message = Some(format!("Connecting to {}…", self.server.address()));
+    }
+
+    fn disconnect_server(&mut self) {
+        self.collab.disconnect();
+        self.collab_open = None;
+        self.drop_remote_notes();
+        self.status_message = Some("Left the shared library".to_string());
+    }
+
+    /// Removes the server's notes from the list after disconnecting.
+    fn drop_remote_notes(&mut self) {
+        if self.remote_ids.is_empty() {
+            return;
+        }
+        let ids = std::mem::take(&mut self.remote_ids);
+        self.notes.retain(|n| !ids.contains(&n.id));
+        self.remote_bodies.clear();
+        if self
+            .selected_id
+            .as_deref()
+            .is_some_and(|id| ids.contains(id))
+        {
+            self.selected_id = None;
+            self.select_first_visible();
+        }
+    }
+
+    /// Rebuilds the server's notes from what the connection last reported, keeping the body the
+    /// editor is currently showing for the open note so typing is never yanked backwards.
+    fn apply_library(&mut self) {
+        let metas = self.collab.notes().to_vec();
+        let live: BTreeSet<String> = metas.iter().map(|m| m.id.clone()).collect();
+        self.notes
+            .retain(|n| !self.remote_ids.contains(&n.id) || live.contains(&n.id));
+        self.remote_ids.retain(|id| live.contains(id));
+
+        for meta in metas {
+            let updated = chrono::TimeZone::timestamp_opt(&Utc, meta.updated_at, 0)
+                .single()
+                .unwrap_or_else(Utc::now);
+            match self.notes.iter_mut().find(|n| n.id == meta.id) {
+                Some(note) => {
+                    note.title = meta.title;
+                    note.folder = meta.folder;
+                    note.explicit_tags = meta.tags;
+                    note.pinned = meta.pinned;
+                    note.trashed = meta.trashed;
+                    note.icon = meta.icon;
+                    note.updated_at = updated;
+                    if self.collab_open.as_deref() != Some(meta.id.as_str()) {
+                        if let Some(body) = self.remote_bodies.get(&meta.id) {
+                            note.body = body.clone();
+                        }
+                    }
+                }
+                None => {
+                    let body = self
+                        .remote_bodies
+                        .get(&meta.id)
+                        .cloned()
+                        .unwrap_or_default();
+                    self.notes.push(Note {
+                        id: meta.id.clone(),
+                        title: meta.title,
+                        body,
+                        pinned: meta.pinned,
+                        trashed: meta.trashed,
+                        explicit_tags: meta.tags,
+                        icon: meta.icon,
+                        folder: meta.folder,
+                        created_at: updated,
+                        updated_at: updated,
+                        file_path: PathBuf::new(),
+                    });
+                }
+            }
+            self.remote_ids.insert(meta.id);
+        }
+        self.resort();
+    }
+
+    /// Drains the connection's messages and folds them into the app state.
+    fn poll_collab(&mut self) {
+        let mut library_changed = false;
+        for event in self.collab.poll() {
+            match event {
+                Incoming::Online { server, .. } => {
+                    self.status_message = Some(format!("Connected to {server}"));
+                    // A fresh connection starts with no note mirrored, so the selected shared
+                    // note is reopened and re-synced.
+                    self.collab_open = None;
+                    library_changed = true;
+                }
+                Incoming::Notes(_) => library_changed = true,
+                Incoming::Offline(reason) => {
+                    if self.collab.is_active() {
+                        self.status_message = Some(format!("Server: {reason}"));
+                    }
+                    self.collab_open = None;
+                    library_changed = true;
+                }
+                Incoming::Body { id, text } => {
+                    self.remote_bodies.insert(id.clone(), text.clone());
+                    if let Some(note) = self.notes.iter_mut().find(|n| n.id == id) {
+                        note.body = text.clone();
+                        note.updated_at = Utc::now();
+                    }
+                    if self.selected_id.as_deref() == Some(id.as_str()) {
+                        // Somebody else's typing is not a local edit: no undo step, no save.
+                        self.last_seen_body = Some((id, text));
+                    }
+                }
+                Incoming::Presence(_) | Incoming::Peers(_) => {}
+            }
+        }
+
+        if let Some(fingerprint) = self.collab.take_fingerprint() {
+            if self.server.fingerprint.is_none() {
+                self.trust_prompt = Some((fingerprint, self.server.address()));
+            }
+        }
+
+        if library_changed {
+            self.apply_library();
+        }
+    }
+
+    /// Keeps the connection pointed at the selected note: shared notes are mirrored live, local
+    /// notes leave the room.
+    fn sync_open_note(&mut self) {
+        let selected = self.selected_id.clone();
+        let wanted = selected.filter(|id| self.is_remote(id));
+        if wanted == self.collab_open {
+            return;
+        }
+        if self.collab_open.is_some() {
+            self.collab.close_note();
+        }
+        self.collab_open = wanted.clone();
+        if let Some(id) = wanted {
+            let body = self
+                .notes
+                .iter()
+                .find(|n| n.id == id)
+                .map(|n| n.body.clone())
+                .unwrap_or_default();
+            self.collab.open_note(&id, &body);
+        }
+    }
+
+    /// Asks the user to confirm a server's certificate the first time they connect to it.
+    fn trust_prompt_window(&mut self, ctx: &egui::Context) {
+        let Some((fingerprint, address)) = self.trust_prompt.clone() else {
+            return;
+        };
+        let p = self.theme.palette_with(&self.colors, self.glow_strength);
+        let short = crate::net::short_fingerprint(&fingerprint);
+        let mut open = true;
+        let mut accept = false;
+        let mut reject = false;
+        egui::Window::new("Trust this server?")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(380.0)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(format!("First connection to {address}"))
+                        .strong()
+                        .color(p.fg_primary),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Check that this code matches the one the server printed while it installed:",
+                    )
+                    .size(11.5)
+                    .color(p.fg_secondary),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(short)
+                        .monospace()
+                        .size(19.0)
+                        .strong()
+                        .color(p.accent),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("EloraNotes remembers it, so nobody can pretend to be this server later.")
+                        .size(11.0)
+                        .color(p.fg_muted),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button(format!("{}  Trust and connect", icon::CHECK)).clicked() {
+                        accept = true;
+                    }
+                    if ui.button("Disconnect").clicked() {
+                        reject = true;
+                    }
+                });
+            });
+
+        if accept {
+            self.server.fingerprint = Some(fingerprint);
+            self.server_form.fingerprint = self.server.fingerprint.clone();
+            self.persist_settings();
+            self.trust_prompt = None;
+            self.status_message = Some("Server trusted".to_string());
+        } else if reject || !open {
+            self.trust_prompt = None;
+            self.disconnect_server();
+        }
     }
 
     /// Every folder currently used by a live note, alphabetically.
@@ -1278,11 +1695,11 @@ impl EloraApp {
     }
 
     fn move_to_trash(&mut self, id: &str) {
-        if let Some(note) = self.notes.iter_mut().find(|n| n.id == id) {
-            note.trashed = true;
-            note.pinned = false;
-            note.updated_at = Utc::now();
-            let _ = self.storage.save_note(note);
+        if let Some(idx) = self.notes.iter().position(|n| n.id == id) {
+            self.notes[idx].trashed = true;
+            self.notes[idx].pinned = false;
+            self.notes[idx].updated_at = Utc::now();
+            let _ = self.persist_note(idx);
             self.resort();
             self.select_first_visible();
             self.status_message = Some("Moved note to Trash".to_string());
@@ -1290,10 +1707,10 @@ impl EloraApp {
     }
 
     fn restore_from_trash(&mut self, id: &str) {
-        if let Some(note) = self.notes.iter_mut().find(|n| n.id == id) {
-            note.trashed = false;
-            note.updated_at = Utc::now();
-            let _ = self.storage.save_note(note);
+        if let Some(idx) = self.notes.iter().position(|n| n.id == id) {
+            self.notes[idx].trashed = false;
+            self.notes[idx].updated_at = Utc::now();
+            let _ = self.persist_note(idx);
             self.resort();
             self.status_message = Some("Restored note from Trash".to_string());
         }
@@ -1301,8 +1718,19 @@ impl EloraApp {
 
     fn permanently_delete_by_id(&mut self, id: &str) {
         if let Some(pos) = self.notes.iter().position(|n| n.id == id) {
-            let removed = self.notes.remove(pos);
-            let _ = self.storage.delete_note(&removed);
+            if self.is_remote(id) {
+                self.collab.delete_note(id, true);
+                self.remote_bodies.remove(id);
+                self.remote_ids.remove(id);
+                self.notes.remove(pos);
+                if self.collab_open.as_deref() == Some(id) {
+                    self.collab.close_note();
+                    self.collab_open = None;
+                }
+            } else {
+                let removed = self.notes.remove(pos);
+                let _ = self.storage.delete_note(&removed);
+            }
             self.confirm_delete_id = None;
             self.select_first_visible();
             self.status_message = Some("Permanently deleted note".to_string());
@@ -2177,13 +2605,18 @@ impl EloraApp {
             .filter(|&i| self.notes[i].pinned && !self.notes[i].trashed)
             .collect();
 
-        // Unpinned live notes are grouped by folder; trashed notes are listed flat.
+        // Unpinned live notes are grouped by folder; trashed notes are listed flat. The
+        // server's notes get their own group, titled with the server's name.
         let mut folder_groups: Vec<(String, Vec<usize>)> = Vec::new();
+        let mut remote_indices: Vec<usize> = Vec::new();
         let mut unfiled: Vec<usize> = Vec::new();
         let mut trashed_indices: Vec<usize> = Vec::new();
+        let server_label = self.collab.server_name().unwrap_or("Shared").to_string();
         for &i in &filtered {
             let note = &self.notes[i];
-            if note.trashed {
+            if self.remote_ids.contains(&note.id) {
+                remote_indices.push(i);
+            } else if note.trashed {
                 trashed_indices.push(i);
             } else if note.pinned {
                 // Already listed in the pinned section above.
@@ -2224,9 +2657,40 @@ impl EloraApp {
                             self.selected_id.as_deref(),
                             p,
                             &self.search_query,
+                            Some(&self.collab),
                             &mut picked,
                         );
                         ui.add_space(4.0);
+                    }
+
+                    if !remote_indices.is_empty() {
+                        let key = format!("server:{server_label}");
+                        let collapsed = !folders_open && self.collapsed_folders.contains(&key);
+                        if folder_header(
+                            ui,
+                            &format!("{} {server_label}", icon::CLOUD),
+                            remote_indices.len(),
+                            collapsed,
+                            p,
+                        )
+                        .clicked()
+                        {
+                            toggled_folder = Some(key);
+                        }
+                        if !collapsed {
+                            ui.add_space(2.0);
+                            render_note_rows(
+                                ui,
+                                &self.notes,
+                                &remote_indices,
+                                self.selected_id.as_deref(),
+                                p,
+                                &self.search_query,
+                                Some(&self.collab),
+                                &mut picked,
+                            );
+                            ui.add_space(3.0);
+                        }
                     }
 
                     for (name, indices) in &folder_groups {
@@ -2243,6 +2707,7 @@ impl EloraApp {
                                 self.selected_id.as_deref(),
                                 p,
                                 &self.search_query,
+                                Some(&self.collab),
                                 &mut picked,
                             );
                             ui.add_space(3.0);
@@ -2260,6 +2725,7 @@ impl EloraApp {
                             self.selected_id.as_deref(),
                             p,
                             &self.search_query,
+                            Some(&self.collab),
                             &mut picked,
                         );
                     }
@@ -2273,6 +2739,7 @@ impl EloraApp {
                             self.selected_id.as_deref(),
                             p,
                             &self.search_query,
+                            Some(&self.collab),
                             &mut picked,
                         );
                     }
@@ -2545,7 +3012,33 @@ impl EloraApp {
             }
         }
 
-        self.last_seen_body = Some((note_id, self.notes[note_idx].body.clone()));
+        self.last_seen_body = Some((note_id.clone(), self.notes[note_idx].body.clone()));
+
+        // Who else has this note open, with the colour of their caret.
+        let peers: Vec<crate::collab::RemotePeer> = if self.is_remote(&note_id) {
+            self.collab.peers().to_vec()
+        } else {
+            Vec::new()
+        };
+        if !peers.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(5.0, 2.0);
+                ui.label(
+                    RichText::new(format!("{} Editing with", icon::USERS))
+                        .size(11.0)
+                        .color(p.fg_muted),
+                );
+                for peer in &peers {
+                    let [r, g, b] = peer.color;
+                    ui.label(
+                        RichText::new(format!("● {}", peer.name))
+                            .size(11.0)
+                            .color(Color32::from_rgb(r, g, b)),
+                    );
+                }
+            });
+            ui.add_space(2.0);
+        }
 
         let is_dark = self.theme.is_dark();
         let p_copy = *p;
@@ -2574,6 +3067,39 @@ impl EloraApp {
             let a = cursor_range.primary.ccursor.index;
             let b = cursor_range.secondary.ccursor.index;
             self.last_editor_selection = Some((a.min(b), a.max(b)));
+            self.last_editor_caret = Some(a);
+        }
+
+        // Other people's carets, drawn where their cursor sits in the text.
+        if !peers.is_empty() {
+            let painter = ui.painter();
+            let body = &self.notes[note_idx].body;
+            for peer in &peers {
+                let Some(byte) = peer.cursor else {
+                    continue;
+                };
+                let byte = byte.min(body.len());
+                let byte = (0..=byte)
+                    .rev()
+                    .find(|i| body.is_char_boundary(*i))
+                    .unwrap_or(0);
+                let char_index = body[..byte].chars().count();
+                let caret = output
+                    .galley
+                    .pos_from_ccursor(egui::text::CCursor::new(char_index));
+                let top = output.galley_pos + caret.left_top().to_vec2();
+                let height = caret.height().max(self.font_size + 2.0);
+                let [r, g, b] = peer.color;
+                let color = Color32::from_rgb(r, g, b);
+                painter.vline(top.x, top.y..=top.y + height, Stroke::new(1.8_f32, color));
+                painter.text(
+                    top - Vec2::new(0.0, 1.0),
+                    Align2::LEFT_BOTTOM,
+                    &peer.name,
+                    FontId::proportional(10.0),
+                    color,
+                );
+            }
         }
 
         if output.response.changed() {
@@ -3509,8 +4035,23 @@ impl EloraApp {
             }
         }
 
+        // A shared note is mirrored to everyone with it open as it is typed.
+        if self.is_remote(&selected_id) {
+            let body = self.notes[note_idx].body.clone();
+            self.collab.send_body(&selected_id, &body);
+            if let Some(caret) = self.last_editor_caret {
+                let char_index = caret.min(body.chars().count());
+                let byte = body
+                    .char_indices()
+                    .nth(char_index)
+                    .map(|(i, _)| i)
+                    .unwrap_or(body.len());
+                self.collab.send_cursor(byte);
+            }
+        }
+
         if needs_save {
-            if let Err(e) = self.storage.save_note(&self.notes[note_idx]) {
+            if let Err(e) = self.persist_note(note_idx) {
                 self.status_message = Some(format!("Auto-save error: {e}"));
             }
         }
@@ -3550,8 +4091,11 @@ impl eframe::App for EloraApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_shortcuts(ctx);
         self.poll_update();
+        self.poll_collab();
+        self.sync_open_note();
         self.settings_window(ctx);
         self.graph_window(ctx);
+        self.trust_prompt_window(ctx);
         let p = self.theme.palette_with(&self.colors, self.glow_strength);
 
         if !self.focus_mode {
@@ -3808,6 +4352,7 @@ struct CardSelection {
 }
 
 /// Renders the given note indices as cards, recording any click in `picked`.
+#[allow(clippy::too_many_arguments)]
 fn render_note_rows(
     ui: &mut Ui,
     notes: &[Note],
@@ -3815,12 +4360,14 @@ fn render_note_rows(
     selected_id: Option<&str>,
     p: &Palette,
     query: &str,
+    collab: Option<&Collab>,
     picked: &mut CardSelection,
 ) {
     for &idx in indices {
         let note = &notes[idx];
         let is_selected = selected_id == Some(note.id.as_str());
-        if let Some(action) = render_note_card(ui, note, is_selected, p, query) {
+        let watchers: &[PresenceUser] = collab.map(|c| c.watchers(&note.id)).unwrap_or_default();
+        if let Some(action) = render_note_card(ui, note, is_selected, p, query, watchers) {
             match action {
                 CardAction::SelectNote(id) => picked.note_id = Some(id),
                 CardAction::FilterTag(t) => picked.tag = Some(t),
@@ -3836,6 +4383,7 @@ fn render_note_card(
     is_selected: bool,
     p: &Palette,
     query: &str,
+    watchers: &[PresenceUser],
 ) -> Option<CardAction> {
     let mut action = None;
     let bg = if is_selected {
@@ -3880,6 +4428,20 @@ fn render_note_card(
                         .size(13.5)
                         .color(p.fg_primary),
                 );
+                // A dot per person with this note open, in the colour of their caret.
+                if !watchers.is_empty() {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        for user in watchers.iter().rev().take(4) {
+                            let [r, g, b] = user.color;
+                            ui.label(
+                                RichText::new("●")
+                                    .size(9.0)
+                                    .color(Color32::from_rgb(r, g, b)),
+                            )
+                            .on_hover_text(format!("{} is in this note", user.name));
+                        }
+                    });
+                }
             });
 
             let excerpt = note.body_snippet(query).unwrap_or_else(|| note.snippet());
