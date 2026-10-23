@@ -155,7 +155,25 @@ fn test_two_clients_edit_the_same_note() {
     // Alice sees Bob arrive in the presence list for this note.
     settle(&mut alice, &mut alice_body, "alice presence", |c, _| {
         c.watchers(&note_id).iter().any(|u| u.name == "bob")
+            && c.peers().iter().any(|p| p.name == "bob")
     });
+
+    // Bob switches to a note of his own: he is no longer editing this one, so Alice stops
+    // drawing his name and caret over it.
+    bob.close_note();
+    settle(
+        &mut alice,
+        &mut alice_body,
+        "alice after bob left",
+        |c, _| c.peers().is_empty() && c.watchers(&note_id).is_empty(),
+    );
+    bob.open_note(&note_id, &bob_body);
+    settle(
+        &mut alice,
+        &mut alice_body,
+        "alice after bob returned",
+        |c, _| c.peers().iter().any(|p| p.name == "bob"),
+    );
 
     // Alice moves her caret; Bob can see where she is.
     alice.send_cursor(3);
@@ -185,6 +203,22 @@ fn test_two_clients_edit_the_same_note() {
         "a remote edit must ask for a new frame"
     );
 
+    // Two machines with the same account name: one leaving must not take the other's presence
+    // away with it. Bob is the one looking, since Alice does not show herself.
+    let mut twin = Collab::new();
+    twin.connect(profile(harness.port), "alice".into());
+    settle(&mut twin, &mut String::new(), "twin", |c, _| {
+        c.is_connected()
+    });
+    twin.open_note(&note_id, "");
+    settle(&mut bob, &mut bob_body, "bob sees both alices", |c, _| {
+        c.peers().iter().filter(|p| p.name == "alice").count() == 2
+    });
+    twin.disconnect();
+    settle(&mut bob, &mut bob_body, "bob keeps alice", |c, _| {
+        c.peers().iter().filter(|p| p.name == "alice").count() == 1
+    });
+
     // Both type at once, at different ends. The merged text must contain both edits.
     let alice_edit = format!("A{}", alice_body);
     let bob_edit = format!("{bob_body} B");
@@ -200,7 +234,12 @@ fn test_two_clients_edit_the_same_note() {
     });
     viewer.open_note(&note_id, "");
     settle(&mut viewer, &mut viewer_body, "viewer", |c, body| {
-        body.contains("from alice") && body.contains(" B") && c.is_watched(&note_id)
+        body.contains("from alice")
+            && body.contains(" B")
+            && c.is_watched(&note_id)
+            // Whoever was already here is visible straight away, not once they happen to move.
+            && c.peers().iter().any(|p| p.name == "alice")
+            && c.peers().iter().any(|p| p.name == "bob")
     });
     assert!(
         viewer_body.starts_with("Ahello") || viewer_body.starts_with("hello"),
@@ -264,11 +303,12 @@ fn test_two_clients_edit_the_same_note() {
         "body: {created_raw:?}"
     );
 
-    // Everyone left but the viewer: presence goes away again.
+    // Everyone left but the viewer: their names and carets go away with them, not just their
+    // sidebar entries.
     alice.disconnect();
     bob.disconnect();
     settle(&mut viewer, &mut viewer_body, "viewer", |c, _| {
-        c.watchers(&note_id).is_empty()
+        c.watchers(&note_id).is_empty() && c.peers().is_empty()
     });
 
     // The server writes the merged body back to a plain Markdown file, on a short debounce.

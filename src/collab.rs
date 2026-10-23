@@ -875,7 +875,11 @@ impl Session {
         if self.awareness.set_local_state(state).is_err() {
             return;
         }
-        if let Ok(update) = self.awareness.update() {
+        // Only this client's own state goes out. `update()` would include every peer it has
+        // heard of, which would have the server credit this connection with other people's
+        // presence and make leaving remove them too.
+        let own = self.awareness.client_id();
+        if let Ok(update) = self.awareness.update_with_clients([own]) {
             let bytes = update.encode_v1();
             let _ = self.send_frame(FRAME_AWARENESS, &bytes);
             events.send(Incoming::Peers(self.peers()));
@@ -883,8 +887,12 @@ impl Session {
     }
 
     fn clear_awareness(&mut self) {
+        let own = self.awareness.client_id();
         self.awareness.clean_local_state();
-        if let Ok(update) = self.awareness.update() {
+        // `update()` leaves out the states that were just cleared, so the removal has to be asked
+        // for by id: otherwise leaving a note tells nobody, and the others keep drawing this
+        // person's name and caret over it.
+        if let Ok(update) = self.awareness.update_with_clients([own]) {
             let _ = self.send_frame(FRAME_AWARENESS, &update.encode_v1());
         }
     }

@@ -25,6 +25,21 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.9.8" date="2026-10-23">
+      <description>
+        <p>
+          People no longer linger on a shared note after they leave it. Closing a shared note, or
+          switching to another one or to a personal note, tells the others straight away; a
+          connection that goes away without saying goodbye — the app quit, or a machine that
+          dropped off — is cleared out by the server with the presence update the other clients
+          need to drop the name and caret. Opening a shared note also shows who is already
+          editing it, instead of only the people who happen to move afterwards. Presence is now
+          tracked per connection rather than by name, so two people who use the same account name
+          no longer take each other's caret away when one of them leaves. The server has to be
+          updated as well for the disconnects and the join-time list.
+        </p>
+      </description>
+    </release>
     <release version="0.9.7" date="2026-10-23">
       <description>
         <p>

@@ -21,10 +21,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use yrs::sync::{Message as YMessage, SyncMessage};
+use yrs::sync::awareness::AwarenessUpdateEntry;
+use yrs::sync::{AwarenessUpdate, Message as YMessage, SyncMessage};
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
-use yrs::{Doc, GetString, ReadTxn, StateVector, Text, TextRef, Transact};
+use yrs::{ClientID, Doc, GetString, ReadTxn, StateVector, Text, TextRef, Transact};
 
 /// Read timeout for a connection: short enough that queued broadcasts go out promptly.
 const READ_TIMEOUT: Duration = Duration::from_millis(8);
@@ -46,6 +47,10 @@ struct Client {
     id: u64,
     name: Mutex<String>,
     room: Mutex<Option<String>>,
+    /// The awareness ids this connection has published, so leaving the room removes exactly
+    /// those states. Matching on the name would make two people who happen to use the same
+    /// account name disappear together.
+    awareness: Mutex<HashSet<u64>>,
     authed: AtomicBool,
     outbox: Mutex<Vec<Frame>>,
 }
@@ -63,10 +68,18 @@ struct Library {
 struct Room {
     doc: Doc,
     text: TextRef,
-    /// Awareness client id -> the JSON state that client last published (name, colour, cursor).
-    /// The server only relays these; it never needs a Yjs client identity of its own.
-    awareness: HashMap<u64, String>,
+    /// Awareness client id -> what that client last published (name, colour, cursor) and the
+    /// clock it published under. The server only relays these; it never needs a Yjs client
+    /// identity of its own, but it does keep the clock so it can tell the others that somebody
+    /// left with an update they will accept.
+    awareness: HashMap<u64, PeerState>,
     subscribers: HashSet<u64>,
+}
+
+/// One person's presence in a room, as they last published it.
+struct PeerState {
+    clock: u32,
+    json: String,
 }
 
 impl Server {
@@ -129,6 +142,7 @@ impl Server {
             id,
             name: Mutex::new(String::new()),
             room: Mutex::new(None),
+            awareness: Mutex::new(HashSet::new()),
             authed: AtomicBool::new(false),
             outbox: Mutex::new(Vec::new()),
         });
@@ -341,6 +355,9 @@ impl Server {
     }
 
     fn open_room(&self, client: &Arc<Client>, id: &str) -> Result<(), String> {
+        // Moving straight from one note to another must not leave this client subscribed to, or
+        // shown as present in, the note it came from.
+        self.leave_room(client);
         let mut library = self.library.lock().map_err(|_| "library poisoned")?;
         if !library.notes.contains_key(id) {
             return Err(format!("no note with id {id}"));
@@ -359,6 +376,24 @@ impl Server {
             .encode_state_as_update_v1(&StateVector::default());
         let step1 = YMessage::Sync(SyncMessage::SyncStep1(state_vector));
         let step2 = YMessage::Sync(SyncMessage::SyncStep2(diff));
+        // Awareness is only relayed as it changes, so somebody opening a note has to be told
+        // about the people already in it — otherwise their names and carets stay invisible until
+        // those people happen to move.
+        let present = AwarenessUpdate {
+            clients: room
+                .awareness
+                .iter()
+                .map(|(awareness_id, state)| {
+                    (
+                        ClientID::new(*awareness_id),
+                        AwarenessUpdateEntry {
+                            clock: state.clock,
+                            json: state.json.as_str().into(),
+                        },
+                    )
+                })
+                .collect(),
+        };
         drop(library);
 
         self.push(client, FRAME_SYNC, step1.encode_v1());
@@ -366,6 +401,9 @@ impl Server {
         // Our own step 1 asks the client for its state; SyncStep2 above already carries ours.
         let server_sv = YMessage::Sync(SyncMessage::SyncStep1(StateVector::default()));
         self.push(client, FRAME_SYNC, server_sv.encode_v1());
+        if !present.clients.is_empty() {
+            self.push(client, FRAME_AWARENESS, present.encode_v1());
+        }
         if let Ok(mut slot) = client.room.lock() {
             *slot = Some(id.to_string());
         }
@@ -375,26 +413,51 @@ impl Server {
 
     fn leave_room(&self, client: &Arc<Client>) {
         let previous = client.room.lock().ok().and_then(|mut slot| slot.take());
-        if let Some(id) = previous {
-            let name = client.name.lock().map(|n| n.clone()).unwrap_or_default();
-            if let Ok(mut library) = self.library.lock() {
-                if let Some(room) = library.rooms.get_mut(&id) {
-                    room.subscribers.remove(&client.id);
-                    // The awareness ids belong to the client, so drop the states published
-                    // under this person's name when their connection goes away.
-                    room.awareness.retain(|_, state| {
-                        serde_json::from_str::<serde_json::Value>(state)
-                            .ok()
-                            .and_then(|v| {
-                                v.get("name").and_then(|n| n.as_str()).map(str::to_string)
-                            })
-                            .map(|state_name| state_name != name)
-                            .unwrap_or(true)
-                    });
+        let Some(id) = previous else {
+            return;
+        };
+        let mut gone: Vec<(u64, u32)> = Vec::new();
+        let mut remaining: Vec<u64> = Vec::new();
+        let published: Vec<u64> = client
+            .awareness
+            .lock()
+            .map(|ids| ids.iter().copied().collect())
+            .unwrap_or_default();
+        if let Ok(mut library) = self.library.lock() {
+            if let Some(room) = library.rooms.get_mut(&id) {
+                room.subscribers.remove(&client.id);
+                for awareness_id in published {
+                    if let Some(state) = room.awareness.remove(&awareness_id) {
+                        gone.push((awareness_id, state.clock));
+                    }
                 }
+                remaining = room.subscribers.iter().copied().collect();
             }
-            self.broadcast_presence();
         }
+        // The people still in the room have that state in their own awareness from when it was
+        // relayed to them, and only an update removes it again: without this the name and caret
+        // of somebody who switched notes or quit would stay on the note for good.
+        if !gone.is_empty() {
+            let update = AwarenessUpdate {
+                clients: gone
+                    .into_iter()
+                    .map(|(awareness_id, clock)| {
+                        (
+                            ClientID::new(awareness_id),
+                            AwarenessUpdateEntry {
+                                clock,
+                                json: "null".into(),
+                            },
+                        )
+                    })
+                    .collect(),
+            };
+            let payload = update.encode_v1();
+            for subscriber in remaining {
+                self.push_to(subscriber, FRAME_AWARENESS, payload.clone());
+            }
+        }
+        self.broadcast_presence();
     }
 
     fn handle_doc_frame(&self, client: &Arc<Client>, kind: u8, payload: Vec<u8>) {
@@ -434,11 +497,29 @@ impl Server {
                 if let Ok(mut library) = self.library.lock() {
                     if let Some(room) = library.rooms.get_mut(&note_id) {
                         for (awareness_id, entry) in update.clients.iter() {
+                            let awareness_id = awareness_id.get();
                             if entry.json.trim() == "null" {
-                                room.awareness.remove(&awareness_id.get());
+                                room.awareness.remove(&awareness_id);
+                                if let Ok(mut mine) = client.awareness.lock() {
+                                    mine.remove(&awareness_id);
+                                }
                             } else {
-                                room.awareness
-                                    .insert(awareness_id.get(), entry.json.to_string());
+                                if let Ok(mut mine) = client.awareness.lock() {
+                                    mine.insert(awareness_id);
+                                }
+                                if room
+                                    .awareness
+                                    .get(&awareness_id)
+                                    .is_none_or(|state| state.clock <= entry.clock)
+                                {
+                                    room.awareness.insert(
+                                        awareness_id,
+                                        PeerState {
+                                            clock: entry.clock,
+                                            json: entry.json.to_string(),
+                                        },
+                                    );
+                                }
                             }
                         }
                     }
@@ -794,7 +875,7 @@ impl Library {
             }
             let mut users: Vec<PresenceUser> = Vec::new();
             for state in room.awareness.values() {
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(state) else {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&state.json) else {
                     continue;
                 };
                 let name = value
