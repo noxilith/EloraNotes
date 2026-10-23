@@ -25,6 +25,18 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.9.5" date="2026-10-22">
+      <description>
+        <p>
+          The folder menu on a note now lists the connected server under "Shared libraries":
+          picking it moves the note into the shared library with its body, folder, tags, pin and
+          icon, and the local file goes once the server has it. A shared note offers "Copy to this
+          computer" instead. The server installer, run on a machine that already has a server,
+          now asks whether to update it, uninstall it and keep the notes, uninstall it and delete
+          them, or cancel.
+        </p>
+      </description>
+    </release>
     <release version="0.9.4" date="2026-10-22">
       <description>
         <p>

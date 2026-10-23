@@ -199,6 +199,7 @@ fn test_two_clients_edit_the_same_note() {
         &["plan".to_string()],
         "the body Alice wrote",
         true,
+        Some("book"),
     );
     let mut created_id = None;
     let mut waited = 0;
@@ -210,6 +211,7 @@ fn test_two_clients_edit_the_same_note() {
                     assert_eq!(note.folder.as_deref(), Some("Team"));
                     assert_eq!(note.tags, vec!["plan".to_string()]);
                     assert!(note.pinned);
+                    assert_eq!(note.icon.as_deref(), Some("book"));
                     created_id = Some(note.id);
                 }
                 Incoming::Body { .. } => {}

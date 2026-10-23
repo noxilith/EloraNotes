@@ -303,10 +303,11 @@ impl Server {
                 tags,
                 body,
                 pinned,
+                icon,
             } => {
                 let meta = {
                     let mut library = self.library.lock().map_err(|_| "library poisoned")?;
-                    library.create(&title, folder, tags, &body, pinned)?
+                    library.create(&title, folder, tags, &body, pinned, icon)?
                 };
                 self.broadcast_library();
                 self.push(client, FRAME_JSON, json(&ServerMsg::Created { note: meta }));
@@ -625,6 +626,7 @@ impl Library {
         tags: Vec<String>,
         body: &str,
         pinned: bool,
+        icon: Option<String>,
     ) -> Result<NoteMeta, String> {
         let title = title.trim();
         let title = if title.is_empty() { "Untitled" } else { title };
@@ -647,7 +649,7 @@ impl Library {
                 .collect(),
             pinned,
             trashed: false,
-            icon: None,
+            icon: icon.filter(|i| !i.trim().is_empty()),
             updated_at: now.timestamp(),
         };
         // Written straight to disk: there is no room for this note yet, and the first client to
@@ -919,7 +921,7 @@ mod tests {
         let dir = temp_dir("library");
         let mut library = Library::load(&dir).unwrap();
         let meta = library
-            .create("Meeting notes", None, Vec::new(), "", false)
+            .create("Meeting notes", None, Vec::new(), "", false, None)
             .unwrap();
         assert!(meta.id.starts_with("meeting-notes-"));
         let path = dir.join(format!("{}.md", meta.id));
@@ -941,14 +943,20 @@ mod tests {
                 vec!["#plan".to_string(), "  ".to_string()],
                 "written by the client",
                 false,
+                Some("book".to_string()),
             )
             .unwrap();
         assert_eq!(meta.folder.as_deref(), Some("Team"));
         assert_eq!(meta.tags, vec!["plan".to_string()]);
+        assert_eq!(meta.icon.as_deref(), Some("book"));
         let raw = std::fs::read_to_string(dir.join(format!("{}.md", meta.id))).unwrap();
         assert!(raw.contains("folder: \"Team\""), "frontmatter: {raw:?}");
         assert!(raw.contains("tags: [plan]"), "frontmatter: {raw:?}");
+        assert!(raw.contains("icon: book"), "frontmatter: {raw:?}");
         assert!(raw.contains("written by the client"), "body: {raw:?}");
+        // A note moved into the shared library keeps its icon across a restart too.
+        let reloaded = Library::load(&dir).unwrap();
+        assert_eq!(reloaded.notes[&meta.id].icon.as_deref(), Some("book"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -957,7 +965,7 @@ mod tests {
         let dir = temp_dir("doc");
         let mut library = Library::load(&dir).unwrap();
         let meta = library
-            .create("Shared", None, Vec::new(), "", false)
+            .create("Shared", None, Vec::new(), "", false, None)
             .unwrap();
         library.open(&meta.id).unwrap();
         {
@@ -977,7 +985,9 @@ mod tests {
     fn test_metadata_update_survives_reload() {
         let dir = temp_dir("meta");
         let mut library = Library::load(&dir).unwrap();
-        let meta = library.create("Tags", None, Vec::new(), "", false).unwrap();
+        let meta = library
+            .create("Tags", None, Vec::new(), "", false, None)
+            .unwrap();
         library
             .update(
                 &meta.id,

@@ -158,6 +158,7 @@ enum Command {
         tags: Vec<String>,
         body: String,
         pinned: bool,
+        icon: Option<String>,
     },
     Update {
         id: String,
@@ -428,6 +429,7 @@ impl Collab {
         tags: &[String],
         body: &str,
         pinned: bool,
+        icon: Option<&str>,
     ) {
         self.send(Command::Create {
             title: title.to_string(),
@@ -435,6 +437,7 @@ impl Collab {
             tags: tags.to_vec(),
             body: body.to_string(),
             pinned,
+            icon: icon.map(str::to_string),
         });
     }
 
@@ -675,12 +678,14 @@ impl Session {
                 tags,
                 body,
                 pinned,
+                icon,
             } => self.send_msg(&ClientMsg::Create {
                 title,
                 folder,
                 tags,
                 body,
                 pinned,
+                icon,
             })?,
             Command::Update { id, meta } => self.send_msg(&ClientMsg::Update {
                 id,

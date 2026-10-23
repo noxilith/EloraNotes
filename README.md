@@ -147,6 +147,13 @@ the port in `ufw`, `firewalld` or Windows Firewall when one of those is in charg
 prints the addresses to hand out and a short certificate code the first client will ask you to
 confirm.
 
+Running the installer again on a machine that already has a server is an update, not a second
+install: it prints what it found (service, binary, settings, how many notes, the certificate code)
+and asks whether to **update** it, **uninstall** it and keep the notes, **uninstall** it and delete
+the notes and the certificate, or **cancel**. An update keeps the notes and the certificate, so the
+code clients already trust does not change. `ELORA_ACTION=update`, `uninstall` or `purge` skips the
+question for scripted installs; with no terminal to ask in, an existing install is updated.
+
 From another network, forward the port on the router once and give people this machine's public IP
 or a DNS name. If the machine sits behind CGNAT, tunnel the port (for example with a small VPS
 reverse proxy or Tailscale) — the app only needs a host and port that reach it.
@@ -166,6 +173,15 @@ Stop-ScheduledTask  -TaskName "EloraNotes Server"
 On Linux the notes live in `/var/lib/elora-server/notes`; on Windows in
 `C:\ProgramData\EloraNotes Server\notes`. Editing those files directly works too — the server
 re-reads a note's body whenever it is next opened.
+
+### Putting notes in the shared library
+
+With a server connected, the folder menu on a note (**No folder** in the note's header) lists the
+server under **Shared libraries**. Picking it moves the note there: it arrives on the server with
+its body, folder, tags, pin and icon, and the local file goes away once it exists on the server.
+The other way round, a shared note's folder menu offers **Copy to this computer**, which keeps a
+local copy and leaves the shared note in place. While a shared note is open, **New** creates the
+next note directly on the server.
 
 ### Connecting from the app
 

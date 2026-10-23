@@ -17,7 +17,6 @@ set -euo pipefail
 RELEASE_URL="https://github.com/noxilith/EloraNotes/releases/latest/download/elora-server-linux-x86_64"
 SERVICE_NAME="elora-server.service"
 SERVICE_USER="elora"
-SYSTEM_DATA_DIR="/var/lib/elora-server"
 SERVICE_MODE=${ELORA_SERVICE_MODE:-auto}
 
 say() { printf '%s\n' "$*"; }
@@ -31,6 +30,182 @@ command -v systemctl >/dev/null 2>&1 \
     || fail "this machine has no systemd, so the installer cannot register the service"
 command -v runuser >/dev/null 2>&1 \
     || fail "runuser (part of util-linux) is missing, so the installer cannot switch users"
+
+# --- is a server already installed here? ----------------------------------------------------
+# Checked before anything is asked or downloaded: an update must never look like a fresh install,
+# and uninstalling has to know where the old files and service are.
+EXISTING_MODE=""
+EXISTING_UNIT=""
+EXISTING_DATA=""
+EXISTING_BINARY=""
+EXISTING_OWNER_HOME=""
+
+# The usual places, overridable for tests and unusual layouts.
+SYSTEM_UNIT_PATH="${ELORA_UNIT_DIR:-/etc/systemd/system}/$SERVICE_NAME"
+SYSTEM_DATA_DIR="${ELORA_SERVER_DATA_DIR:-/var/lib/elora-server}"
+SYSTEM_BIN="${ELORA_SERVER_BIN:-/usr/local/bin/elora-server}"
+
+# The account a per-user service would belong to, needed before the mode is chosen.
+if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    EXISTING_OWNER="$SUDO_USER"
+    EXISTING_OWNER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+fi
+USER_UNIT_PATH="${EXISTING_OWNER_HOME:+$EXISTING_OWNER_HOME/.config/systemd/user/$SERVICE_NAME}"
+USER_DATA_DIR="${EXISTING_OWNER_HOME:+$EXISTING_OWNER_HOME/.local/share/elora-server}"
+USER_BIN="${EXISTING_OWNER_HOME:+$EXISTING_OWNER_HOME/.local/bin/elora-server}"
+
+# Only a service decides the mode. A leftover settings folder alone does not, because the mode
+# still has to fit this system (a read-only /etc cannot take a system unit).
+if [ -f "$SYSTEM_UNIT_PATH" ]; then
+    EXISTING_MODE="system"
+    EXISTING_UNIT="$SYSTEM_UNIT_PATH"
+elif [ -n "$USER_UNIT_PATH" ] && [ -f "$USER_UNIT_PATH" ]; then
+    EXISTING_MODE="user"
+    EXISTING_UNIT="$USER_UNIT_PATH"
+fi
+
+# A binary or a settings folder can also be left behind by an install that stopped half way.
+for candidate in "$SYSTEM_BIN" /opt/elora-server/elora-server "$USER_BIN"; do
+    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+        EXISTING_BINARY="$candidate"
+        break
+    fi
+done
+if [ -z "$EXISTING_DATA" ]; then
+    for candidate in "$SYSTEM_DATA_DIR" "$USER_DATA_DIR"; do
+        if [ -n "$candidate" ] && [ -f "$candidate/config.json" ]; then
+            EXISTING_DATA="$candidate"
+            break
+        fi
+    done
+fi
+
+EXISTING=no
+if [ -n "$EXISTING_MODE$EXISTING_BINARY$EXISTING_DATA" ]; then
+    EXISTING=yes
+fi
+
+# ELORA_ACTION=update|uninstall|purge skips the question (for scripted installs).
+ACTION=${ELORA_ACTION:-}
+case "$ACTION" in
+    "" | update | uninstall | purge) ;;
+    *) fail "ELORA_ACTION must be 'update', 'uninstall' or 'purge', not '$ACTION'" ;;
+esac
+
+if [ "$EXISTING" = "yes" ]; then
+    NOTE_COUNT=0
+    if [ -n "$EXISTING_DATA" ]; then
+        NOTE_COUNT=$(ls -1 "$EXISTING_DATA/notes"/*.md 2>/dev/null | wc -l || true)
+    fi
+    CODE=""
+    if [ -n "$EXISTING_BINARY" ] && [ -n "$EXISTING_DATA" ]; then
+        CODE=$(ELORA_SERVER_DIR="$EXISTING_DATA" "$EXISTING_BINARY" fingerprint 2>/dev/null \
+            | head -n 1 || true)
+    fi
+
+    say ""
+    say "EloraNotes server is already installed on this machine:"
+    if [ -n "$EXISTING_MODE" ]; then
+        say "  service:  $EXISTING_UNIT ($EXISTING_MODE service)"
+    else
+        say "  service:  none found"
+    fi
+    [ -n "$EXISTING_BINARY" ] && say "  binary:   $EXISTING_BINARY"
+    if [ -n "$EXISTING_DATA" ]; then
+        say "  settings: $EXISTING_DATA"
+        say "  notes:    $NOTE_COUNT in $EXISTING_DATA/notes"
+    fi
+    [ -n "$CODE" ] && say "  code:     $CODE (clients already trust this certificate)"
+
+    if [ -z "$ACTION" ]; then
+        if [ -t 0 ]; then
+            say ""
+            say "What would you like to do?"
+            say "  1) Update it, keeping the notes and the certificate  (recommended)"
+            say "  2) Uninstall it, keeping the notes on disk"
+            say "  3) Uninstall it and delete the notes and certificate"
+            say "  4) Cancel"
+            while true; do
+                read -r -p "Choice [1]: " CHOICE \
+                    || fail "no answer was given; run the installer again and choose 1, 2, 3 or 4"
+                case "${CHOICE:-1}" in
+                    1) ACTION=update; break ;;
+                    2) ACTION=uninstall; break ;;
+                    3) ACTION=purge; break ;;
+                    4) ACTION=cancel; break ;;
+                    *) say "  Type 1, 2, 3 or 4." ;;
+                esac
+            done
+        else
+            ACTION=update
+            say "No terminal to ask in, so the existing install is updated."
+        fi
+    fi
+
+    if [ "$ACTION" = "cancel" ]; then
+        say "Nothing was changed."
+        exit 0
+    fi
+
+    if [ "$ACTION" = "uninstall" ] || [ "$ACTION" = "purge" ]; then
+        say ""
+        say "Uninstalling…"
+        # Stop and forget the service, whichever kind of install it is.
+        if [ -f "$SYSTEM_UNIT_PATH" ]; then
+            systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+            systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+            rm -f "$SYSTEM_UNIT_PATH"
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
+            say "  Removed $SYSTEM_UNIT_PATH"
+        fi
+        if [ -n "$USER_UNIT_PATH" ] && [ -f "$USER_UNIT_PATH" ]; then
+            RUNTIME_DIR="/run/user/$(id -u "$EXISTING_OWNER")"
+            runuser -u "$EXISTING_OWNER" -- env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+                systemctl --user disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
+            rm -f "$USER_UNIT_PATH"
+            runuser -u "$EXISTING_OWNER" -- env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+                systemctl --user daemon-reload >/dev/null 2>&1 || true
+            say "  Removed $USER_UNIT_PATH"
+        fi
+        # The binary, wherever this install put it.
+        for path in "$SYSTEM_BIN" /opt/elora-server/elora-server "$USER_BIN"; do
+            if [ -n "$path" ] && [ -e "$path" ]; then
+                rm -f "$path" && say "  Removed $path"
+            fi
+        done
+        rmdir /opt/elora-server >/dev/null 2>&1 || true
+
+        if [ "$ACTION" = "purge" ]; then
+            if [ -n "$EXISTING_DATA" ] && [ -d "$EXISTING_DATA" ]; then
+                rm -rf "$EXISTING_DATA" && say "  Deleted $EXISTING_DATA"
+            fi
+            # The service account only exists for a system install; remove it with the data.
+            if id -u "$SERVICE_USER" >/dev/null 2>&1; then
+                userdel "$SERVICE_USER" >/dev/null 2>&1 || true
+                say "  Removed the $SERVICE_USER account"
+            fi
+            if getent group "$SERVICE_USER" >/dev/null 2>&1; then
+                groupdel "$SERVICE_USER" >/dev/null 2>&1 || true
+            fi
+            say ""
+            say "The server and everything it held are gone."
+        else
+            say ""
+            if [ -n "$EXISTING_DATA" ]; then
+                say "The server is gone; the notes are still in $EXISTING_DATA/notes."
+                say "Copy that folder somewhere safe if you want to keep them."
+            else
+                say "The server is gone."
+            fi
+        fi
+        say "Run this installer again to set a server up from scratch."
+        exit 0
+    fi
+
+    say ""
+    say "Updating it; the notes and the certificate stay where they are."
+fi
 
 # --- what the server should be called ------------------------------------------------------
 read -r -p "Server name (shown in everyone's sidebar) [EloraNotes]: " SERVER_NAME
@@ -60,8 +235,12 @@ read -r -s -p "Repeat the password: " PASSWORD_AGAIN; say
 # /etc/systemd/system is a read-only link into the system image, so it is tested for real
 # instead of assumed.
 if [ "$SERVICE_MODE" = "auto" ]; then
-    if ( : > /etc/systemd/system/.elora-write-test ) 2>/dev/null; then
-        rm -f /etc/systemd/system/.elora-write-test 2>/dev/null || true
+    if [ -n "$EXISTING_MODE" ]; then
+        # Keep an existing install where it is; switching would leave its notes behind.
+        SERVICE_MODE="$EXISTING_MODE"
+    elif SYSTEM_UNIT_DIR=$(dirname -- "$SYSTEM_UNIT_PATH") \
+        && ( : > "$SYSTEM_UNIT_DIR/.elora-write-test" ) 2>/dev/null; then
+        rm -f "$SYSTEM_UNIT_DIR/.elora-write-test" 2>/dev/null || true
         SERVICE_MODE="system"
     else
         SERVICE_MODE="user"
@@ -73,9 +252,9 @@ case "$SERVICE_MODE" in
 esac
 
 if [ "$SERVICE_MODE" = "system" ]; then
-    DATA_DIR=${ELORA_SERVER_DATA_DIR:-$SYSTEM_DATA_DIR}
-    UNIT_DIR=${ELORA_UNIT_DIR:-/etc/systemd/system}
-    BINARY=${ELORA_SERVER_BIN:-/usr/local/bin/elora-server}
+    DATA_DIR=$SYSTEM_DATA_DIR
+    UNIT_DIR=$(dirname -- "$SYSTEM_UNIT_PATH")
+    BINARY=$SYSTEM_BIN
     TARGET_USER=""
     TARGET_HOME=""
 else

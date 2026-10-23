@@ -129,6 +129,10 @@ pub struct EloraApp {
     /// True while waiting for the server to answer a new-note request, so the title field can be
     /// focused once the note exists.
     pending_new_note_focus: bool,
+    /// The local note being moved into the shared library. Once the server reports a note with
+    /// that title, the body is shown straight away and the local file is removed, so the note
+    /// exists in one place.
+    pending_server_move: Option<PendingMove>,
     confirm_delete_id: Option<String>,
     command_palette_open: bool,
     icon_picker_open: bool,
@@ -311,6 +315,7 @@ impl EloraApp {
             collab_open: None,
             trust_prompt: None,
             pending_new_note_focus: false,
+            pending_server_move: None,
             edit_history: BTreeMap::new(),
             last_seen_body: None,
             confirm_delete_id: None,
@@ -1166,6 +1171,60 @@ impl EloraApp {
         }
     }
 
+    /// Moves a note from this computer into the shared library: the server gets a copy with the
+    /// same title, body, folder, tags, pin and icon, and the local file goes away once it exists
+    /// there. Called from the folder menu on a local note.
+    fn move_note_to_server(&mut self, note_idx: usize) {
+        let server = match self.collab.server_name() {
+            Some(name) if self.collab.is_connected() => name.to_string(),
+            _ => {
+                self.status_message = Some("Connect to a server before moving a note there".into());
+                return;
+            }
+        };
+        let note = self.notes[note_idx].clone();
+        if self.is_remote(&note.id) {
+            return;
+        }
+        self.pending_server_move = Some(PendingMove {
+            local_id: note.id.clone(),
+            title: note.title.clone(),
+            body: note.body.clone(),
+        });
+        self.collab.create_note(
+            &note.title,
+            note.folder.as_deref(),
+            &note.explicit_tags,
+            &note.body,
+            note.pinned,
+            note.icon.as_deref(),
+        );
+        self.status_message = Some(format!("Moving “{}” to {server}…", note.display_title()));
+    }
+
+    /// Copies a shared note onto this computer, keeping the shared one in place.
+    fn copy_shared_note_to_computer(&mut self, note_idx: usize) {
+        let shared = self.notes[note_idx].clone();
+        let mut note = Note::new(
+            shared.title.clone(),
+            shared.body.clone(),
+            self.storage.root_dir(),
+        );
+        note.folder = shared.folder.clone();
+        note.explicit_tags = shared.explicit_tags.clone();
+        note.icon = shared.icon.clone();
+        note.pinned = shared.pinned;
+        if let Err(e) = self.storage.save_note(&note) {
+            self.status_message = Some(format!("Could not copy the note: {e}"));
+            return;
+        }
+        let id = note.id.clone();
+        self.notes.push(note);
+        self.resort();
+        self.selected_id = Some(id);
+        self.status_message = Some(format!("Copied “{}” to this computer", shared.title));
+    }
+
     /// Rebuilds the server's notes from what the connection last reported, keeping the body the
     /// editor is currently showing for the open note so typing is never yanked backwards.
     fn apply_library(&mut self) {
@@ -1262,12 +1321,44 @@ impl EloraApp {
                     }
                     self.selected_id = Some(note.id.clone());
                     self.sidebar_section = SidebarSection::AllNotes;
+
+                    // A move finishes here: the server has the note, so the local file goes and
+                    // the body that travelled with it is shown without waiting for the room.
+                    let moved = self.pending_server_move.take().filter(|pending| {
+                        pending.title == note.title && !self.remote_ids.contains(&pending.local_id)
+                    });
+                    if let Some(pending) = moved {
+                        self.remote_bodies
+                            .insert(note.id.clone(), pending.body.clone());
+                        if let Some(local) =
+                            self.notes.iter_mut().find(|n| n.id == pending.local_id)
+                        {
+                            local.body = pending.body.clone();
+                        }
+                        if let Some(pos) = self.notes.iter().position(|n| n.id == pending.local_id)
+                        {
+                            let removed = self.notes.remove(pos);
+                            let _ = self.storage.delete_note(&removed);
+                        }
+                        if let Some(local) = self.notes.iter_mut().find(|n| n.id == note.id) {
+                            local.body = pending.body.clone();
+                        }
+                        let server = self.collab.server_name().unwrap_or("the server");
+                        self.status_message = Some(format!("Moved “{}” to {server}", note.title));
+                    }
+
                     if self.pending_new_note_focus {
                         self.focus_title_next_frame = true;
                         self.pending_new_note_focus = false;
                     }
                     let server = self.collab.server_name().unwrap_or("the server");
-                    self.status_message = Some(format!("Created “{}” on {server}", note.title));
+                    if !self
+                        .status_message
+                        .as_deref()
+                        .is_some_and(|m| m.starts_with("Moved"))
+                    {
+                        self.status_message = Some(format!("Created “{}” on {server}", note.title));
+                    }
                     library_changed = true;
                 }
                 Incoming::Offline(reason) => {
@@ -1275,6 +1366,8 @@ impl EloraApp {
                         self.status_message = Some(format!("Server: {reason}"));
                     }
                     self.collab_open = None;
+                    // Nothing was moved, so the local note stays where it is.
+                    self.pending_server_move = None;
                     library_changed = true;
                 }
                 Incoming::Body { id, text } => {
@@ -1393,12 +1486,16 @@ impl EloraApp {
         }
     }
 
-    /// Every folder currently used by a live note, alphabetically.
-    fn all_folders(&self) -> Vec<String> {
+    /// Every folder currently used by a live note, alphabetically, either on this computer or on
+    /// the server. The two lists are kept apart so a local note cannot be filed into a server
+    /// folder (and the other way round) by accident.
+    fn folders_for(&self, remote: bool) -> Vec<String> {
         let mut folders: BTreeSet<String> = BTreeSet::new();
         for note in self.notes.iter().filter(|n| !n.trashed) {
-            if let Some(folder) = &note.folder {
-                folders.insert(folder.clone());
+            if self.is_remote(&note.id) == remote {
+                if let Some(folder) = &note.folder {
+                    folders.insert(folder.clone());
+                }
             }
         }
         folders.into_iter().collect()
@@ -1670,6 +1767,7 @@ impl EloraApp {
                 &note.explicit_tags,
                 &note.body,
                 note.pinned,
+                note.icon.as_deref(),
             );
             self.pending_new_note_focus = true;
             if self.view_mode == EditorViewMode::Preview {
@@ -1745,6 +1843,7 @@ impl EloraApp {
                 &["linked".to_string()],
                 body,
                 false,
+                None,
             );
             self.pending_new_note_focus = false;
             let server = self.collab.server_name().unwrap_or("the server");
@@ -3372,7 +3471,7 @@ impl EloraApp {
         let mut action_restore_trash = false;
         let mut action_perm_delete = false;
         let mut queued_format_op: Option<EditorFormatOp> = None;
-        let mut folder_choice: Option<Option<String>> = None;
+        let mut folder_choice: Option<FolderChoice> = None;
 
         let is_trashed = self.notes[note_idx].trashed;
 
@@ -3440,9 +3539,20 @@ impl EloraApp {
                 ui.label(RichText::new("·").color(p.fg_muted));
             }
 
-            // Folder chooser: file this note under a folder, or start a new one.
+            // Folder chooser: file this note under a folder, start a new one, or move the note
+            // into the shared library.
             let current_folder = self.notes[note_idx].folder.clone();
-            let folders = self.all_folders();
+            let on_server = self.is_remote(&selected_id);
+            let folders = self.folders_for(on_server);
+            let server = if !on_server && self.collab.is_connected() {
+                self.collab.server_name().map(str::to_string)
+            } else {
+                None
+            };
+            let extras = MenuExtras {
+                server: server.as_deref(),
+                on_server,
+            };
             if let Some(choice) = folder_menu_ui(
                 ui,
                 p,
@@ -3450,6 +3560,7 @@ impl EloraApp {
                 &folders,
                 &mut self.new_folder_input,
                 if compact { 104.0 } else { 148.0 },
+                &extras,
             ) {
                 folder_choice = Some(choice);
             }
@@ -3705,16 +3816,23 @@ impl EloraApp {
         });
 
         if let Some(choice) = folder_choice {
-            self.notes[note_idx].folder = choice.clone();
-            self.notes[note_idx].updated_at = Utc::now();
-            needs_save = true;
             match choice {
-                Some(name) => {
+                FolderChoice::Unfiled => {
+                    self.notes[note_idx].folder = None;
+                    self.notes[note_idx].updated_at = Utc::now();
+                    needs_save = true;
+                    self.status_message = Some("Removed from folder".to_string());
+                }
+                FolderChoice::Folder(name) => {
+                    self.notes[note_idx].folder = Some(name.clone());
+                    self.notes[note_idx].updated_at = Utc::now();
+                    needs_save = true;
                     // Filing a note into a folded folder should reveal it.
                     self.collapsed_folders.remove(&name);
                     self.status_message = Some(format!("Filed under {name}"));
                 }
-                None => self.status_message = Some("Removed from folder".to_string()),
+                FolderChoice::ToServer => self.move_note_to_server(note_idx),
+                FolderChoice::ToComputer => self.copy_shared_note_to_computer(note_idx),
             }
         }
 
@@ -4442,6 +4560,36 @@ fn folder_header(
     .inner
 }
 
+/// The entries the folder menu offers outside the folders themselves: the connected server's
+/// shared library, and a way back from it onto this computer.
+#[derive(Clone, Copy, Default)]
+struct MenuExtras<'a> {
+    /// Name of the connected server, when this note could be moved into its library.
+    server: Option<&'a str>,
+    /// True when the note lives on the server and could be copied onto this computer.
+    on_server: bool,
+}
+
+/// A local note on its way into the shared library, remembered until the server answers.
+#[derive(Clone, Debug)]
+struct PendingMove {
+    local_id: String,
+    title: String,
+    body: String,
+}
+
+/// What the folder menu on a note's header was used for.
+#[derive(Clone, Debug, PartialEq)]
+enum FolderChoice {
+    /// Take the note out of any folder.
+    Unfiled,
+    Folder(String),
+    /// Move the note into the shared library.
+    ToServer,
+    /// Copy a shared note onto this computer.
+    ToComputer,
+}
+
 /// What the user clicked in the note list this frame.
 #[derive(Default)]
 struct CardSelection {
@@ -4646,8 +4794,9 @@ fn folder_menu_ui(
     folders: &[String],
     new_folder_input: &mut String,
     width: f32,
-) -> Option<Option<String>> {
-    let mut choice: Option<Option<String>> = None;
+    extras: &MenuExtras<'_>,
+) -> Option<FolderChoice> {
+    let mut choice: Option<FolderChoice> = None;
     let folder_label = current_folder.unwrap_or("No folder");
 
     egui::ComboBox::from_id_salt("note_folder_choice")
@@ -4667,7 +4816,7 @@ fn folder_menu_ui(
                 .selectable_label(current_folder.is_none(), "No folder")
                 .clicked()
             {
-                choice = Some(None);
+                choice = Some(FolderChoice::Unfiled);
                 ui.memory_mut(|mem| mem.close_popup());
             }
             for folder in folders {
@@ -4676,7 +4825,36 @@ fn folder_menu_ui(
                     .selectable_label(selected, format!("{} {folder}", icon::FOLDER))
                     .clicked()
                 {
-                    choice = Some(Some(folder.clone()));
+                    choice = Some(FolderChoice::Folder(folder.clone()));
+                    ui.memory_mut(|mem| mem.close_popup());
+                }
+            }
+            if let Some(server) = extras.server {
+                ui.separator();
+                ui.label(
+                    RichText::new("Shared libraries")
+                        .size(10.5)
+                        .color(p.fg_muted),
+                );
+                if ui
+                    .selectable_label(false, format!("{} {server}", icon::CLOUD))
+                    .on_hover_text(format!(
+                        "Move this note into the shared library on {server}"
+                    ))
+                    .clicked()
+                {
+                    choice = Some(FolderChoice::ToServer);
+                    ui.memory_mut(|mem| mem.close_popup());
+                }
+            }
+            if extras.on_server {
+                ui.separator();
+                if ui
+                    .selectable_label(false, format!("{} Copy to this computer", icon::SERVER))
+                    .on_hover_text("Keep a local copy; the shared note stays on the server")
+                    .clicked()
+                {
+                    choice = Some(FolderChoice::ToComputer);
                     ui.memory_mut(|mem| mem.close_popup());
                 }
             }
@@ -4698,7 +4876,7 @@ fn folder_menu_ui(
             });
             if submit {
                 if let Some(name) = normalize_folder(new_folder_input) {
-                    choice = Some(Some(name));
+                    choice = Some(FolderChoice::Folder(name));
                     new_folder_input.clear();
                     ui.memory_mut(|mem| mem.close_popup());
                 }
@@ -4883,7 +5061,9 @@ mod tests {
         palette: Palette,
         folders: Vec<String>,
         input: String,
-        choice: Option<Option<String>>,
+        choice: Option<FolderChoice>,
+        server: Option<String>,
+        on_server: bool,
         combo_id: Option<Id>,
     }
 
@@ -4897,6 +5077,8 @@ mod tests {
                 folders: Vec::new(),
                 input: String::new(),
                 choice: None,
+                server: None,
+                on_server: false,
                 combo_id: None,
             }
         }
@@ -4912,13 +5094,19 @@ mod tests {
             };
             let p = self.palette;
             let folders = self.folders.clone();
+            let server = self.server.clone();
+            let on_server = self.on_server;
             let input = &mut self.input;
             let choice = &mut self.choice;
             let combo_id = &mut self.combo_id;
             let _ = self.ctx.run(raw, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     *combo_id = Some(ui.make_persistent_id(Id::new("note_folder_choice")));
-                    *choice = folder_menu_ui(ui, &p, None, &folders, input, 148.0);
+                    let extras = MenuExtras {
+                        server: server.as_deref(),
+                        on_server,
+                    };
+                    *choice = folder_menu_ui(ui, &p, None, &folders, input, 148.0, &extras);
                 });
             });
         }
@@ -4979,7 +5167,7 @@ mod tests {
             modifiers: egui::Modifiers::NONE,
         }]);
 
-        assert_eq!(h.choice, Some(Some("Research".to_string())));
+        assert_eq!(h.choice, Some(FolderChoice::Folder("Research".to_string())));
         assert!(h.input.is_empty(), "the field should reset after use");
         assert!(
             !egui::ComboBox::is_open(&h.ctx, widget_id),

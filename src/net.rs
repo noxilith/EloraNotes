@@ -130,6 +130,8 @@ pub enum ClientMsg {
         body: String,
         #[serde(default)]
         pinned: bool,
+        #[serde(default)]
+        icon: Option<String>,
     },
     /// Update the fields that live in the note's frontmatter. `None` means "leave as is".
     Update {
