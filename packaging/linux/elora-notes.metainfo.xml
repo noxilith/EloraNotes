@@ -25,6 +25,21 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.9.11" date="2026-10-23">
+      <description>
+        <p>
+          Shared notes no longer show each other's text. Every live text frame now says which
+          note it belongs to, so a frame still on the way when another note is opened is dropped
+          instead of being merged into the note now on screen — that was why a note you switched
+          back to could come up as the one you had just left, and settle only after a few
+          switches. A shared note also no longer pushes the copy the window happens to be showing
+          before the server has sent that note's own text. Taking a shared note out of its folder
+          works: a cleared folder used to reach the server as "leave it alone", so the note stayed
+          filed. The app and the server both need this one; the older side reports a version
+          mismatch.
+        </p>
+      </description>
+    </release>
     <release version="0.9.10" date="2026-10-23">
       <description>
         <p>

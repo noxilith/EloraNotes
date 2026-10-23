@@ -176,7 +176,7 @@ fn test_two_clients_edit_the_same_note() {
     );
 
     // Alice moves her caret; Bob can see where she is.
-    alice.send_cursor(3);
+    alice.send_cursor(&note_id, 3);
     settle(&mut bob, &mut bob_body, "bob caret", |c, _| {
         c.peers()
             .iter()
@@ -314,6 +314,17 @@ fn test_two_clients_edit_the_same_note() {
         |_, body| body == "the body Alice wrote",
     );
 
+    // Text aimed at the note she left must not land in the one she has open: the connection
+    // tags every body with its note and drops the ones that do not match.
+    alice.send_body(&note_id, "this belongs to the other note");
+    std::thread::sleep(Duration::from_millis(300));
+    settle(
+        &mut viewer,
+        &mut viewer_body,
+        "viewer keeps its text",
+        |_, body| body == "Ahello from alice! B",
+    );
+
     // Bob is still in the shared note; Alice is in the one she just made, so her caret and name
     // must not be drawn over his note.
     settle(
@@ -331,6 +342,43 @@ fn test_two_clients_edit_the_same_note() {
     assert!(
         after_open.contains("the body Alice wrote"),
         "the new note lost its own body: {after_open:?}"
+    );
+
+    // Switching back and forth between two shared notes must show each note's own text. A
+    // shared note used to keep the text it was left with, so the note reopened after a switch
+    // showed the other note until something happened to refresh it.
+    let shared_body = "Ahello from alice! B".to_string();
+    let new_body = "the body Alice wrote plus a line".to_string();
+    alice.send_body(&created_id, &new_body);
+    // Her own keystrokes are not echoed back to her, so the write is confirmed on the server.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let saved = std::fs::read_to_string(&created_path).expect("the new note file");
+        if saved.contains("plus a line") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    alice.open_note(&note_id, &shared_body);
+    settle(
+        &mut alice,
+        &mut alice_body,
+        "alice back on the shared note",
+        |_, body| body == shared_body,
+    );
+    alice.open_note(&created_id, &new_body);
+    settle(
+        &mut alice,
+        &mut alice_body,
+        "alice back on the new note",
+        |_, body| body == new_body,
+    );
+    alice.open_note(&note_id, &shared_body);
+    settle(
+        &mut alice,
+        &mut alice_body,
+        "alice on the shared note again",
+        |_, body| body == shared_body,
     );
 
     // Everyone left but the viewer: their names and carets go away with them, not just their

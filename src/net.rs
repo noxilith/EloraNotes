@@ -8,8 +8,70 @@ use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::path::PathBuf;
 
+/// A frontmatter value a client may change, leave alone, or clear.
+///
+/// The obvious `Option<Option<T>>` cannot say "clear it": serde turns both `Keep` and a cleared
+/// value into `null`, so a folder could be set but never taken off again. This type keeps the
+/// three cases apart while still putting a plain value or `null` on the wire, which is what the
+/// protocol has always sent.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Field<T> {
+    /// The message does not mention it.
+    #[default]
+    Keep,
+    /// Set it to nothing.
+    Clear,
+    Set(T),
+}
+
+impl<T> Field<T> {
+    pub fn is_keep(&self) -> bool {
+        matches!(self, Field::Keep)
+    }
+}
+
+impl<T: Serialize> Serialize for Field<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Field::Keep | Field::Clear => serializer.serialize_none(),
+            Field::Set(value) => value.serialize(serializer),
+        }
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Field<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(match Option::<T>::deserialize(deserializer)? {
+            Some(value) => Field::Set(value),
+            None => Field::Clear,
+        })
+    }
+}
+
 /// Bumped whenever a message changes shape in a way an older peer cannot read.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Version 2 tags every Yjs sync frame with the note it belongs to.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Prefixes a Yjs sync payload with the id of the note it belongs to.
+///
+/// A connection has one note open at a time, but frames already on the wire when the note is
+/// switched arrive afterwards. Without the id they look exactly like the new note's state, and a
+/// stale frame was enough to put the note just left into the one being opened.
+pub fn encode_sync(note_id: &str, message: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + note_id.len() + message.len());
+    out.extend_from_slice(&(note_id.len() as u16).to_be_bytes());
+    out.extend_from_slice(note_id.as_bytes());
+    out.extend_from_slice(message);
+    out
+}
+
+/// Splits a sync payload back into its note id and the Yjs message.
+pub fn decode_sync(payload: &[u8]) -> Option<(&str, &[u8])> {
+    let len = u16::from_be_bytes([*payload.first()?, *payload.get(1)?]) as usize;
+    let id = payload.get(2..2 + len)?;
+    let message = payload.get(2 + len..)?;
+    Some((std::str::from_utf8(id).ok()?, message))
+}
 
 /// Frame kinds. Every frame is `[kind][len: u32 big endian][payload]`.
 pub const FRAME_JSON: u8 = 0;
@@ -133,21 +195,22 @@ pub enum ClientMsg {
         #[serde(default)]
         icon: Option<String>,
     },
-    /// Update the fields that live in the note's frontmatter. `None` means "leave as is".
+    /// Update the fields that live in the note's frontmatter. `None` means "leave as is";
+    /// `Field` is used where a value can also be cleared.
     Update {
         id: String,
         #[serde(default)]
         title: Option<String>,
-        #[serde(default)]
-        folder: Option<Option<String>>,
+        #[serde(default, skip_serializing_if = "Field::is_keep")]
+        folder: Field<String>,
         #[serde(default)]
         tags: Option<Vec<String>>,
         #[serde(default)]
         pinned: Option<bool>,
         #[serde(default)]
         trashed: Option<bool>,
-        #[serde(default)]
-        icon: Option<Option<String>>,
+        #[serde(default, skip_serializing_if = "Field::is_keep")]
+        icon: Field<String>,
     },
     /// Move a note to the trash (`permanent: false`) or delete it outright.
     Delete {
@@ -347,5 +410,53 @@ mod tests {
     #[test]
     fn test_username_falls_back_to_non_empty() {
         assert!(!os_username().is_empty());
+    }
+
+    #[test]
+    fn test_sync_frames_carry_their_note_id() {
+        let payload = encode_sync("untitled-a1b2", b"yjs bytes");
+        assert_eq!(
+            decode_sync(&payload),
+            Some(("untitled-a1b2", &b"yjs bytes"[..]))
+        );
+        // A long id still leaves the message intact.
+        let long = "n".repeat(200);
+        let payload = encode_sync(&long, b"x");
+        assert_eq!(decode_sync(&payload), Some((long.as_str(), &b"x"[..])));
+        // Truncated or empty payloads are refused rather than misread.
+        assert_eq!(decode_sync(&[]), None);
+        assert_eq!(decode_sync(&[0, 9, b'a']), None);
+    }
+
+    #[test]
+    fn test_field_tells_keep_clear_and_set_apart() {
+        #[derive(Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct Update {
+            #[serde(default, skip_serializing_if = "Field::is_keep")]
+            folder: Field<String>,
+        }
+
+        assert_eq!(serde_json::to_string(&Update::default()).unwrap(), "{}");
+        assert_eq!(
+            serde_json::to_string(&Update {
+                folder: Field::Clear
+            })
+            .unwrap(),
+            "{\"folder\":null}"
+        );
+        assert_eq!(
+            serde_json::to_string(&Update {
+                folder: Field::Set("Team".to_string())
+            })
+            .unwrap(),
+            "{\"folder\":\"Team\"}"
+        );
+
+        let keep: Update = serde_json::from_str("{}").unwrap();
+        assert_eq!(keep.folder, Field::Keep);
+        let clear: Update = serde_json::from_str("{\"folder\":null}").unwrap();
+        assert_eq!(clear.folder, Field::Clear);
+        let set: Update = serde_json::from_str("{\"folder\":\"Team\"}").unwrap();
+        assert_eq!(set.folder, Field::Set("Team".to_string()));
     }
 }

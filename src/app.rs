@@ -30,6 +30,9 @@ use std::time::{Duration, Instant};
 /// and the editor stop shifting around while the window is resized. It only has to fit
 /// the logo, title and New button now that the other actions live in the footer.
 const SIDEBAR_WIDTH: f32 = 210.0;
+/// How long the editor waits for a shared note's own text before trusting the copy it has. A
+/// note that opens normally answers in a few milliseconds; this only covers one that never does.
+const ROOM_BODY_WAIT: Duration = Duration::from_millis(800);
 /// Inset of the sidebar's content, in points. Also used to place the divider at the panel edge.
 const SIDEBAR_MARGIN_X: i8 = 12;
 const SIDEBAR_MARGIN_Y: i8 = 10;
@@ -131,6 +134,10 @@ pub struct EloraApp {
     remote_bodies: BTreeMap<String, String>,
     /// The server note the connection currently mirrors.
     collab_open: Option<String>,
+    /// A shared note whose own text has been asked for and not arrived yet. Until it does, the
+    /// window is showing whatever it had for that note from earlier, and sending that would
+    /// write a stale copy into the room.
+    awaiting_room_body: Option<(String, Instant)>,
     /// A certificate the server presented that has not been pinned yet: `(fingerprint, address)`.
     trust_prompt: Option<(String, String)>,
     /// True while waiting for the server to answer a new-note request, so the title field can be
@@ -280,12 +287,31 @@ fn color_override_row(
 
 impl EloraApp {
     pub fn new(cc: &eframe::CreationContext<'_>, storage: NoteStorage) -> Self {
-        install_tabler_icons(&cc.egui_ctx);
+        let mut app = Self::with_context(&cc.egui_ctx, storage);
+        app.start_update_check(&cc.egui_ctx, false);
+        // A remote keystroke asks for a frame the moment it arrives; an idle window is never
+        // asked to draw on its own, so without this the other person's words would only appear
+        // the next time this window happened to repaint.
+        let repaint = cc.egui_ctx.clone();
+        app.collab
+            .set_waker(std::sync::Arc::new(move || repaint.request_repaint()));
+        // A configured shared library reconnects on its own at launch.
+        if app.server.is_configured() {
+            let profile = app.server.clone();
+            app.collab.connect(profile, crate::net::os_username());
+        }
+        app
+    }
+
+    /// Builds the app against a context without the side effects a window has at startup: no
+    /// update check and no automatic reconnect. Tests drive the same state machine with it.
+    fn with_context(ctx: &egui::Context, storage: NoteStorage) -> Self {
+        install_tabler_icons(ctx);
 
         let settings = storage.load_settings();
         let theme = ThemeMode::from_name(&settings.theme_name);
         theme.apply(
-            &cc.egui_ctx,
+            ctx,
             &settings.colors,
             settings.font_size,
             settings.glow_strength,
@@ -294,7 +320,7 @@ impl EloraApp {
         let notes = storage.load_all().unwrap_or_default();
         let selected_id = notes.iter().find(|n| !n.trashed).map(|n| n.id.clone());
 
-        let mut app = Self {
+        let app = Self {
             storage,
             notes,
             selected_id,
@@ -324,6 +350,7 @@ impl EloraApp {
             remote_ids: BTreeSet::new(),
             remote_bodies: BTreeMap::new(),
             collab_open: None,
+            awaiting_room_body: None,
             trust_prompt: None,
             pending_new_note_focus: false,
             pending_server_move: None,
@@ -349,18 +376,6 @@ impl EloraApp {
             quiet_update: false,
             note_images: NoteImages::default(),
         };
-        app.start_update_check(&cc.egui_ctx, false);
-        // A remote keystroke asks for a frame the moment it arrives; an idle window is never
-        // asked to draw on its own, so without this the other person's words would only appear
-        // the next time this window happened to repaint.
-        let repaint = cc.egui_ctx.clone();
-        app.collab
-            .set_waker(std::sync::Arc::new(move || repaint.request_repaint()));
-        // A configured shared library reconnects on its own at launch.
-        if app.server.is_configured() {
-            let profile = app.server.clone();
-            app.collab.connect(profile, crate::net::os_username());
-        }
         app
     }
 
@@ -1144,7 +1159,9 @@ impl EloraApp {
                 updated_at: note.updated_at.timestamp(),
             });
         }
-        if self.collab_open.as_deref() == Some(note.id.as_str()) {
+        if self.collab_open.as_deref() == Some(note.id.as_str())
+            && !self.room_body_pending(&note.id)
+        {
             self.collab.send_body(&note.id, &note.body);
         }
         Ok(())
@@ -1167,6 +1184,7 @@ impl EloraApp {
     fn disconnect_server(&mut self) {
         self.collab.disconnect();
         self.collab_open = None;
+        self.awaiting_room_body = None;
         self.drop_remote_notes();
         self.status_message = Some("Left the shared library".to_string());
     }
@@ -1307,6 +1325,7 @@ impl EloraApp {
                     // A fresh connection starts with no note mirrored, so the selected shared
                     // note is reopened and re-synced.
                     self.collab_open = None;
+                    self.awaiting_room_body = None;
                     library_changed = true;
                 }
                 Incoming::Notes(_) => library_changed = true,
@@ -1384,11 +1403,19 @@ impl EloraApp {
                         self.status_message = Some(format!("Server: {reason}"));
                     }
                     self.collab_open = None;
+                    self.awaiting_room_body = None;
                     // Nothing was moved, so the local note stays where it is.
                     self.pending_server_move = None;
                     library_changed = true;
                 }
                 Incoming::Body { id, text } => {
+                    if self
+                        .awaiting_room_body
+                        .as_ref()
+                        .is_some_and(|(pending, _)| *pending == id)
+                    {
+                        self.awaiting_room_body = None;
+                    }
                     let previous = self
                         .notes
                         .iter()
@@ -1444,7 +1471,21 @@ impl EloraApp {
                 .map(|n| n.body.clone())
                 .unwrap_or_default();
             self.collab.open_note(&id, &body);
+            // What the window holds for this note is only trusted again once the room has sent
+            // its own text for it; until then the editor must not push that copy back.
+            self.awaiting_room_body = Some((id, Instant::now()));
+        } else {
+            self.awaiting_room_body = None;
         }
+    }
+
+    /// True while the room's own text for `id` has not arrived yet. A request that goes
+    /// unanswered stops holding the editor back after a moment, so a note that cannot be opened
+    /// is still editable.
+    fn room_body_pending(&self, id: &str) -> bool {
+        self.awaiting_room_body
+            .as_ref()
+            .is_some_and(|(pending, since)| pending == id && since.elapsed() < ROOM_BODY_WAIT)
     }
 
     /// Asks the user to confirm a server's certificate the first time they connect to it.
@@ -1941,6 +1982,7 @@ impl EloraApp {
                 if self.collab_open.as_deref() == Some(id) {
                     self.collab.close_note();
                     self.collab_open = None;
+                    self.awaiting_room_body = None;
                 }
             } else {
                 let removed = self.notes.remove(pos);
@@ -4325,8 +4367,10 @@ impl EloraApp {
             }
         }
 
-        // A shared note is mirrored to everyone with it open as it is typed.
-        if self.is_remote(&selected_id) {
+        // A shared note is mirrored to everyone with it open as it is typed. A note whose text
+        // the connection has not handed over yet is left alone: the editor is still showing an
+        // earlier copy of it.
+        if self.is_remote(&selected_id) && !self.room_body_pending(&selected_id) {
             let body = self.notes[note_idx].body.clone();
             self.collab.send_body(&selected_id, &body);
             if let Some(caret) = self.last_editor_caret {
@@ -4336,7 +4380,7 @@ impl EloraApp {
                     .nth(char_index)
                     .map(|(i, _)| i)
                     .unwrap_or(body.len());
-                self.collab.send_cursor(byte);
+                self.collab.send_cursor(&selected_id, byte);
             }
         }
 
@@ -5488,5 +5532,217 @@ mod tests {
         });
 
         assert_eq!(images.ready_pictures(), 1, "the picture should be decoded");
+    }
+
+    /// Runs the app's connection handling until `done` holds: this is what a window does every
+    /// frame, minus the drawing.
+    fn wait_for_shared(
+        app: &mut EloraApp,
+        ctx: &egui::Context,
+        label: &str,
+        done: impl Fn(&EloraApp) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            app.poll_collab(ctx);
+            app.sync_open_note();
+            if done(app) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "{label} did not settle: {:?}",
+            app.notes
+                .iter()
+                .filter(|n| app.remote_ids.contains(&n.id))
+                .map(|n| (n.display_title(), n.body.clone(), n.folder.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    fn shared_body(app: &EloraApp, id: &str) -> String {
+        app.notes
+            .iter()
+            .find(|n| n.id == id)
+            .map(|n| n.body.clone())
+            .unwrap_or_default()
+    }
+
+    /// Starts a real server on a loopback port with one shared note, for app-level tests.
+    fn start_shared_server(label: &str) -> (PathBuf, u16, String) {
+        let dir = std::env::temp_dir().join(format!(
+            "elora-app-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let notes_dir = dir.join("notes");
+        std::fs::create_dir_all(&notes_dir).unwrap();
+        let note_id = "shared-0001".to_string();
+        std::fs::write(
+            notes_dir.join(format!("{note_id}.md")),
+            "---\ntitle: \"Shared\"\npinned: false\ntrashed: false\ntags: []\n\
+             created_at: 2026-01-01T00:00:00+00:00\nupdated_at: 2026-01-01T00:00:00+00:00\n---\n\
+             hello",
+        )
+        .unwrap();
+
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        // SAFETY: the lock keeps the other test that changes this variable out of the way.
+        let _guard = crate::tls::server_dir_lock();
+        unsafe { std::env::set_var("ELORA_SERVER_DIR", dir.join("server")) };
+        let config = crate::net::ServerConfig {
+            name: "Test Vault".into(),
+            port,
+            password: "letmein".into(),
+            notes_dir,
+            bind: "127.0.0.1".into(),
+        };
+        let server = std::sync::Arc::new(crate::server::Server::new(config).expect("server"));
+        std::thread::spawn(move || {
+            let _ = server.run();
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        (dir, port, note_id)
+    }
+
+    #[test]
+    fn test_shared_notes_keep_their_own_text_and_folder() {
+        let (dir, port, shared_id) = start_shared_server("shared-notes");
+        let storage = NoteStorage::new(dir.join("local")).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = EloraApp::with_context(&ctx, storage);
+
+        app.server_form = ServerProfile {
+            host: "127.0.0.1".into(),
+            port,
+            password: "letmein".into(),
+            fingerprint: None,
+        };
+        app.connect_server();
+        wait_for_shared(&mut app, &ctx, "connect", |a| {
+            a.collab.is_connected() && !a.collab.notes().is_empty()
+        });
+
+        // Opening the shared note hands the window its text.
+        app.selected_id = Some(shared_id.clone());
+        app.sync_open_note();
+        wait_for_shared(&mut app, &ctx, "shared note", |a| {
+            shared_body(a, &shared_id) == "hello"
+        });
+
+        // The New button with a shared note selected: the note is created on the server.
+        app.create_note_from_template(NoteTemplate::Blank);
+        wait_for_shared(&mut app, &ctx, "created note", |a| {
+            a.notes
+                .iter()
+                .any(|n| a.remote_ids.contains(&n.id) && n.id != shared_id)
+        });
+        let new_id = app
+            .notes
+            .iter()
+            .find(|n| app.remote_ids.contains(&n.id) && n.id != shared_id)
+            .map(|n| n.id.clone())
+            .expect("the new shared note");
+
+        // Type in it the way the editor does, then switch away and back: each note shows its
+        // own text, and the new one is not the note it was created from.
+        let typed = "the new note's own words";
+        let idx = app.notes.iter().position(|n| n.id == new_id).unwrap();
+        app.notes[idx].body = typed.to_string();
+        app.collab.send_body(&new_id, typed);
+
+        app.selected_id = Some(shared_id.clone());
+        app.sync_open_note();
+        wait_for_shared(&mut app, &ctx, "back on the shared note", |a| {
+            shared_body(a, &shared_id) == "hello"
+        });
+        app.selected_id = Some(new_id.clone());
+        app.sync_open_note();
+        wait_for_shared(&mut app, &ctx, "back on the new note", |a| {
+            shared_body(a, &new_id) == typed
+        });
+
+        // A note whose copy in the window went stale is put right when it is opened again: the
+        // room is empty, so only an unconditional hand-over of its text can clear the old one.
+        app.create_note_from_template(NoteTemplate::Blank);
+        wait_for_shared(&mut app, &ctx, "second new note", |a| {
+            a.notes
+                .iter()
+                .filter(|n| a.remote_ids.contains(&n.id) && n.id != shared_id)
+                .count()
+                == 2
+        });
+        let empty_id = app
+            .notes
+            .iter()
+            .find(|n| app.remote_ids.contains(&n.id) && n.id != shared_id && n.id != new_id)
+            .map(|n| n.id.clone())
+            .expect("the second new note");
+        let idx = app.notes.iter().position(|n| n.id == empty_id).unwrap();
+        app.notes[idx].body = "hello".to_string();
+        app.remote_bodies
+            .insert(empty_id.clone(), "hello".to_string());
+        app.selected_id = Some(shared_id.clone());
+        app.sync_open_note();
+        wait_for_shared(&mut app, &ctx, "away from the empty note", |a| {
+            shared_body(a, &shared_id) == "hello"
+        });
+        app.selected_id = Some(empty_id.clone());
+        app.sync_open_note();
+        // The window is still showing the stale copy here, so the editor must be held back until
+        // the room answers with its own (empty) text, or that copy would be written into it.
+        assert!(
+            app.room_body_pending(&empty_id),
+            "the editor should wait for the note's own text"
+        );
+        wait_for_shared(&mut app, &ctx, "the empty note again", |a| {
+            shared_body(a, &empty_id).is_empty()
+        });
+        assert!(
+            !app.room_body_pending(&empty_id),
+            "the note's own text arrived, so the editor can send again"
+        );
+
+        // A shared note can be filed, and taken out of its folder again.
+        app.selected_id = Some(shared_id.clone());
+        app.sync_open_note();
+        wait_for_shared(&mut app, &ctx, "shared note again", |a| {
+            shared_body(a, &shared_id) == "hello"
+        });
+        let idx = app.notes.iter().position(|n| n.id == shared_id).unwrap();
+        app.notes[idx].folder = Some("Team".to_string());
+        app.persist_note(idx).unwrap();
+        wait_for_shared(&mut app, &ctx, "filed on the server", |a| {
+            a.collab
+                .notes()
+                .iter()
+                .any(|m| m.id == shared_id && m.folder.as_deref() == Some("Team"))
+        });
+        let idx = app.notes.iter().position(|n| n.id == shared_id).unwrap();
+        app.notes[idx].folder = None;
+        app.persist_note(idx).unwrap();
+        wait_for_shared(&mut app, &ctx, "taken out of the folder", |a| {
+            a.collab
+                .notes()
+                .iter()
+                .any(|m| m.id == shared_id && m.folder.is_none())
+        });
+
+        app.collab.disconnect();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -8,8 +8,8 @@
 //! Events come back through a channel and are drained once per frame by [`Collab::poll`].
 
 use crate::net::{
-    self, ClientMsg, NoteMeta, PresenceUser, ServerMsg, FRAME_AWARENESS, FRAME_JSON, FRAME_SYNC,
-    PROTOCOL_VERSION,
+    self, ClientMsg, Field, NoteMeta, PresenceUser, ServerMsg, FRAME_AWARENESS, FRAME_JSON,
+    FRAME_SYNC, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -167,12 +167,23 @@ impl Notify {
 }
 
 enum Command {
-    Open(String),
+    /// The body is what the window is showing as the note opens, so the worker can tell a stale
+    /// copy from a real edit made before the note's own text arrives.
+    Open {
+        id: String,
+        body: String,
+    },
     Close,
+    /// Text for a specific note. The id matters: a body queued for the note just left must never
+    /// be written into the one that replaced it.
     Body {
+        id: String,
         text: String,
     },
-    Cursor(usize),
+    Cursor {
+        id: String,
+        byte: usize,
+    },
     Create {
         title: String,
         folder: Option<String>,
@@ -411,13 +422,16 @@ impl Collab {
         if !self.is_active() {
             return;
         }
-        if self.open.as_deref() == Some(id) {
-            return;
-        }
+        // No guard on the note already open: after a reconnect the worker has nothing open and
+        // has to be told again, while the window still thinks it is showing that note. Asking
+        // twice costs one ignored message; the worker ignores a repeat for the note it has.
         self.open = Some(id.to_string());
         self.sent_body = Some((id.to_string(), body.to_string()));
         self.peers.clear();
-        self.send(Command::Open(id.to_string()));
+        self.send(Command::Open {
+            id: id.to_string(),
+            body: body.to_string(),
+        });
     }
 
     pub fn close_note(&mut self) {
@@ -440,13 +454,18 @@ impl Collab {
         }
         self.sent_body = Some((id.to_string(), body.to_string()));
         self.send(Command::Body {
+            id: id.to_string(),
             text: body.to_string(),
         });
     }
 
-    pub fn send_cursor(&mut self, byte_index: usize) {
+    /// Sends a caret position for `note_id`, in bytes.
+    pub fn send_cursor(&mut self, note_id: &str, byte_index: usize) {
         if self.is_connected() {
-            self.send(Command::Cursor(byte_index));
+            self.send(Command::Cursor {
+                id: note_id.to_string(),
+                byte: byte_index,
+            });
         }
     }
 
@@ -498,10 +517,14 @@ struct Session {
     /// Last text the UI was told about (or that the UI sent), used to diff local edits.
     mirror: String,
     open: Option<String>,
-    /// True between asking for a note and the server sending that note's state. Updates that
-    /// arrive in that window belong to the note just left, whose document has been thrown away,
-    /// and must not be merged into this note.
+    /// True from asking for a note until its state arrives. Typing in that window is held back:
+    /// the editor is showing the note from the last time it was open, so sending it now would
+    /// write that whole text into the room and duplicate what is already there.
     awaiting_room_state: bool,
+    /// Text the window was showing when the note was opened. Anything it sends that is still
+    /// exactly this is a leftover copy, not something the person typed.
+    opened_with: String,
+    deferred_body: Option<String>,
     buffer: Vec<u8>,
     last_cursor: Instant,
     last_cursor_sent: Option<usize>,
@@ -628,6 +651,8 @@ impl Session {
             mirror: String::new(),
             open: None,
             awaiting_room_state: false,
+            opened_with: String::new(),
+            deferred_body: None,
             buffer,
             last_cursor: Instant::now(),
             last_cursor_sent: None,
@@ -671,7 +696,7 @@ impl Session {
     fn handle(&mut self, command: Command, events: &Notify) -> Result<(), String> {
         match command {
             Command::Stop => return Err("disconnected".to_string()),
-            Command::Open(id) => {
+            Command::Open { id, body } => {
                 if self.open.as_deref() == Some(id.as_str()) {
                     return Ok(());
                 }
@@ -684,6 +709,8 @@ impl Session {
                 self.awareness = Awareness::new(doc);
                 self.mirror.clear();
                 self.awaiting_room_state = true;
+                self.opened_with = body;
+                self.deferred_body = None;
                 self.send_msg(&ClientMsg::Open { id: id.clone() })?;
                 self.open = Some(id);
                 self.last_cursor_sent = None;
@@ -693,14 +720,26 @@ impl Session {
             }
             Command::Close => {
                 self.open = None;
+                self.awaiting_room_state = false;
+                self.deferred_body = None;
                 self.mirror.clear();
                 self.clear_awareness();
                 self.send_msg(&ClientMsg::Close)?;
                 events.send(Incoming::Peers(Vec::new()));
             }
-            Command::Body { text } => self.apply_local(&text)?,
-            Command::Cursor(byte) => {
-                if self.open.is_none() {
+            Command::Body { id, text } => {
+                // The window may still be sending the note it had open a moment ago.
+                if self.open.as_deref() != Some(id.as_str()) {
+                    return Ok(());
+                }
+                if self.awaiting_room_state {
+                    self.deferred_body = Some(text);
+                    return Ok(());
+                }
+                self.apply_local(&text)?;
+            }
+            Command::Cursor { id, byte } => {
+                if self.open.as_deref() != Some(id.as_str()) {
                     return Ok(());
                 }
                 // The first caret goes out immediately; after that it is throttled so typing
@@ -732,11 +771,14 @@ impl Session {
             Command::Update { id, meta } => self.send_msg(&ClientMsg::Update {
                 id,
                 title: Some(meta.title),
-                folder: Some(meta.folder),
+                // A note with no folder or icon says so explicitly: `Keep` would leave the old
+                // one on the server, which is how a shared note could be filed but never
+                // taken out of its folder again.
+                folder: meta.folder.map(Field::Set).unwrap_or(Field::Clear),
                 tags: Some(meta.tags),
                 pinned: Some(meta.pinned),
                 trashed: Some(meta.trashed),
-                icon: Some(meta.icon),
+                icon: meta.icon.map(Field::Set).unwrap_or(Field::Clear),
             })?,
             Command::Delete { id, permanent } => {
                 self.send_msg(&ClientMsg::Delete { id, permanent })?
@@ -761,7 +803,15 @@ impl Session {
                 }
             }
             FRAME_SYNC => {
-                let Ok(message) = YMessage::decode_v1(&payload) else {
+                // Every sync frame names its note. One that arrives after a switch belongs to the
+                // note just left, and applying it would put that note's text into this one.
+                let Some((note_id, message)) = crate::net::decode_sync(&payload) else {
+                    return Ok(());
+                };
+                if self.open.as_deref() != Some(note_id) {
+                    return Ok(());
+                }
+                let Ok(message) = YMessage::decode_v1(message) else {
                     return Ok(());
                 };
                 match message {
@@ -772,20 +822,30 @@ impl Session {
                             .transact()
                             .encode_state_as_update_v1(&sv);
                         let reply = YMessage::Sync(SyncMessage::SyncStep2(update)).encode_v1();
-                        self.send_frame(FRAME_SYNC, &reply)?;
+                        let tagged = crate::net::encode_sync(note_id, &reply);
+                        self.send_frame(FRAME_SYNC, &tagged)?;
                     }
                     YMessage::Sync(SyncMessage::SyncStep2(update)) => {
                         // The room's own state, sent as soon as the note opens.
                         self.awaiting_room_state = false;
-                        self.apply_remote(update, events)?;
+                        self.apply_remote(update)?;
+                        // Hand the window what the room holds even when that is what the
+                        // connection already had: the app's copy of the note can be out of date
+                        // from an earlier session, and this is what puts it right.
+                        self.emit_body_now(events);
+                        // Now that the note's own text is here, an edit made while waiting can be
+                        // sent as the small change it is. Text that is simply the copy the note
+                        // was opened with is not an edit: it is whatever the window was showing
+                        // before, and the room's own text has just replaced it.
+                        if let Some(text) = self.deferred_body.take() {
+                            if text != self.opened_with {
+                                self.apply_local(&text)?;
+                            }
+                        }
                     }
                     YMessage::Sync(SyncMessage::Update(update)) => {
-                        // An update still in flight from the note just left describes a document
-                        // that no longer exists here, and must not be merged into this one.
-                        if self.awaiting_room_state {
-                            return Ok(());
-                        }
-                        self.apply_remote(update, events)?;
+                        self.apply_remote(update)?;
+                        self.emit_body(events);
                     }
                     _ => {}
                 }
@@ -804,7 +864,7 @@ impl Session {
     }
 
     /// Merges an update from the server into this note's document.
-    fn apply_remote(&mut self, update: Vec<u8>, events: &Notify) -> Result<(), String> {
+    fn apply_remote(&mut self, update: Vec<u8>) -> Result<(), String> {
         let Ok(update) = yrs::Update::decode_v1(&update) else {
             return Ok(());
         };
@@ -817,8 +877,18 @@ impl Session {
         {
             return Ok(());
         }
-        self.emit_body(events);
         Ok(())
+    }
+
+    /// Hands the window the document's text even when it has not changed here, so opening a
+    /// note always replaces whatever the app was showing for it.
+    fn emit_body_now(&mut self, events: &Notify) {
+        let Some(id) = self.open.clone() else {
+            return;
+        };
+        let text = self.doc_text();
+        self.mirror = text.clone();
+        events.send(Incoming::Body { id, text });
     }
 
     /// Applies what the user typed to the shared document. Only the changed range is sent, and
@@ -869,11 +939,15 @@ impl Session {
     }
 
     fn send_update(&mut self, update: Vec<u8>) -> Result<(), String> {
+        let Some(id) = self.open.clone() else {
+            return Ok(());
+        };
         if update.is_empty() {
             return Ok(());
         }
         let frame = YMessage::Sync(SyncMessage::Update(update)).encode_v1();
-        self.send_frame(FRAME_SYNC, &frame)
+        let tagged = crate::net::encode_sync(&id, &frame);
+        self.send_frame(FRAME_SYNC, &tagged)
     }
 
     fn emit_body(&mut self, events: &Notify) {

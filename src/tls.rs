@@ -199,6 +199,14 @@ pub fn client_config(
     (Arc::new(cfg), seen)
 }
 
+/// Serialises the tests that point `ELORA_SERVER_DIR` at a temp folder. The server's certificate
+/// paths follow that variable, and several tests in this binary need their own server.
+#[cfg(test)]
+pub(crate) fn server_dir_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,7 +223,8 @@ mod tests {
             bind: "127.0.0.1".into(),
         };
         // The helpers write next to the config dir, so point ELORA_SERVER_DIR at the temp dir.
-        // SAFETY: this test runs alone in its own process on this single-threaded path.
+        // SAFETY: the lock keeps the other test that changes this variable out of the way.
+        let _guard = server_dir_lock();
         unsafe { std::env::set_var("ELORA_SERVER_DIR", &dir) };
         ensure_identity(&config).expect("identity");
         assert!(config.cert_path().is_file());

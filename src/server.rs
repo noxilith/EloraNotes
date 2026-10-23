@@ -9,8 +9,8 @@
 //! server's folder stays an ordinary EloraNotes library.
 
 use crate::net::{
-    self, ClientMsg, NoteMeta, PresenceUser, ServerConfig, ServerMsg, FRAME_AWARENESS, FRAME_JSON,
-    FRAME_SYNC, PROTOCOL_VERSION,
+    self, ClientMsg, Field, NoteMeta, PresenceUser, ServerConfig, ServerMsg, FRAME_AWARENESS,
+    FRAME_JSON, FRAME_SYNC, PROTOCOL_VERSION,
 };
 use crate::storage::Note;
 use chrono::{TimeZone, Utc};
@@ -396,11 +396,17 @@ impl Server {
         };
         drop(library);
 
-        self.push(client, FRAME_SYNC, step1.encode_v1());
-        self.push(client, FRAME_SYNC, step2.encode_v1());
+        // Every sync frame carries the note it belongs to, so a frame still in flight when the
+        // client switches notes cannot be taken for the note it just opened.
+        self.push(client, FRAME_SYNC, net::encode_sync(id, &step1.encode_v1()));
+        self.push(client, FRAME_SYNC, net::encode_sync(id, &step2.encode_v1()));
         // Our own step 1 asks the client for its state; SyncStep2 above already carries ours.
         let server_sv = YMessage::Sync(SyncMessage::SyncStep1(StateVector::default()));
-        self.push(client, FRAME_SYNC, server_sv.encode_v1());
+        self.push(
+            client,
+            FRAME_SYNC,
+            net::encode_sync(id, &server_sv.encode_v1()),
+        );
         if !present.clients.is_empty() {
             self.push(client, FRAME_AWARENESS, present.encode_v1());
         }
@@ -474,7 +480,15 @@ impl Server {
 
         match kind {
             FRAME_SYNC => {
-                let Ok(message) = YMessage::decode_v1(&payload) else {
+                let Some((frame_note, message)) = crate::net::decode_sync(&payload) else {
+                    return;
+                };
+                // A frame for a note this connection no longer has open is dropped: it would
+                // otherwise write the note just left into the one now open.
+                if frame_note != note_id {
+                    return;
+                }
+                let Ok(message) = YMessage::decode_v1(message) else {
                     return;
                 };
                 match message {
@@ -485,7 +499,8 @@ impl Server {
                                 let reply =
                                     YMessage::Sync(SyncMessage::SyncStep2(diff)).encode_v1();
                                 drop(library);
-                                self.push(client, FRAME_SYNC, reply);
+                                let tagged = crate::net::encode_sync(&note_id, &reply);
+                                self.push(client, FRAME_SYNC, tagged);
                             }
                         }
                     }
@@ -580,11 +595,13 @@ impl Server {
             room.subscribers.clone()
         };
         library_mark_dirty(&self.library, note_id);
-        // Relayed as a Yjs sync message, which is what the other clients decode.
+        // Relayed as a Yjs sync message, which is what the other clients decode, tagged with the
+        // note it belongs to.
         let relayed = YMessage::Sync(SyncMessage::Update(update)).encode_v1();
+        let tagged = net::encode_sync(note_id, &relayed);
         let recipients: Vec<u64> = applied.into_iter().filter(|id| *id != from).collect();
         for id in recipients {
-            self.push_to(id, FRAME_SYNC, relayed.clone());
+            self.push_to(id, FRAME_SYNC, tagged.clone());
         }
     }
 
@@ -776,11 +793,11 @@ impl Library {
         &mut self,
         id: &str,
         title: Option<String>,
-        folder: Option<Option<String>>,
+        folder: Field<String>,
         tags: Option<Vec<String>>,
         pinned: Option<bool>,
         trashed: Option<bool>,
-        icon: Option<Option<String>>,
+        icon: Field<String>,
     ) -> Result<(), String> {
         let Some(meta) = self.notes.get_mut(id) else {
             return Err(format!("no note with id {id}"));
@@ -791,8 +808,10 @@ impl Library {
                 meta.title = title.to_string();
             }
         }
-        if let Some(folder) = folder {
-            meta.folder = folder.filter(|f| !f.trim().is_empty());
+        match folder {
+            Field::Keep => {}
+            Field::Clear => meta.folder = None,
+            Field::Set(folder) => meta.folder = Some(folder).filter(|f| !f.trim().is_empty()),
         }
         if let Some(tags) = tags {
             meta.tags = tags
@@ -807,8 +826,10 @@ impl Library {
         if let Some(trashed) = trashed {
             meta.trashed = trashed;
         }
-        if let Some(icon) = icon {
-            meta.icon = icon.filter(|i| !i.trim().is_empty());
+        match icon {
+            Field::Keep => {}
+            Field::Clear => meta.icon = None,
+            Field::Set(icon) => meta.icon = Some(icon).filter(|i| !i.trim().is_empty()),
         }
         meta.updated_at = Utc::now().timestamp();
         self.write(id)
@@ -823,7 +844,7 @@ impl Library {
             let _ = std::fs::remove_file(path);
             Ok(())
         } else {
-            self.update(id, None, None, None, None, Some(true), None)
+            self.update(id, None, Field::Keep, None, None, Some(true), Field::Keep)
         }
     }
 
@@ -1101,11 +1122,11 @@ mod tests {
             .update(
                 &meta.id,
                 Some("Tags!".into()),
-                Some(Some("Study".into())),
+                Field::Set("Study".into()),
                 Some(vec!["#alpha".into(), "Beta".into()]),
                 Some(true),
                 None,
-                None,
+                Field::Keep,
             )
             .unwrap();
         let reloaded = Library::load(&dir).unwrap();
@@ -1114,6 +1135,16 @@ mod tests {
         assert_eq!(note.folder.as_deref(), Some("Study"));
         assert_eq!(note.tags, vec!["alpha".to_string(), "beta".to_string()]);
         assert!(note.pinned);
+
+        // Taking the folder off again has to stick too. A cleared folder used to reach the
+        // server as `null`, which it read as "leave it alone", so the note stayed in the
+        // folder for good.
+        library
+            .update(&meta.id, None, Field::Clear, None, None, None, Field::Clear)
+            .unwrap();
+        let reloaded = Library::load(&dir).unwrap();
+        let note = reloaded.notes.get(&meta.id).unwrap();
+        assert_eq!(note.folder, None, "the folder should have been cleared");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
