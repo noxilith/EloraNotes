@@ -11,6 +11,8 @@ pub mod icon_names;
 #[cfg(feature = "gui")]
 pub mod icons;
 #[cfg(feature = "gui")]
+pub mod images;
+#[cfg(feature = "gui")]
 pub mod markdown;
 pub mod net;
 pub mod server;

@@ -1,10 +1,11 @@
 use crate::collab::{Collab, ConnectionState, Incoming, ServerProfile};
 use crate::icon_names::TABLER_ICON_NAMES;
 use crate::icons::{icon, install_tabler_icons, tabler_glyph};
+use crate::images::NoteImages;
 use crate::markdown::{
     apply_highlight_selection, build_editor_layout_job, clear_formatting_selection,
     color_swatch_button, insert_at_selection, markdown_to_html, render_inline_spans_ui, rgb_to_hex,
-    wrap_selection, HIGHLIGHT_PRESETS,
+    split_images, wrap_selection, LinePiece, HIGHLIGHT_PRESETS,
 };
 use crate::net::{NoteMeta, PresenceUser};
 use crate::storage::{
@@ -21,7 +22,7 @@ use egui::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::f32::consts::TAU;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -161,6 +162,8 @@ pub struct EloraApp {
     /// True while the check was started from Settings: the result belongs in that window
     /// rather than in a popup over the notes.
     quiet_update: bool,
+    /// Pictures embedded in the preview, decoded once and kept as textures.
+    note_images: NoteImages,
 }
 
 /// Messages from the update worker threads to the UI.
@@ -344,6 +347,7 @@ impl EloraApp {
             update_rx: None,
             update_state: UpdateState::Idle,
             quiet_update: false,
+            note_images: NoteImages::default(),
         };
         app.start_update_check(&cc.egui_ctx, false);
         // A remote keystroke asks for a frame the moment it arrives; an idle window is never
@@ -1958,10 +1962,11 @@ impl EloraApp {
 
     fn toggle_pin_selected(&mut self) {
         if let Some(id) = self.selected_id.clone() {
-            if let Some(note) = self.notes.iter_mut().find(|n| n.id == id) {
-                note.pinned = !note.pinned;
-                note.updated_at = Utc::now();
-                let _ = self.storage.save_note(note);
+            if let Some(idx) = self.notes.iter().position(|n| n.id == id) {
+                self.notes[idx].pinned = !self.notes[idx].pinned;
+                self.notes[idx].updated_at = Utc::now();
+                // Shared notes are pinned on the server, not on this disk.
+                let _ = self.persist_note(idx);
                 self.resort();
             }
         }
@@ -2003,7 +2008,8 @@ impl EloraApp {
         }
 
         self.notes[note_idx].updated_at = Utc::now();
-        if let Err(e) = self.storage.save_note(&self.notes[note_idx]) {
+        // A shared note has no file on this disk, so it goes back to the server instead.
+        if let Err(e) = self.persist_note(note_idx) {
             self.status_message = Some(format!("Auto-save error: {e}"));
         }
     }
@@ -2240,7 +2246,7 @@ impl EloraApp {
                 PaletteCommand::SetViewMode(EditorViewMode::Preview),
             ),
             (
-                icon::PENCIL,
+                icon::BRUSH,
                 "View: Markdown Editor",
                 "",
                 PaletteCommand::SetViewMode(EditorViewMode::Edit),
@@ -3336,13 +3342,24 @@ impl EloraApp {
                 let [r, g, b] = peer.color;
                 let color = Color32::from_rgb(r, g, b);
                 painter.vline(top.x, top.y..=top.y + height, Stroke::new(1.8_f32, color));
-                painter.text(
-                    top - Vec2::new(0.0, 1.0),
-                    Align2::LEFT_BOTTOM,
-                    &peer.name,
-                    FontId::proportional(10.0),
-                    color,
-                );
+                // The name sits in a filled chip rather than as bare text: it very often lands
+                // on the line above, where glyphs underneath would otherwise show through it.
+                // An opaque pill drawn after the text stays legible there, and when the caret is
+                // too close to the top of the text to fit a chip above it, it moves below.
+                let galley = ui.fonts(|f| {
+                    f.layout_no_wrap(
+                        peer.name.clone(),
+                        FontId::proportional(10.0),
+                        readable_on(color),
+                    )
+                });
+                let pad = Vec2::new(4.0, 1.5);
+                let size = galley.size() + pad * 2.0;
+                let chip = caret_chip(top, height, size, ui.clip_rect());
+                if chip.is_positive() {
+                    painter.rect_filled(chip, CornerRadius::same(3), color);
+                    painter.galley(chip.min + pad, galley, readable_on(color));
+                }
             }
         }
 
@@ -3794,12 +3811,7 @@ impl EloraApp {
                         "Split",
                         "Side-by-side Editor & Live Preview (Ctrl+Shift+E)",
                     ),
-                    (
-                        EditorViewMode::Edit,
-                        icon::PENCIL,
-                        "Edit",
-                        "Markdown Editor",
-                    ),
+                    (EditorViewMode::Edit, icon::BRUSH, "Edit", "Markdown Editor"),
                 ] {
                     let active = self.view_mode == mode;
                     let col = if active { p.accent } else { p.fg_secondary };
@@ -4170,6 +4182,17 @@ impl EloraApp {
         ui.add_space(6.0);
 
         let backlinks = self.backlinks_for(note_idx);
+        // Relative picture paths resolve from the note's own folder, the way a file in a GitHub
+        // repository does. A shared note has no file on this disk, so the library folder is the
+        // closest thing it has to one.
+        let note_dir: Option<PathBuf> = {
+            let note = &self.notes[note_idx];
+            if self.is_remote(&note.id) {
+                Some(self.storage.root_dir().to_path_buf())
+            } else {
+                note.file_path.parent().map(Path::to_path_buf)
+            }
+        };
         let mut clicked_wiki_link: Option<String> = None;
         let mut clicked_backlink_id: Option<String> = None;
         let mut toggled_task_idx: Option<usize> = None;
@@ -4218,6 +4241,8 @@ impl EloraApp {
                             p,
                             &mut clicked_wiki_link,
                             &mut toggled_task_idx,
+                            note_dir.as_deref(),
+                            &mut self.note_images,
                         );
                         render_backlinks_footer(ui, &backlinks, p, &mut clicked_backlink_id);
                     });
@@ -4274,6 +4299,8 @@ impl EloraApp {
                                         p,
                                         &mut clicked_wiki_link,
                                         &mut toggled_task_idx,
+                                        note_dir.as_deref(),
+                                        &mut self.note_images,
                                     );
                                     render_backlinks_footer(
                                         ui,
@@ -4415,16 +4442,12 @@ impl eframe::App for EloraApp {
             )
             .show(ctx, |ui| {
                 // Every view uses the same column width, so switching between Edit, Split
-                // and Preview never shifts the text sideways. Closing the sidebar gives the
-                // note more room instead of centring a narrow column in the wider window, so
-                // focus mode allows a wider column than the sidebar layout does.
-                let max_width = if self.focus_mode { 1200.0 } else { 980.0 };
-                let available = ui.available_width();
-                // Centre the column when the window is wide, and keep an equal minimum inset
-                // on both sides when it is not. Only the padding changes with the window size;
-                // the column never clings to one edge.
-                let pad = ((available - max_width) * 0.5).max(NOTE_SIDE_MARGIN);
-                let width = (available - pad * 2.0).max(200.0);
+                // and Preview never shifts the text sideways. The column fills the window
+                // rather than stopping at a fixed cap: on a large or fullscreen monitor a
+                // capped column left wide empty bands beside the note, and the toolbar above
+                // it spanned the whole window while the text sat in the middle. A proportional
+                // inset keeps a little air at the edges instead.
+                let (pad, width) = note_column(ui.available_width());
                 let height = ui.available_height();
                 ui.horizontal_top(|ui| {
                     ui.add_space(pad);
@@ -4480,6 +4503,41 @@ fn carry_caret_over(ctx: &egui::Context, note_id: &str, before: &str, after: &st
     )));
     state.store(ctx, editor_id);
     true
+}
+
+/// Where another person's name chip goes: just above their caret, below it when the caret is
+/// too near the top of the visible text to fit one above, and pulled back inside the text when
+/// the caret sits at the right edge of a wrapped line.
+fn caret_chip(top: Pos2, line_height: f32, size: Vec2, clip: Rect) -> Rect {
+    let mut chip = Rect::from_min_size(Pos2::new(top.x, top.y - size.y - 1.0), size);
+    if chip.top() < clip.top() {
+        chip = Rect::from_min_size(Pos2::new(top.x, top.y + line_height + 1.0), size);
+    }
+    if chip.right() > clip.right() {
+        chip = chip.translate(Vec2::new(clip.right() - chip.right(), 0.0));
+    }
+    chip
+}
+
+/// The inset on each side of the note column and the width of the column itself. A wide window is
+/// filled rather than capped at a fixed 980 points, which used to leave wide empty bands beside
+/// the note on a large or fullscreen monitor.
+fn note_column(available: f32) -> (f32, f32) {
+    let pad = (available * 0.04).clamp(NOTE_SIDE_MARGIN, 64.0);
+    (pad, (available - pad * 2.0).max(200.0))
+}
+
+/// Text colour that stays readable on a filled background: white on dark fills, near-black on
+/// light ones, so a pale caret colour does not get white-on-pale text.
+fn readable_on(background: Color32) -> Color32 {
+    let luma = 0.299 * background.r() as f32
+        + 0.587 * background.g() as f32
+        + 0.114 * background.b() as f32;
+    if luma > 150.0 {
+        Color32::from_rgb(24, 24, 24)
+    } else {
+        Color32::WHITE
+    }
 }
 
 /// Blends `b` into `a`: `0.0` keeps `a`, `1.0` gives `b`.
@@ -4976,6 +5034,8 @@ fn render_markdown_preview(
     p: &Palette,
     clicked_wiki_link: &mut Option<String>,
     toggled_task_idx: &mut Option<usize>,
+    note_dir: Option<&Path>,
+    images: &mut NoteImages,
 ) {
     let mut in_code_block = false;
     let mut code_buffer = String::new();
@@ -5020,6 +5080,38 @@ fn render_markdown_preview(
         }
 
         let trimmed_start = trimmed.trim_start();
+
+        // `![alt](src)` is a picture, the way GitHub draws one. The text around it stays text,
+        // and each picture gets its own line under the words it was written next to.
+        let pieces = split_images(trimmed_start);
+        if pieces
+            .iter()
+            .any(|piece| matches!(piece, LinePiece::Image { .. }))
+        {
+            for piece in pieces {
+                match piece {
+                    LinePiece::Text(text) if !text.trim().is_empty() => {
+                        ui.horizontal_wrapped(|ui| {
+                            render_inline_spans_ui(
+                                ui,
+                                text.trim(),
+                                14.5,
+                                p,
+                                p.fg_primary,
+                                clicked_wiki_link,
+                                false,
+                            );
+                        });
+                    }
+                    LinePiece::Image { alt, src } => {
+                        images.show(ui, &src, &alt, note_dir, p);
+                        ui.add_space(4.0);
+                    }
+                    LinePiece::Text(_) => {}
+                }
+            }
+            continue;
+        }
 
         if trimmed_start == "---" || trimmed_start == "***" {
             ui.add_space(4.0);
@@ -5305,5 +5397,96 @@ mod tests {
         let state = TextEdit::load_state(&ctx, editor_id).expect("editor state");
         let range = state.cursor.char_range().expect("caret");
         assert_eq!(range.primary.index, 11);
+    }
+
+    #[test]
+    fn test_caret_chip_sits_above_and_stays_visible() {
+        let clip = Rect::from_min_size(Pos2::ZERO, egui::vec2(500.0, 400.0));
+        let size = Vec2::new(60.0, 14.0);
+
+        // Usually the name sits just above the caret, on the line above.
+        let chip = caret_chip(Pos2::new(100.0, 120.0), 18.0, size, clip);
+        assert_eq!(chip.bottom(), 119.0);
+        assert_eq!(chip.left(), 100.0);
+
+        // On the first visible line there is no room above, so it drops below instead of being
+        // clipped away at the top of the editor.
+        let chip = caret_chip(Pos2::new(100.0, 4.0), 18.0, size, clip);
+        assert_eq!(chip.top(), 23.0);
+
+        // At the end of a wrapped line it is pulled back inside the text.
+        let chip = caret_chip(Pos2::new(470.0, 120.0), 18.0, size, clip);
+        assert_eq!(chip.right(), clip.right());
+    }
+
+    #[test]
+    fn test_caret_chip_text_contrast() {
+        // A pale caret colour needs dark text, a deep one white text.
+        assert_eq!(
+            readable_on(Color32::from_rgb(255, 226, 130)),
+            Color32::from_rgb(24, 24, 24)
+        );
+        assert_eq!(readable_on(Color32::from_rgb(40, 70, 140)), Color32::WHITE);
+    }
+
+    #[test]
+    fn test_note_column_fills_a_wide_window() {
+        // The column used to stop at 980 points, leaving 600-point bands empty on either side of
+        // a maximised window. It now takes the width it is given, keeping only a small inset.
+        let (pad, width) = note_column(2400.0);
+        assert_eq!(pad, 64.0);
+        assert_eq!(width, 2400.0 - 128.0);
+        assert!(
+            width > 2000.0,
+            "a wide window should not be left mostly empty"
+        );
+
+        // A narrow window keeps its small margin and never collapses the text away.
+        let (pad, width) = note_column(320.0);
+        assert_eq!(pad, NOTE_SIDE_MARGIN);
+        assert_eq!(width, 320.0 - NOTE_SIDE_MARGIN * 2.0);
+        assert!(note_column(100.0).1 >= 200.0);
+    }
+
+    #[test]
+    fn test_preview_draws_an_embedded_picture() {
+        let ctx = egui::Context::default();
+        install_tabler_icons(&ctx);
+        let dir = std::env::temp_dir().join(format!(
+            "elora-preview-image-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pixels = image::RgbaImage::from_pixel(6, 4, image::Rgba([90, 150, 210, 255]));
+        pixels.save(dir.join("dot.png")).unwrap();
+
+        let markdown = "Before the picture.\n\n![a blue dot](dot.png \"A dot\")\n\nAfter it.";
+        let p = ThemeMode::Obsidian.palette();
+        let mut images = NoteImages::default();
+        let mut clicked_wiki_link = None;
+        let mut toggled_task_idx = None;
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render_markdown_preview(
+                    ui,
+                    markdown,
+                    &p,
+                    &mut clicked_wiki_link,
+                    &mut toggled_task_idx,
+                    Some(&dir),
+                    &mut images,
+                );
+            });
+        });
+
+        assert_eq!(images.ready_pictures(), 1, "the picture should be decoded");
     }
 }

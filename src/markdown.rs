@@ -106,6 +106,71 @@ pub enum InlineSpan {
     },
 }
 
+/// One piece of a rendered line: ordinary Markdown text, or a picture to draw on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinePiece {
+    Text(String),
+    /// `![alt](src)`: the picture GitHub would show, with its alt text and address.
+    Image {
+        alt: String,
+        src: String,
+    },
+}
+
+/// Splits a line into text and GitHub-style `![alt](src)` pictures. A line without pictures comes
+/// back as a single piece of text, so rendering it is unchanged. An empty address (`![]()`) or a
+/// half-written marker stays as text instead of turning into a broken picture.
+pub fn split_images(line: &str) -> Vec<LinePiece> {
+    let mut pieces = Vec::new();
+    let mut text = String::new();
+    let mut rest = line;
+
+    while let Some(start) = rest.find("![") {
+        // `\![…` is literal text, not a picture.
+        if start > 0 && rest.as_bytes()[start - 1] == b'\\' {
+            text.push_str(&rest[..start + 2]);
+            rest = &rest[start + 2..];
+            continue;
+        }
+        let after = &rest[start + 2..];
+        let Some(close) = after.find(']') else { break };
+        if !after[close + 1..].starts_with('(') {
+            text.push_str(&rest[..start + 2]);
+            rest = &rest[start + 2..];
+            continue;
+        }
+        let inside = &after[close + 2..];
+        let Some(end) = inside.find(')') else { break };
+        let target = inside[..end].trim();
+        // `![alt](cat.png "a cat")`: the title after the address is not part of the path.
+        let src = target
+            .split_once(char::is_whitespace)
+            .map(|(src, _)| src)
+            .unwrap_or(target)
+            .trim();
+        if src.is_empty() {
+            text.push_str(&rest[..start + 2]);
+            rest = &rest[start + 2..];
+            continue;
+        }
+        text.push_str(&rest[..start]);
+        if !text.is_empty() {
+            pieces.push(LinePiece::Text(std::mem::take(&mut text)));
+        }
+        pieces.push(LinePiece::Image {
+            alt: after[..close].replace("\\]", "]"),
+            src: src.to_string(),
+        });
+        rest = &inside[end + 1..];
+    }
+
+    text.push_str(rest);
+    if !text.is_empty() || pieces.is_empty() {
+        pieces.push(LinePiece::Text(text));
+    }
+    pieces
+}
+
 /// Parses inline Markdown spans from a single line of text:
 /// - `***bold italic***`
 /// - `**bold**`
@@ -1806,5 +1871,55 @@ mod tests {
         let len_chars = text.chars().count();
         clear_formatting_selection(&mut text, Some((0, len_chars)));
         assert_eq!(text, "Important glowing phrase");
+    }
+
+    #[test]
+    fn test_split_images_finds_pictures_and_keeps_text() {
+        assert_eq!(
+            split_images("plain line"),
+            vec![LinePiece::Text("plain line".to_string())]
+        );
+        assert_eq!(
+            split_images("![a cat](pics/cat.png)"),
+            vec![LinePiece::Image {
+                alt: "a cat".to_string(),
+                src: "pics/cat.png".to_string(),
+            }]
+        );
+        // The optional title after the address is not part of the path.
+        assert_eq!(
+            split_images("![cat](pics/cat.png \"A cat\")"),
+            vec![LinePiece::Image {
+                alt: "cat".to_string(),
+                src: "pics/cat.png".to_string(),
+            }]
+        );
+        // Text around a picture is kept on both sides.
+        assert_eq!(
+            split_images("see ![x](y.png) now"),
+            vec![
+                LinePiece::Text("see ".to_string()),
+                LinePiece::Image {
+                    alt: "x".to_string(),
+                    src: "y.png".to_string(),
+                },
+                LinePiece::Text(" now".to_string()),
+            ]
+        );
+        // Two pictures on one line stay separate pictures.
+        assert_eq!(split_images("![a](a.png) ![b](b.png)").len(), 3);
+        // An empty address, an unfinished marker or an escaped marker is ordinary text.
+        assert_eq!(
+            split_images("![]()"),
+            vec![LinePiece::Text("![]()".to_string())]
+        );
+        assert_eq!(
+            split_images("![open](x"),
+            vec![LinePiece::Text("![open](x".to_string())]
+        );
+        assert_eq!(
+            split_images("\\![not](x.png)"),
+            vec![LinePiece::Text("\\![not](x.png)".to_string())]
+        );
     }
 }

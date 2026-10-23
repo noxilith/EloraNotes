@@ -1,6 +1,6 @@
 [package]
 name = "elora-notes"
-version = "0.9.8"
+version = "0.9.9"
 edition = "2021"
 description = "EloraNotes — A calm, minimalistic cross-platform Markdown notes desktop app"
 authors = ["EloraNotes"]
@@ -23,7 +23,7 @@ path = "src/bin/elora-server.rs"
 default = ["gui"]
 # Everything that draws a window. `cargo build --no-default-features --bin elora-server`
 # produces a server binary with no X11/GL/wayland dependency at all.
-gui = ["dep:eframe", "dep:egui"]
+gui = ["dep:eframe", "dep:egui", "dep:image"]
 
 [dependencies]
 eframe = { version = "0.31", optional = true, default-features = false, features = [
@@ -33,6 +33,13 @@ eframe = { version = "0.31", optional = true, default-features = false, features
     "x11",
 ] }
 egui = { version = "0.31", optional = true }
+# Decodes the pictures a note embeds. Only the formats a note realistically points at: PNG,
+# JPEG and GIF.
+image = { version = "0.25", optional = true, default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6.0"
 serde = { version = "1.0", features = ["derive"] }

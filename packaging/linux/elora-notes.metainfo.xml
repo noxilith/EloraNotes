@@ -25,6 +25,23 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.9.9" date="2026-10-23">
+      <description>
+        <p>
+          Pictures written into a note the way GitHub writes them — ![alt](path) — are now drawn
+          in Preview and Split mode, with paths resolved from the note's own folder. PNG, JPEG and
+          GIF pictures load from disk, and http(s) links are downloaded in the background and
+          cached, so a note can point at a screenshot next to it or at an image on the web. A
+          shared note no longer reports "Auto-save error" when its text is formatted or it is
+          pinned: those went to a file on disk that a note living on the server does not have.
+          The name tag by somebody else's caret is now a filled chip, so the line above it no
+          longer shows through the name, and it moves below the caret when there is no room
+          above. The Edit tab and its command palette entry use the Tabler brush instead of a
+          pencil, and the note column now fills a large or fullscreen window instead of stopping
+          at a fixed width, which used to leave wide empty bands on either side.
+        </p>
+      </description>
+    </release>
     <release version="0.9.8" date="2026-10-23">
       <description>
         <p>

@@ -78,6 +78,7 @@ pub mod icon {
     pub const EYE: &str = "\u{ea9a}";
     pub const EDIT: &str = "\u{ea98}";
     pub const PENCIL: &str = "\u{eb04}";
+    pub const BRUSH: &str = "\u{ebb8}";
     pub const COLUMNS: &str = "\u{eb83}";
     pub const LAYOUT_COLUMNS: &str = "\u{ead4}";
     pub const LAYOUT_SIDEBAR: &str = "\u{eada}";
@@ -110,6 +111,8 @@ pub mod icon {
     pub const CLEAR_FORMATTING: &str = "\u{ebe5}";
     pub const SEPARATOR: &str = "\u{ebda}";
     pub const FLARE: &str = "\u{ee8e}";
+    pub const PHOTO: &str = "\u{eb0a}";
+    pub const PHOTO_OFF: &str = "\u{ecf6}";
     pub const DROPLET: &str = "\u{ea97}";
     pub const CODE: &str = "\u{ea77}";
     pub const QUOTE: &str = "\u{efbe}";
