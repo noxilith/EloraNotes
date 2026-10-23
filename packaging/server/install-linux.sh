@@ -7,13 +7,18 @@
 # connects with, then installs the binary, creates the notes folder, generates the certificate,
 # and registers a service that starts at boot. The server listens on all interfaces so people on
 # other networks can reach it; the last step opens the port in the firewall if one is running.
+#
+# On a system whose /etc/systemd/system is read-only (NixOS and other immutable systems) the
+# installer cannot add a system service. It then registers a service for your own account instead,
+# with the notes in ~/.local/share/elora-server and lingering enabled so it still starts at boot.
+# Set ELORA_SERVICE_MODE=system or ELORA_SERVICE_MODE=user to choose that yourself.
 set -euo pipefail
 
 RELEASE_URL="https://github.com/noxilith/EloraNotes/releases/latest/download/elora-server-linux-x86_64"
-BINARY=${ELORA_SERVER_BIN:-/usr/local/bin/elora-server}
-SERVICE="/etc/systemd/system/elora-server.service"
+SERVICE_NAME="elora-server.service"
 SERVICE_USER="elora"
-DATA_DIR=${ELORA_SERVER_DATA_DIR:-/var/lib/elora-server}
+SYSTEM_DATA_DIR="/var/lib/elora-server"
+SERVICE_MODE=${ELORA_SERVICE_MODE:-auto}
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -24,6 +29,8 @@ fi
 
 command -v systemctl >/dev/null 2>&1 \
     || fail "this machine has no systemd, so the installer cannot register the service"
+command -v runuser >/dev/null 2>&1 \
+    || fail "runuser (part of util-linux) is missing, so the installer cannot switch users"
 
 # --- what the server should be called ------------------------------------------------------
 read -r -p "Server name (shown in everyone's sidebar) [EloraNotes]: " SERVER_NAME
@@ -48,16 +55,62 @@ read -r -s -p "Repeat the password: " PASSWORD_AGAIN; say
 [ -n "$PASSWORD" ] || fail "the password cannot be empty"
 [ "$PASSWORD" = "$PASSWORD_AGAIN" ] || fail "the passwords did not match"
 
+# --- system service or per-user service ----------------------------------------------------
+# A unit has to be written into a directory systemd reads from. On an immutable system
+# /etc/systemd/system is a read-only link into the system image, so it is tested for real
+# instead of assumed.
+if [ "$SERVICE_MODE" = "auto" ]; then
+    if ( : > /etc/systemd/system/.elora-write-test ) 2>/dev/null; then
+        rm -f /etc/systemd/system/.elora-write-test 2>/dev/null || true
+        SERVICE_MODE="system"
+    else
+        SERVICE_MODE="user"
+    fi
+fi
+case "$SERVICE_MODE" in
+    system | user) ;;
+    *) fail "ELORA_SERVICE_MODE must be 'system' or 'user', not '$SERVICE_MODE'" ;;
+esac
+
+if [ "$SERVICE_MODE" = "system" ]; then
+    DATA_DIR=${ELORA_SERVER_DATA_DIR:-$SYSTEM_DATA_DIR}
+    UNIT_DIR=${ELORA_UNIT_DIR:-/etc/systemd/system}
+    BINARY=${ELORA_SERVER_BIN:-/usr/local/bin/elora-server}
+    TARGET_USER=""
+    TARGET_HOME=""
+else
+    TARGET_USER=${ELORA_TARGET_USER:-${SUDO_USER:-}}
+    [ -n "$TARGET_USER" ] || fail \
+        "no account to run the service as; run the installer with sudo from your own account, or set ELORA_TARGET_USER"
+    [ "$TARGET_USER" != "root" ] || fail \
+        "the per-user service needs a normal account; set ELORA_TARGET_USER"
+    TARGET_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
+    [ -n "$TARGET_HOME" ] && [ -d "$TARGET_HOME" ] \
+        || fail "could not find the home folder of $TARGET_USER"
+    TARGET_GROUP=$(id -gn "$TARGET_USER")
+    DATA_DIR=${ELORA_SERVER_DATA_DIR:-$TARGET_HOME/.local/share/elora-server}
+    UNIT_DIR=${ELORA_UNIT_DIR:-$TARGET_HOME/.config/systemd/user}
+    if [ -n "${ELORA_SERVER_BIN:-}" ]; then
+        BINARY=$ELORA_SERVER_BIN
+    elif [ -w /usr/local/bin ] && ( : > /usr/local/bin/.elora-write-test ) 2>/dev/null; then
+        rm -f /usr/local/bin/.elora-write-test 2>/dev/null || true
+        BINARY=/usr/local/bin/elora-server
+    else
+        BINARY=$TARGET_HOME/.local/bin/elora-server
+    fi
+    say ""
+    say "/etc/systemd/system is read-only on this system, so the server is installed as a"
+    say "per-user service for $TARGET_USER instead, with its notes in $DATA_DIR."
+fi
+
 # --- where the binary goes -----------------------------------------------------------------
-# /usr/local/bin is not writable on every system (immutable roots, NixOS), and a failed download
-# must not be the way people find that out, so the destination is checked first.
 BIN_DIR=$(dirname -- "$BINARY")
 mkdir -p "$BIN_DIR" 2>/dev/null || true
 if [ ! -d "$BIN_DIR" ] || ! touch "$BIN_DIR/.elora-write-test" 2>/dev/null; then
     rm -f "$BIN_DIR/.elora-write-test" 2>/dev/null || true
     BINARY="/opt/elora-server/elora-server"
     BIN_DIR=$(dirname -- "$BINARY")
-    say "$ELORA_SERVER_BIN is not writable here; installing the server to $BINARY instead."
+    say "$BIN_DIR is not writable here; installing the server to $BINARY instead."
     mkdir -p "$BIN_DIR" || fail "could not create $BIN_DIR"
 fi
 rm -f "$BIN_DIR/.elora-write-test" 2>/dev/null || true
@@ -101,68 +154,146 @@ install -m 0755 "$STAGED" "$BINARY" || fail "could not install the server to $BI
 "$BINARY" --help >/dev/null 2>&1 \
     || fail "$BINARY does not run on this machine (wrong CPU architecture or a corrupt download)"
 
-# --- a user and folder of its own, so the server never runs as root -------------------------
-# `useradd --system` does not give the user a group of its own on Debian and Ubuntu (that is
-# adduser's behaviour), so the group is created first instead of assuming it exists.
-if ! getent group "$SERVICE_USER" >/dev/null 2>&1; then
-    groupadd --system "$SERVICE_USER" || fail "could not create the $SERVICE_USER group"
-fi
-if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
-    useradd --system --gid "$SERVICE_USER" --home-dir "$DATA_DIR" \
-        --shell /usr/sbin/nologin "$SERVICE_USER" \
-        || fail "could not create the $SERVICE_USER user"
-fi
-SERVICE_GROUP=$(id -gn "$SERVICE_USER")
-if [ "$SERVICE_GROUP" != "$SERVICE_USER" ]; then
-    # An install from an older release left the user on `nogroup`; move it to its own group.
-    usermod -g "$SERVICE_USER" "$SERVICE_USER" \
-        || fail "could not move $SERVICE_USER to its own group"
-    SERVICE_GROUP="$SERVICE_USER"
-fi
-install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$DATA_DIR"
+# --- the account, the folder, the settings -------------------------------------------------
+if [ "$SERVICE_MODE" = "system" ]; then
+    # `useradd --system` does not give the user a group of its own on Debian and Ubuntu (that is
+    # adduser's behaviour), so the group is created first instead of assuming it exists.
+    if ! getent group "$SERVICE_USER" >/dev/null 2>&1; then
+        groupadd --system "$SERVICE_USER" || fail "could not create the $SERVICE_USER group"
+    fi
+    if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
+        useradd --system --gid "$SERVICE_USER" --home-dir "$DATA_DIR" \
+            --shell /usr/sbin/nologin "$SERVICE_USER" \
+            || fail "could not create the $SERVICE_USER user"
+    fi
+    SERVICE_GROUP=$(id -gn "$SERVICE_USER")
+    if [ "$SERVICE_GROUP" != "$SERVICE_USER" ]; then
+        # An install from an older release left the user on `nogroup`; move it to its own group.
+        usermod -g "$SERVICE_USER" "$SERVICE_USER" \
+            || fail "could not move $SERVICE_USER to its own group"
+        SERVICE_GROUP="$SERVICE_USER"
+    fi
+    install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$DATA_DIR"
 
-# The settings, certificate and notes are written here as root and handed to the service user
-# afterwards, so the script never has to switch users (sudo is not always installed).
-say "Writing the settings and the certificate…"
-printf '%s\n' "$PASSWORD" | ELORA_SERVER_DIR="$DATA_DIR" \
-    "$BINARY" init --name "$SERVER_NAME" --port "$PORT" --password-stdin
-chown -R "$SERVICE_USER:$SERVICE_GROUP" "$DATA_DIR"
+    # The settings, certificate and notes are written here as root and handed to the service
+    # user afterwards, so the script never has to switch users (sudo is not always installed).
+    say "Writing the settings and the certificate…"
+    printf '%s\n' "$PASSWORD" | ELORA_SERVER_DIR="$DATA_DIR" \
+        "$BINARY" init --name "$SERVER_NAME" --port "$PORT" --password-stdin
+    chown -R "$SERVICE_USER:$SERVICE_GROUP" "$DATA_DIR"
+    UNIT_USER="User=$SERVICE_USER"
+    UNIT_GROUP="Group=$SERVICE_GROUP"
+    UNIT_WANTED="WantedBy=multi-user.target"
+    UNIT_HARDENING="ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes"
+else
+    # Created as the user, so ~/.local/share never ends up owned by root.
+    runuser -u "$TARGET_USER" -- mkdir -p "$DATA_DIR" \
+        || fail "could not create $DATA_DIR"
+    chmod 0750 "$DATA_DIR"
+
+    # An install that stopped at the system-service step (or a switch from system to user mode)
+    # already has a certificate. Carrying it over keeps the code clients confirm unchanged, and
+    # any notes written meanwhile come along too.
+    PREVIOUS_DATA_DIR=${ELORA_PREVIOUS_DATA_DIR:-$SYSTEM_DATA_DIR}
+    if [ ! -f "$DATA_DIR/cert.pem" ] && [ -f "$PREVIOUS_DATA_DIR/cert.pem" ]; then
+        say "Carrying the certificate over from $PREVIOUS_DATA_DIR, so clients keep the same code."
+        if cp -a "$PREVIOUS_DATA_DIR/cert.pem" "$PREVIOUS_DATA_DIR/key.pem" "$DATA_DIR/" 2>/dev/null; then
+            chown "$TARGET_USER:$TARGET_GROUP" "$DATA_DIR/cert.pem" "$DATA_DIR/key.pem" 2>/dev/null || true
+            chmod 0600 "$DATA_DIR/key.pem" 2>/dev/null || true
+        fi
+    fi
+    if [ -d "$PREVIOUS_DATA_DIR/notes" ] && [ -z "$(ls -A "$PREVIOUS_DATA_DIR/notes" 2>/dev/null)" ]; then
+        : # nothing to bring over
+    elif [ -d "$PREVIOUS_DATA_DIR/notes" ] && [ -z "$(ls -A "$DATA_DIR/notes" 2>/dev/null)" ]; then
+        say "Copying the notes from $PREVIOUS_DATA_DIR/notes."
+        runuser -u "$TARGET_USER" -- mkdir -p "$DATA_DIR/notes"
+        cp -a "$PREVIOUS_DATA_DIR/notes/." "$DATA_DIR/notes/" 2>/dev/null || true
+        chown -R "$TARGET_USER:$TARGET_GROUP" "$DATA_DIR/notes" 2>/dev/null || true
+    fi
+    say "Writing the settings and the certificate…"
+    printf '%s\n' "$PASSWORD" | runuser -u "$TARGET_USER" -- \
+        env ELORA_SERVER_DIR="$DATA_DIR" \
+        "$BINARY" init --name "$SERVER_NAME" --port "$PORT" --password-stdin \
+        || fail "could not write the settings as $TARGET_USER"
+    chown -R "$TARGET_USER:$TARGET_GROUP" "$DATA_DIR"
+    UNIT_USER=""
+    UNIT_GROUP=""
+    UNIT_WANTED="WantedBy=default.target"
+    # A user service cannot take the home folder away from itself, so only the cheap guard stays.
+    UNIT_HARDENING="NoNewPrivileges=yes"
+fi
+
 # The password and the private key are for the service only; a missing file is not fatal.
 chmod 0600 "$DATA_DIR/config.json" "$DATA_DIR/key.pem" 2>/dev/null || true
 chmod 0644 "$DATA_DIR/cert.pem" 2>/dev/null || true
 
 # --- service -------------------------------------------------------------------------------
-cat >"$SERVICE" <<UNIT
-[Unit]
-Description=EloraNotes collaboration server ($SERVER_NAME)
-After=network-online.target
-Wants=network-online.target
+if [ "$SERVICE_MODE" = "system" ]; then
+    mkdir -p "$UNIT_DIR" || fail "could not create $UNIT_DIR"
+else
+    runuser -u "$TARGET_USER" -- mkdir -p "$UNIT_DIR" \
+        || fail "could not create $UNIT_DIR"
+fi
+UNIT_PATH="$UNIT_DIR/$SERVICE_NAME"
+if ! ( : > "$UNIT_PATH" ) 2>/dev/null; then
+    fail "cannot write $UNIT_PATH (is the filesystem read-only?)"
+fi
+{
+    echo "[Unit]"
+    echo "Description=EloraNotes collaboration server ($SERVER_NAME)"
+    echo "After=network-online.target"
+    echo "Wants=network-online.target"
+    echo ""
+    echo "[Service]"
+    echo "Type=simple"
+    [ -n "$UNIT_USER" ] && echo "$UNIT_USER"
+    [ -n "$UNIT_GROUP" ] && echo "$UNIT_GROUP"
+    echo "Environment=ELORA_SERVER_DIR=$DATA_DIR"
+    echo "ExecStart=$BINARY run"
+    echo "Restart=on-failure"
+    echo "RestartSec=3"
+    printf '%s\n' "$UNIT_HARDENING"
+    echo ""
+    echo "[Install]"
+    echo "$UNIT_WANTED"
+} >"$UNIT_PATH"
 
-[Service]
-Type=simple
-User=$SERVICE_USER
-Group=$SERVICE_GROUP
-Environment=ELORA_SERVER_DIR=$DATA_DIR
-ExecStart=$BINARY run
-Restart=on-failure
-RestartSec=3
-# The server only needs its own folder.
-ProtectSystem=full
-ProtectHome=yes
-PrivateTmp=yes
-NoNewPrivileges=yes
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-systemctl daemon-reload
-systemctl enable --now elora-server.service
-sleep 1
-if ! systemctl is-active --quiet elora-server.service; then
-    say "The service did not start; recent log lines:"
-    journalctl -u elora-server.service -n 20 --no-pager || true
-    fail "fix the error above, then run: systemctl restart elora-server"
+started=""
+if [ "$SERVICE_MODE" = "system" ]; then
+    systemctl daemon-reload
+    systemctl enable --now "$SERVICE_NAME"
+    sleep 1
+    if ! systemctl is-active --quiet "$SERVICE_NAME"; then
+        say "The service did not start; recent log lines:"
+        journalctl -u "$SERVICE_NAME" -n 20 --no-pager || true
+        fail "fix the error above, then run: systemctl restart elora-server"
+    fi
+    started="systemctl is-active"
+else
+    chown "$TARGET_USER:$TARGET_GROUP" "$UNIT_PATH"
+    RUNTIME_DIR="/run/user/$(id -u "$TARGET_USER")"
+    loginctl enable-linger "$TARGET_USER" >/dev/null 2>&1 \
+        || say "Could not enable lingering; the server would only run while $TARGET_USER is logged in."
+    if runuser -u "$TARGET_USER" -- env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+        systemctl --user daemon-reload 2>/dev/null; then
+        runuser -u "$TARGET_USER" -- env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+            systemctl --user enable --now "$SERVICE_NAME" \
+            || say "Could not start the user service from here; see the commands at the end."
+        sleep 1
+        if runuser -u "$TARGET_USER" -- env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+            systemctl --user is-active --quiet "$SERVICE_NAME"; then
+            started="systemctl --user is-active"
+        else
+            say "Recent log lines:"
+            runuser -u "$TARGET_USER" -- env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+                journalctl --user -u "$SERVICE_NAME" -n 20 --no-pager || true
+        fi
+    else
+        say "The service manager for $TARGET_USER is not reachable from here."
+    fi
 fi
 
 # --- firewall ------------------------------------------------------------------------------
@@ -192,6 +323,37 @@ if [ -n "$FINGERPRINT" ]; then
 fi
 say ""
 say "Server binary: $BINARY"
-say "Notes live in $DATA_DIR/notes. Manage the service with:"
-say "  systemctl status elora-server     systemctl restart elora-server"
-say "  journalctl -u elora-server -f     (live log)"
+say "Unit file:     $UNIT_PATH"
+say "Notes live in $DATA_DIR/notes."
+if [ "$SERVICE_MODE" = "system" ]; then
+    say "Manage the service with:"
+    say "  systemctl status elora-server     systemctl restart elora-server"
+    say "  journalctl -u elora-server -f     (live log)"
+else
+    say "It runs as a per-user service for $TARGET_USER, so manage it from your own shell:"
+    say "  systemctl --user status elora-server     systemctl --user restart elora-server"
+    say "  journalctl --user -u elora-server -f     (live log)"
+    if [ -z "$started" ]; then
+        say ""
+        say "Start it now with:"
+        say "  systemctl --user daemon-reload && systemctl --user enable --now elora-server"
+    fi
+fi
+
+if [ -e /etc/NIXOS ]; then
+    say ""
+    say "This looks like NixOS. The service above works, but survives a rebuild only if you"
+    say "declare it; add this to configuration.nix instead if you prefer that:"
+    say ""
+    say "  systemd.services.elora-server = {"
+    say "    description = \"EloraNotes collaboration server\";"
+    say "    wantedBy = [ \"multi-user.target\" ];"
+    say "    after = [ \"network-online.target\" ];"
+    say "    serviceConfig = {"
+    say "      ExecStart = \"$BINARY run\";"
+    say "      Environment = \"ELORA_SERVER_DIR=$DATA_DIR\";"
+    say "      Restart = \"on-failure\";"
+    say "      User = \"$TARGET_USER\";"
+    say "    };"
+    say "  };"
+fi

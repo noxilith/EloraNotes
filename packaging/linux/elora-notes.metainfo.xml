@@ -25,6 +25,17 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.9.3" date="2026-10-22">
+      <description>
+        <p>
+          The server installer works on systems with a read-only /etc/systemd/system, such as
+          NixOS: it registers a per-user service, keeps the notes in ~/.local/share/elora-server,
+          turns on lingering so it still starts at boot, and prints the systemctl --user commands
+          that manage it. A certificate from an earlier interrupted install is carried over with
+          any notes, so the code clients confirm does not change.
+        </p>
+      </description>
+    </release>
     <release version="0.9.2" date="2026-10-22">
       <description>
         <p>
