@@ -25,6 +25,21 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.9.28" date="2026-10-24">
+      <description>
+        <p>
+          The note graph now reads as a system of orbits: the best-connected notes travel on the
+          inner elliptical rings, links bend with the orbit, and quieter notes step back towards
+          the edge so the middle is easy to read. Hovering slows the graph and lights up a note's
+          links and neighbours, dragging empty space turns it by hand, and labels shorten and
+          make room for each other instead of piling up.
+        </p>
+        <p>
+          Settings → Appearance → Note graph motion chooses how much it drifts — Orbit, Slow, or
+          Still — and the choice is remembered between launches.
+        </p>
+      </description>
+    </release>
     <release version="0.9.27" date="2026-10-24">
       <description>
         <p>

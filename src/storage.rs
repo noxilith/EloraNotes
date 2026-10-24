@@ -89,6 +89,36 @@ impl NoteSort {
     }
 }
 
+/// How the note graph moves while its window is open: the normal orbit, a slower drift, or a
+/// still picture. Dragging turns the graph in every mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphMotion {
+    #[default]
+    Orbit,
+    Slow,
+    Still,
+}
+
+impl GraphMotion {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Orbit => "Orbit",
+            Self::Slow => "Slow",
+            Self::Still => "Still",
+        }
+    }
+
+    /// Radians per second for the graph's turn. `Still` leaves the turn to a drag.
+    pub fn speed(self) -> f32 {
+        match self {
+            Self::Orbit => 0.12,
+            Self::Slow => 0.05,
+            Self::Still => 0.0,
+        }
+    }
+}
+
 /// The window as it was left: its size, where it sat, and whether it was maximised. A maximised
 /// window keeps the size and position it had before, so restoring it does not open it huge.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -169,6 +199,11 @@ pub struct AppSettings {
     /// is not in those files, so they open with the line off like a fresh install does.
     #[serde(rename = "note_previews", default = "default_show_card_previews")]
     pub show_card_previews: bool,
+
+    /// How the note graph moves. A fresh settings file drifts normally; an older one, which has
+    /// no opinion, does the same.
+    #[serde(default)]
+    pub graph_motion: GraphMotion,
 }
 
 fn default_highlight_rgb() -> [u8; 3] {
@@ -214,6 +249,7 @@ impl Default for AppSettings {
             window: None,
             export_dir: None,
             show_card_previews: default_show_card_previews(),
+            graph_motion: GraphMotion::default(),
         }
     }
 }
@@ -1680,6 +1716,32 @@ And a number #123 should be ignored, while #valid_tag is kept.";
         assert!(back.roomy_cards);
         assert_eq!(back.sort, NoteSort::Title);
         assert_eq!(back.window, chosen.window);
+    }
+
+    /// A fresh settings file drifts like the graph always has, and an older file with no opinion
+    /// does too; once a mode is chosen, it survives a save and load.
+    #[test]
+    fn test_graph_motion_starts_orbiting_and_a_choice_is_kept() {
+        assert_eq!(AppSettings::default().graph_motion, GraphMotion::Orbit);
+
+        let old = serde_json::json!({
+            "theme_name": "Obsidian",
+            "show_formatting_bar": true,
+        });
+        let settings: AppSettings = serde_json::from_value(old).unwrap();
+        assert_eq!(settings.graph_motion, GraphMotion::Orbit);
+
+        let chosen = AppSettings {
+            graph_motion: GraphMotion::Still,
+            ..AppSettings::default()
+        };
+        let text = serde_json::to_string(&chosen).unwrap();
+        assert!(text.contains("\"graph_motion\":\"still\""), "{text}");
+        let back: AppSettings = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.graph_motion, GraphMotion::Still);
+
+        assert_eq!(GraphMotion::Still.speed(), 0.0);
+        assert!(GraphMotion::Slow.speed() < GraphMotion::Orbit.speed());
     }
 
     /// A colour picked for a person's caret is kept, and a settings file from before colours
