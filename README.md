@@ -228,6 +228,15 @@ unless you type the old one in.
 While somebody else has a note open, its card shows a coloured dot; when you open it too you see
 their caret with their name, and the words they type appear as they type them.
 
+The connection looks after itself. While a note is open it tells the server it is still there every
+20 seconds, so a note nobody happens to be typing in is not taken for an abandoned connection and
+closed — which used to take everyone in that note offline together — and a link that has really gone
+(a router that forgot it, a laptop that slept) is noticed within a minute instead of at the next
+keystroke. Editing together does not depend on who types first either: a keystroke made in the frame
+before the window has drawn somebody else's new words is placed on the text it was actually made on,
+so their words are still there afterwards, and the caret follows the newest position rather than the
+last one the throttle let through.
+
 Which notes are synced: the note bodies and the library structure (titles, folders, tags, pins,
 trash). Settings, themes and the update check stay on your own machine.
 

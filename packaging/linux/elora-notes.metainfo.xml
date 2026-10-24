@@ -25,6 +25,29 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.9.26" date="2026-10-24">
+      <description>
+        <p>
+          Shared notes stay connected without anyone typing: the app now pings the server while a
+          note sits idle, so a quiet note is no longer dropped for everybody after two minutes and
+          reconnected. A link that really dies is noticed in under a minute instead of waiting for
+          the next keystroke to fail.
+        </p>
+        <p>
+          A keystroke made in the same instant as somebody else's words arrived can no longer
+          overwrite them: the edit is placed on the version of the text that was actually on
+          screen, and the room's text is what the editor is brought back to. Other people's carets
+          no longer lag behind fast typing, and a caret is published in the document's own
+          coordinates so it stays on the right word when edits arrive at the same time.
+        </p>
+        <p>
+          The server does less work per connection: a whole library no longer needs locking a
+          hundred and twenty times a second for one person, presence lists are only sent when
+          somebody joins, leaves or changes colour, and saving a note is one write instead of
+          re-reading its own file.
+        </p>
+      </description>
+    </release>
     <release version="0.9.25" date="2026-10-24">
       <description>
         <p>

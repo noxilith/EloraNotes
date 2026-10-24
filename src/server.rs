@@ -15,7 +15,7 @@ use crate::net::{
 };
 use crate::people::{self, Registry};
 use crate::storage::Note;
-use chrono::{TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -33,6 +33,9 @@ use yrs::{ClientID, Doc, GetString, ReadTxn, StateVector, Text, TextRef, Transac
 const READ_TIMEOUT: Duration = Duration::from_millis(8);
 /// A room is written to disk at most this often while people are typing.
 const WRITE_DEBOUNCE: Duration = Duration::from_millis(400);
+/// How often one connection looks for notes that are due to be written. Every connection doing
+/// it on its own loop meant the library lock was taken a hundred times a second per person.
+const FLUSH_TICK: Duration = Duration::from_millis(100);
 /// How long a silent connection is kept before it is dropped.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -43,6 +46,10 @@ pub struct Server {
     /// Which display name belongs to which secret key. The keys themselves are never kept.
     people: Mutex<Registry>,
     clients: Mutex<HashMap<u64, Arc<Client>>>,
+    /// The presence list last handed out, and the connections that already have it. Who is in a
+    /// note changes when somebody opens or leaves one; the awareness frames that arrive for every
+    /// caret move carry no such news, so they must not turn into a full list per person.
+    presence: Mutex<PresenceBroadcast>,
     next_id: AtomicU64,
 }
 
@@ -71,6 +78,10 @@ struct Library {
     rooms: HashMap<String, Room>,
     /// Notes whose `.md` is behind the document, and when it was last written.
     dirty: HashMap<String, Instant>,
+    /// When each note was made. A save must not change it, and finding it back out by reading the
+    /// note's own file cost a read and a parse of the whole note on every save — while the
+    /// library lock was held, which is time every other connection spent waiting to type.
+    created: HashMap<String, DateTime<Utc>>,
 }
 
 struct Room {
@@ -82,6 +93,13 @@ struct Room {
     /// left with an update they will accept.
     awareness: HashMap<u64, PeerState>,
     subscribers: HashSet<u64>,
+}
+
+/// The presence list as the connections have it: the snapshot, and who was already sent it.
+#[derive(Default)]
+struct PresenceBroadcast {
+    list: Vec<(String, Vec<PresenceUser>)>,
+    sent: HashSet<u64>,
 }
 
 /// One person's presence in a room, as they last published it.
@@ -103,6 +121,7 @@ impl Server {
             library: Mutex::new(library),
             people: Mutex::new(people),
             clients: Mutex::new(HashMap::new()),
+            presence: Mutex::new(PresenceBroadcast::default()),
             next_id: AtomicU64::new(1),
         })
     }
@@ -178,6 +197,7 @@ impl Server {
         let mut buffer: Vec<u8> = Vec::new();
         let mut chunk = [0u8; 16 * 1024];
         let mut last_contact = Instant::now();
+        let mut last_flush = Instant::now();
 
         loop {
             // Hand over anything other connections queued for us.
@@ -230,15 +250,16 @@ impl Server {
                 }
             }
 
-            self.flush_dirty();
+            if last_flush.elapsed() >= FLUSH_TICK {
+                self.flush_dirty();
+                last_flush = Instant::now();
+            }
 
             if last_contact.elapsed() > IDLE_TIMEOUT {
                 return Ok(());
             }
-            // Nothing waiting: sleep a little so the loop does not spin on an idle socket.
-            if buffer.is_empty() {
-                std::thread::sleep(Duration::from_millis(4));
-            }
+            // The read timeout above is what paces this loop, so a finished frame goes to the
+            // room at once instead of waiting out an extra sleep.
         }
     }
 
@@ -758,56 +779,50 @@ impl Server {
                 let Ok(update) = yrs::sync::AwarenessUpdate::decode_v1(&payload) else {
                     return;
                 };
-                if let Ok(mut library) = self.library.lock() {
-                    if let Some(room) = library.rooms.get_mut(&note_id) {
-                        for (awareness_id, entry) in update.clients.iter() {
-                            let awareness_id = awareness_id.get();
-                            if entry.json.trim() == "null" {
-                                room.awareness.remove(&awareness_id);
-                                if let Ok(mut mine) = client.awareness.lock() {
-                                    mine.remove(&awareness_id);
-                                }
-                            } else {
-                                if let Ok(mut mine) = client.awareness.lock() {
-                                    mine.insert(awareness_id);
-                                }
-                                if room
-                                    .awareness
-                                    .get(&awareness_id)
-                                    .is_none_or(|state| state.clock <= entry.clock)
-                                {
-                                    room.awareness.insert(
-                                        awareness_id,
-                                        PeerState {
-                                            clock: entry.clock,
-                                            json: entry.json.to_string(),
-                                        },
-                                    );
-                                }
+                // Only the people in this note see where this person's caret is. Relaying to
+                // every connection told somebody editing one note that a person was in theirs,
+                // and left a name behind in a note that person had already left. The state and
+                // the list of who to send it to come from the same look at the library: two
+                // locks per caret made every keystroke contend with every other connection.
+                let recipients: Vec<u64> = {
+                    let Ok(mut library) = self.library.lock() else {
+                        return;
+                    };
+                    let Some(room) = library.rooms.get_mut(&note_id) else {
+                        return;
+                    };
+                    for (awareness_id, entry) in update.clients.iter() {
+                        let awareness_id = awareness_id.get();
+                        if entry.json.trim() == "null" {
+                            room.awareness.remove(&awareness_id);
+                            if let Ok(mut mine) = client.awareness.lock() {
+                                mine.remove(&awareness_id);
+                            }
+                        } else {
+                            if let Ok(mut mine) = client.awareness.lock() {
+                                mine.insert(awareness_id);
+                            }
+                            if room
+                                .awareness
+                                .get(&awareness_id)
+                                .is_none_or(|state| state.clock <= entry.clock)
+                            {
+                                room.awareness.insert(
+                                    awareness_id,
+                                    PeerState {
+                                        clock: entry.clock,
+                                        json: entry.json.to_string(),
+                                    },
+                                );
                             }
                         }
                     }
-                }
-                // Only the people in this note see where this person's caret is. Relaying to
-                // every connection told somebody editing one note that a person was in theirs,
-                // and left a name behind in a note that person had already left.
-                let recipients: Vec<u64> = self
-                    .library
-                    .lock()
-                    .ok()
-                    .and_then(|library| {
-                        library
-                            .rooms
-                            .get(&note_id)
-                            .map(|room| room.subscribers.clone())
-                    })
-                    .map(|subscribers| {
-                        subscribers
-                            .into_iter()
-                            .filter(|id| *id != client.id)
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                    room.subscribers
+                        .iter()
+                        .copied()
+                        .filter(|id| *id != client.id)
+                        .collect()
+                };
                 for recipient in recipients {
                     self.push_to(recipient, FRAME_AWARENESS, payload.clone());
                 }
@@ -910,12 +925,23 @@ impl Server {
     /// would hand a client the notes that were restricted away from it.
     fn broadcast_library(&self) {
         let clients = self.connected();
-        let Ok(library) = self.library.lock() else {
-            return;
+        // Working out who may see what needs the library; encoding each list for the wire does
+        // not, and doing that under the lock held up every other connection's keystrokes for as
+        // long as the whole library took to serialize.
+        let lists: Vec<(Arc<Client>, Vec<NoteMeta>)> = {
+            let Ok(library) = self.library.lock() else {
+                return;
+            };
+            clients
+                .into_iter()
+                .map(|client| {
+                    let key = self.key_of(&client);
+                    let notes = library.list_for(&key);
+                    (client, notes)
+                })
+                .collect()
         };
-        for client in clients {
-            let key = self.key_of(&client);
-            let notes = library.list_for(&key);
+        for (client, notes) in lists {
             self.push(&client, FRAME_JSON, json(&ServerMsg::Notes { notes }));
         }
     }
@@ -926,7 +952,19 @@ impl Server {
             return;
         };
         let present = library.presence();
+        let Ok(mut last) = self.presence.lock() else {
+            return;
+        };
+        if last.list != present {
+            last.list = present.clone();
+            last.sent.clear();
+        }
         for client in clients {
+            // Already handed this exact list: a caret moving in one note does not tell anybody
+            // else in the server something they can see.
+            if !last.sent.insert(client.id) {
+                continue;
+            }
             let key = self.key_of(&client);
             let notes: Vec<(String, Vec<PresenceUser>)> = present
                 .iter()
@@ -994,6 +1032,7 @@ fn library_mark_dirty(library: &Mutex<Library>, id: &str) {
 impl Library {
     fn load(dir: &Path) -> Result<Self, String> {
         let mut notes = HashMap::new();
+        let mut created = HashMap::new();
         let entries =
             std::fs::read_dir(dir).map_err(|e| format!("could not read {}: {e}", dir.display()))?;
         for entry in entries.flatten() {
@@ -1012,13 +1051,15 @@ impl Library {
                 continue;
             };
             let note = Note::from_markdown(id.clone(), &raw, path.clone());
-            notes.insert(id, meta_from_note(&note));
+            notes.insert(id.clone(), meta_from_note(&note));
+            created.insert(id, note.created_at);
         }
         Ok(Self {
             dir: dir.to_path_buf(),
             notes,
             rooms: HashMap::new(),
             dirty: HashMap::new(),
+            created,
         })
     }
 
@@ -1092,6 +1133,7 @@ impl Library {
         let path = self.dir.join(format!("{id}.md"));
         std::fs::write(&path, note.to_markdown())
             .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+        self.created.insert(id.clone(), now);
         self.notes.insert(id, meta.clone());
         Ok(meta)
     }
@@ -1162,6 +1204,7 @@ impl Library {
             self.notes.remove(id);
             self.rooms.remove(id);
             self.dirty.remove(id);
+            self.created.remove(id);
             let path = self.dir.join(format!("{id}.md"));
             let _ = std::fs::remove_file(path);
             Ok(())
@@ -1320,11 +1363,8 @@ impl Library {
         };
         let body = self.body(id);
         let path = self.dir.join(format!("{id}.md"));
-        // Keep the original creation time when the note already exists on disk.
-        let created_at = std::fs::read_to_string(&path)
-            .ok()
-            .map(|raw| Note::from_markdown(id.to_string(), &raw, path.clone()).created_at)
-            .unwrap_or_else(Utc::now);
+        // Keep the original creation time: a save is an edit of the note, not a new one.
+        let created_at = *self.created.entry(id.to_string()).or_insert_with(Utc::now);
         let mut note = note_from_meta(&meta, body);
         note.created_at = created_at;
         std::fs::write(&path, note.to_markdown())

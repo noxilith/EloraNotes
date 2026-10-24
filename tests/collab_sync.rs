@@ -832,6 +832,98 @@ fn test_a_title_keeps_the_space_at_the_end_of_a_half_typed_word() {
     );
 }
 
+/// A window draws once a frame, so a keystroke can be made on text the connection has already
+/// moved past. It has to land on the version it was made on: taking the window's older text as
+/// the whole note is what made somebody else's words vanish from it.
+#[test]
+fn test_a_keystroke_from_a_window_a_frame_behind_keeps_the_other_words() {
+    let _turn = SERVER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let harness = start_server();
+    let note_id = harness.note_id.clone();
+
+    let mut alice = Collab::new();
+    alice.connect(profile(harness.port), "alice".into(), key("alice"));
+    let mut alice_body = String::new();
+    settle(&mut alice, &mut alice_body, "alice", |c, _| {
+        c.is_connected()
+    });
+    alice.open_note(&note_id, "hello");
+    settle(&mut alice, &mut alice_body, "alice", |_, body| {
+        body == "hello"
+    });
+
+    let mut bob = Collab::new();
+    bob.connect(profile(harness.port), "bob".into(), key("bob"));
+    let mut bob_body = String::new();
+    settle(&mut bob, &mut bob_body, "bob", |c, _| c.is_connected());
+    bob.open_note(&note_id, "hello");
+    settle(&mut bob, &mut bob_body, "bob", |_, body| body == "hello");
+
+    // Alice types a word. Bob's window draws it…
+    alice.send_body(&note_id, "hello there");
+    settle(&mut bob, &mut bob_body, "bob", |_, body| {
+        body == "hello there"
+    });
+
+    // …but the frame it draws it in has not happened yet when Bob's next keystroke leaves, so his
+    // text is the note as it was before Alice's word, plus his own "!".
+    bob.send_body(&note_id, "hello!");
+
+    // His "!" joins the note where he typed it, and Alice's word is still there for everybody.
+    settle(&mut bob, &mut bob_body, "bob settled", |_, body| {
+        body == "hello! there"
+    });
+    settle(&mut alice, &mut alice_body, "alice", |_, body| {
+        body == "hello! there"
+    });
+
+    alice.disconnect();
+    bob.disconnect();
+}
+
+/// A caret that moves twice in one frame is throttled, but the second move is the one that has to
+/// arrive: dropping it left the other person's name sitting a few characters behind the words.
+#[test]
+fn test_a_caret_moved_twice_in_a_moment_still_arrives() {
+    let _turn = SERVER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let harness = start_server();
+    let note_id = harness.note_id.clone();
+
+    let mut alice = Collab::new();
+    alice.connect(profile(harness.port), "alice".into(), key("alice"));
+    settle(&mut alice, &mut String::new(), "alice", |c, _| {
+        c.is_connected()
+    });
+    alice.open_note(&note_id, "hello");
+    settle(&mut alice, &mut String::new(), "alice", |_, body| {
+        body == "hello"
+    });
+
+    let mut bob = Collab::new();
+    bob.connect(profile(harness.port), "bob".into(), key("bob"));
+    settle(&mut bob, &mut String::new(), "bob", |c, _| c.is_connected());
+    bob.open_note(&note_id, "hello");
+    settle(&mut bob, &mut String::new(), "bob", |_, body| {
+        body == "hello"
+    });
+    settle(&mut bob, &mut String::new(), "bob sees alice", |c, _| {
+        c.peers().iter().any(|p| p.name == "alice")
+    });
+
+    // Two moves back to back, faster than the throttle allows to be sent.
+    alice.send_cursor(&note_id, 1);
+    alice.send_cursor(&note_id, 4);
+
+    settle(&mut bob, &mut String::new(), "bob caret", |c, _| {
+        c.peers()
+            .iter()
+            .any(|p| p.name == "alice" && p.cursor == Some(4))
+    });
+
+    alice.disconnect();
+    bob.disconnect();
+}
+
 /// The colour somebody picks in Settings is the one the others draw their caret and name in —
 /// and a colour picked while the note is already open reaches them without a reconnect.
 #[test]

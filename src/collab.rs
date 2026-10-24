@@ -27,7 +27,22 @@ const POLL: Duration = Duration::from_millis(8);
 const FIRST_RETRY: Duration = Duration::from_secs(2);
 const MAX_RETRY: Duration = Duration::from_secs(15);
 /// Cursor updates are throttled: a caret that moves every keystroke does not need every frame.
-const CURSOR_INTERVAL: Duration = Duration::from_millis(120);
+/// Whatever the throttle holds back is sent as soon as it allows, so the newest caret always
+/// ends up on the other side.
+const CURSOR_INTERVAL: Duration = Duration::from_millis(60);
+/// How often a quiet connection tells the server it is still there. A note nobody types in sends
+/// nothing at all, and the server closes a connection that has not spoken in a couple of minutes
+/// — which took everybody in that note offline together, and read as the connection randomly
+/// dropping.
+const PING_INTERVAL: Duration = Duration::from_secs(20);
+/// How long a ping goes unanswered before the link is treated as gone. A connection killed by a
+/// router or a sleeping laptop does not close cleanly: without this, the app would sit on a dead
+/// socket until the next keystroke happened to fail.
+const PONG_TIMEOUT: Duration = Duration::from_secs(50);
+/// How many versions of the text the window may have been left showing. A window draws once a
+/// frame, so one or two is the honest lag; keeping a few more costs little and covers a stalled
+/// frame.
+const RECENT_TEXTS: usize = 4;
 /// How long an address is given to answer when the connection is opened. A port that is
 /// filtered rather than refused (the usual result of a missing port forward) would otherwise
 /// leave the app in "Connecting…" for minutes, which looks like it has hung.
@@ -642,6 +657,19 @@ struct Session {
     buffer: Vec<u8>,
     last_cursor: Instant,
     last_cursor_sent: Option<usize>,
+    /// A caret the throttle is holding back. It is published the moment the interval allows,
+    /// even when no further keystroke arrives to carry it out.
+    pending_cursor: Option<usize>,
+    /// Versions the window may still be showing, newest first. A keystroke typed before the
+    /// window drew the newest text was made on one of these, and placing it on the right one is
+    /// what stops a frame's worth of somebody else's words from being wiped out.
+    recent: Vec<String>,
+    /// The text the window last sent. It sends the whole text every frame, so the same text again
+    /// is not an edit — and must not be applied as one.
+    window: String,
+    /// When the last keepalive ping went out, and when the one still unanswered was sent.
+    last_ping: Instant,
+    pending_pong: Option<Instant>,
     name: String,
     color: [u8; 3],
 }
@@ -811,6 +839,11 @@ impl Session {
             buffer,
             last_cursor: Instant::now(),
             last_cursor_sent: None,
+            pending_cursor: None,
+            recent: Vec::new(),
+            window: String::new(),
+            last_ping: Instant::now(),
+            pending_pong: None,
             name: name.to_string(),
             color: color.unwrap_or_else(|| default_peer_color(name)),
         };
@@ -832,6 +865,10 @@ impl Session {
                     }
                     Err(TryRecvError::Empty) => break,
                 }
+            }
+
+            if let Err(error) = self.keep_alive(events) {
+                return error;
             }
 
             match read_frames(&mut self.stream, &mut self.buffer) {
@@ -864,11 +901,16 @@ impl Session {
                 self.awareness = Awareness::new(doc);
                 self.mirror.clear();
                 self.awaiting_room_state = true;
+                // Until the note's own text arrives, the window is still showing what it had, so
+                // that copy is what a keystroke made in the meantime is based on.
+                self.recent = vec![body.clone()];
+                self.window = body.clone();
                 self.opened_with = body;
                 self.deferred_body = None;
                 self.send_msg(&ClientMsg::Open { id: id.clone() })?;
                 self.open = Some(id);
                 self.last_cursor_sent = None;
+                self.pending_cursor = None;
                 // Announce ourselves in the room so the presence list has a name to show even
                 // before this person moves their caret.
                 self.publish_awareness(events, true);
@@ -877,6 +919,8 @@ impl Session {
                 self.open = None;
                 self.awaiting_room_state = false;
                 self.deferred_body = None;
+                self.recent.clear();
+                self.window.clear();
                 self.mirror.clear();
                 self.clear_awareness();
                 self.send_msg(&ClientMsg::Close)?;
@@ -891,7 +935,7 @@ impl Session {
                     self.deferred_body = Some(text);
                     return Ok(());
                 }
-                self.apply_local(&text)?;
+                self.apply_local(&text, events)?;
             }
             Command::SetName(name) => {
                 self.name = name;
@@ -910,16 +954,21 @@ impl Session {
                 if self.open.as_deref() != Some(id.as_str()) {
                     return Ok(());
                 }
-                // The first caret goes out immediately; after that it is throttled so typing
-                // does not turn into a stream of awareness frames.
-                let throttled =
-                    self.last_cursor_sent.is_some() && self.last_cursor.elapsed() < CURSOR_INTERVAL;
-                if self.last_cursor_sent == Some(byte) || throttled {
+                // The window's caret counts bytes into the text it is showing, which can be a
+                // frame behind the document another person is already typing into.
+                let byte = map_position(&self.mirror, &self.doc_text(), byte);
+                if self.last_cursor_sent == Some(byte) {
+                    self.pending_cursor = None;
                     return Ok(());
                 }
-                self.last_cursor = Instant::now();
-                self.last_cursor_sent = Some(byte);
-                self.publish_awareness(events, false);
+                self.pending_cursor = Some(byte);
+                // The first caret goes out immediately; after that it is throttled so typing
+                // does not turn into a stream of awareness frames. A held-back one is not
+                // dropped: `keep_alive` sends the newest as soon as the interval is up.
+                if self.last_cursor_sent.is_none() || self.last_cursor.elapsed() >= CURSOR_INTERVAL
+                {
+                    self.publish_cursor(events);
+                }
             }
             Command::Create {
                 title,
@@ -989,6 +1038,9 @@ impl Session {
                     // A refusal is not a reason to drop the connection: the library is still
                     // there, and the note that was turned down simply is not this client's.
                     ServerMsg::Error { message } => events.send(Incoming::Refused(message)),
+                    // The link is alive in both directions: nothing is waiting to be resent and
+                    // the server has not gone away.
+                    ServerMsg::Pong => self.pending_pong = None,
                     _ => {}
                 }
             }
@@ -1029,7 +1081,7 @@ impl Session {
                         // before, and the room's own text has just replaced it.
                         if let Some(text) = self.deferred_body.take() {
                             if text != self.opened_with {
-                                self.apply_local(&text)?;
+                                self.apply_local(&text, events)?;
                             }
                         }
                     }
@@ -1097,48 +1149,95 @@ impl Session {
             return;
         };
         let text = self.doc_text();
-        self.mirror = text.clone();
+        self.hand_off(&text);
         events.send(Incoming::Body { id, text });
     }
 
     /// Applies what the user typed to the shared document. Only the changed range is sent, and
     /// the position is mapped into the document so a remote insert elsewhere does not make the
     /// local text land in the wrong place.
-    fn apply_local(&mut self, text: &str) -> Result<(), String> {
+    ///
+    /// The document is the authority: whatever it holds afterwards is handed back to the window
+    /// whenever the two disagree. Leaving the window with text the document never received is
+    /// what made a note show words nobody else had — and miss words it did have.
+    fn apply_local(&mut self, text: &str, events: &Notify) -> Result<(), String> {
         if self.open.is_none() {
             return Ok(());
         }
-        if text == self.mirror {
+        // The window hands over its whole text every frame. The same text again is not an edit,
+        // however far the document has moved on in the meantime.
+        if text == self.window {
             return Ok(());
         }
+        self.window = text.to_string();
+        // The window can be a frame behind: somebody's words arrived, and it has not drawn them
+        // yet. What this person typed belongs on top of the text it is showing, not on top of the
+        // text it has not seen — taking its text as the whole truth would wipe those words out.
+        let Some((base, age)) = self.base_for(text) else {
+            return Ok(());
+        };
+        // Nothing older than the version it typed on can still be on screen.
+        self.recent.truncate(age);
         let current = self.doc_text();
-        let (start, removed, inserted) = diff(&self.mirror, text);
-        let base = self.mirror.clone();
-        if base.is_empty() && current.is_empty() {
-            // First edit after opening a note that was empty everywhere.
-            let update = self.write_range(0, 0, text);
-            self.mirror = text.to_string();
-            return self.send_update(update);
-        }
+        let Some((at, removed, inserted)) = local_patch(&base, &current, text) else {
+            // Nothing to write: the text sent is the version it was already given.
+            if age == 0 {
+                self.mirror = text.to_string();
+            }
+            return Ok(());
+        };
+        let update = self.write_range(at, removed, inserted);
+        self.send_update(update)?;
 
-        let at = map_position(&base, &current, start);
-        let at = at.min(current.len());
-        let at = floor_char_boundary(&current, at);
-        let removed_text = &base[start..start + removed];
-        let delete = current[at..].starts_with(removed_text) && !removed_text.is_empty();
-        let update = self.write_range(
-            at,
-            if delete { removed } else { 0 },
-            &text[start..start + inserted],
-        );
+        let doc = self.doc_text();
+        if doc == text {
+            self.mirror = doc;
+        } else if let Some(id) = self.open.clone() {
+            // The document had to be worked around what arrived meanwhile, so it is the document
+            // that the window should be showing.
+            self.hand_off(&doc);
+            events.send(Incoming::Body { id, text: doc });
+        }
+        Ok(())
+    }
+
+    /// The text out of what the window has been handed that `text` was most likely typed on:
+    /// the one it is the smallest change from. The version it is on, and how old that is.
+    fn base_for(&self, text: &str) -> Option<(String, usize)> {
+        let mut best: Option<(String, usize, usize)> = None;
+        for (age, candidate) in std::iter::once(&self.mirror)
+            .chain(self.recent.iter())
+            .enumerate()
+        {
+            let (_, removed, inserted) = diff(candidate, text);
+            let cost = removed + inserted;
+            if best.as_ref().is_none_or(|(_, _, kept)| cost < *kept) {
+                best = Some((candidate.clone(), age, cost));
+            }
+        }
+        best.map(|(base, age, _)| (base, age))
+    }
+
+    /// Records that the window is being shown `text`, keeping what it was showing before in case
+    /// a keystroke was made before it drew the new text.
+    fn hand_off(&mut self, text: &str) {
+        if !self.mirror.is_empty() && self.mirror != text {
+            let previous = std::mem::take(&mut self.mirror);
+            self.recent.insert(0, previous);
+            self.recent.truncate(RECENT_TEXTS);
+        }
         self.mirror = text.to_string();
-        self.send_update(update)
     }
 
     /// Applies one local change and returns the Yjs update describing it. The update has to be
     /// encoded inside the transaction that made the change, otherwise it carries nothing.
     fn write_range(&mut self, at: usize, removed: usize, inserted: &str) -> Vec<u8> {
         let mut txn = self.awareness.doc_mut().transact_mut();
+        // Every position here was meant for this document, but a range that runs off its end
+        // would take the worker thread down with it, so it is pulled back inside first.
+        let len = self.text.len(&txn) as usize;
+        let at = at.min(len);
+        let removed = removed.min(len - at);
         if removed > 0 {
             self.text.remove_range(&mut txn, at as u32, removed as u32);
         }
@@ -1168,13 +1267,47 @@ impl Session {
         if text == self.mirror {
             return;
         }
-        self.mirror = text.clone();
+        self.hand_off(&text);
         events.send(Incoming::Body { id, text });
     }
 
     fn doc_text(&self) -> String {
         let txn = self.awareness.doc().transact();
         self.text.get_string(&txn)
+    }
+
+    /// The work that has to happen on a quiet connection too: the caret the throttle held back,
+    /// and the ping that keeps the session open. Returns the reason the link is gone when it no
+    /// longer answers.
+    fn keep_alive(&mut self, events: &Notify) -> Result<(), String> {
+        if self.pending_cursor.is_some() && self.last_cursor.elapsed() >= CURSOR_INTERVAL {
+            self.publish_cursor(events);
+        }
+        match keepalive_action(
+            self.last_ping.elapsed(),
+            self.pending_pong.map(|s| s.elapsed()),
+        ) {
+            KeepAlive::Nothing => {}
+            KeepAlive::Ping => {
+                self.last_ping = Instant::now();
+                self.pending_pong.get_or_insert_with(Instant::now);
+                self.send_msg(&ClientMsg::Ping)?;
+            }
+            KeepAlive::Gone => {
+                return Err("the server stopped answering; reconnecting".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    /// Sends the caret the throttle has been holding, now that it may.
+    fn publish_cursor(&mut self, events: &Notify) {
+        let Some(byte) = self.pending_cursor.take() else {
+            return;
+        };
+        self.last_cursor = Instant::now();
+        self.last_cursor_sent = Some(byte);
+        self.publish_awareness(events, false);
     }
 
     fn publish_awareness(&mut self, events: &Notify, force: bool) {
@@ -1356,22 +1489,103 @@ pub fn diff(base: &str, new: &str) -> (usize, usize, usize) {
     (prefix, base_rest - suffix, new_rest - suffix)
 }
 
-/// Maps a byte position in `base` onto the matching position in `current`, where the two differ
-/// only by edits made elsewhere. Falls back to counting from the end when the change is before
-/// the position, which keeps the caret's text on either side intact.
-fn map_position(base: &str, current: &str, position: usize) -> usize {
-    let mut common = 0;
-    let limit = base.len().min(current.len());
-    while common < limit && base.as_bytes()[common] == current.as_bytes()[common] {
-        common += 1;
-    }
-    while common > 0 && !current.is_char_boundary(common) {
-        common -= 1;
-    }
-    if common >= position {
-        position
+/// What a connection that has heard nothing should do about it.
+#[derive(Debug, PartialEq)]
+enum KeepAlive {
+    Nothing,
+    /// Say it is still there, so the server does not close a note nobody is typing in.
+    Ping,
+    /// A ping went unanswered for long enough that the link is not carrying anything any more.
+    Gone,
+}
+
+fn keepalive_action(since_ping: Duration, unanswered: Option<Duration>) -> KeepAlive {
+    if unanswered.is_some_and(|waited| waited >= PONG_TIMEOUT) {
+        KeepAlive::Gone
+    } else if since_ping >= PING_INTERVAL {
+        KeepAlive::Ping
     } else {
-        current.len().saturating_sub(base.len() - position)
+        KeepAlive::Nothing
+    }
+}
+
+/// What to write into the document so the text the window typed lands on top of what the
+/// document already holds: `(position, removed, inserted)`. `None` when there is nothing to
+/// write, which is the case both for an unchanged window and for one that caught up on its own.
+fn local_patch<'a>(base: &str, current: &str, text: &'a str) -> Option<(usize, usize, &'a str)> {
+    if text == base || current == text {
+        return None;
+    }
+    let (start, removed, inserted) = diff(base, text);
+    let (at, removable) = place_change(base, current, start, removed);
+    let at = floor_char_boundary(current, at.min(current.len()));
+    // Deleting is only safe where the text being deleted is still the text that was meant: when
+    // somebody else has just changed that spot, the words stay and the new text goes in beside
+    // them, which loses no keystroke and can be fixed with a second backspace.
+    let keep = removable
+        && removed > 0
+        && at + removed <= current.len()
+        && current[at..].starts_with(&base[start..start + removed]);
+    Some((
+        at,
+        if keep { removed } else { 0 },
+        &text[start..start + inserted],
+    ))
+}
+
+/// Maps a byte position in `base` onto the matching position in `current`, where the two differ
+/// only by edits made elsewhere. A position inside text somebody else replaced lands at the
+/// nearest unchanged end, so a caret is never left pointing into the middle of a word.
+fn map_position(base: &str, current: &str, position: usize) -> usize {
+    place_change(base, current, position, 0).0
+}
+
+/// Where a change made against `base` belongs in `current`, as `(position, may_delete)`.
+///
+/// The one case it cannot place honestly is a change landing inside text somebody else has just
+/// replaced: it answers with the nearest unchanged end and says the deletion must not happen,
+/// because the words there are no longer the ones the window meant to remove.
+fn place_change(base: &str, current: &str, start: usize, removed: usize) -> (usize, bool) {
+    let base_bytes = base.as_bytes();
+    let current_bytes = current.as_bytes();
+    let limit = base_bytes.len().min(current_bytes.len());
+
+    let mut prefix = 0;
+    while prefix < limit && base_bytes[prefix] == current_bytes[prefix] {
+        prefix += 1;
+    }
+    while prefix > 0 && (!base.is_char_boundary(prefix) || !current.is_char_boundary(prefix)) {
+        prefix -= 1;
+    }
+
+    let mut suffix = 0;
+    let room = limit - prefix;
+    while suffix < room
+        && base_bytes[base_bytes.len() - 1 - suffix]
+            == current_bytes[current_bytes.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    while suffix > 0
+        && (!base.is_char_boundary(base.len() - suffix)
+            || !current.is_char_boundary(current.len() - suffix))
+    {
+        suffix -= 1;
+    }
+
+    // The head and the tail of the two texts still agree; whatever changed is between them.
+    let base_tail = base.len() - suffix;
+    let current_tail = current.len() - suffix;
+    if start + removed <= prefix {
+        // Everything up to the change is untouched, so the position is its own.
+        (start, true)
+    } else if start >= base_tail {
+        // The change is in the shared tail: it moves with it.
+        (current_tail + (start - base_tail), true)
+    } else if start - prefix <= base_tail - start {
+        (prefix, false)
+    } else {
+        (current_tail, false)
     }
 }
 
@@ -1453,6 +1667,65 @@ mod tests {
         let (start, removed, inserted) = diff("héllo", "héllo wörld");
         assert_eq!(&"héllo wörld"[start..start + inserted], " wörld");
         assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn test_a_local_edit_lands_on_the_documents_own_text() {
+        // Typing in the middle while somebody else appends at the end: both survive, in place.
+        let (at, removed, inserted) = local_patch("abc", "abcZZ", "aXbc").unwrap();
+        assert_eq!((at, removed, inserted), (1, 0, "X"));
+
+        // A backspace while somebody else added a line above: the letter the person meant goes,
+        // and the line above stays.
+        let (at, removed, inserted) = local_patch("one\ntwo", "new\none\ntwo", "one\nwo").unwrap();
+        assert_eq!((at, removed, inserted), (8, 1, ""));
+        let mut current = String::from("new\none\ntwo");
+        current.replace_range(at..at + removed, inserted);
+        assert_eq!(current, "new\none\nwo");
+
+        // Nothing was typed, or the window already shows the document: nothing to write.
+        assert_eq!(local_patch("abc", "abc", "abc"), None);
+        assert_eq!(local_patch("abc", "abcdef", "abcdef"), None);
+        assert_eq!(local_patch("", "", "hello").unwrap(), (0, 0, "hello"));
+    }
+
+    #[test]
+    fn test_a_replacement_is_not_deleted_out_of_text_somebody_else_just_wrote() {
+        // The window means to turn "world" into "there", but the other person has just put
+        // "earth" where those letters were. Their words stay, and no keystroke is thrown away.
+        let (at, removed, inserted) = local_patch("say world", "say earth", "say there").unwrap();
+        assert_eq!(removed, 0, "text that is not ours must not be deleted");
+        assert_eq!(inserted, "there");
+        let mut current = String::from("say earth");
+        current.insert_str(at, inserted);
+        assert!(
+            current.contains("earth") && current.contains("there"),
+            "{current:?}"
+        );
+        assert!(current.is_char_boundary(at));
+    }
+
+    #[test]
+    fn test_a_quiet_connection_pings_before_it_gives_up() {
+        assert_eq!(
+            keepalive_action(Duration::from_secs(1), None),
+            KeepAlive::Nothing
+        );
+        assert_eq!(
+            keepalive_action(PING_INTERVAL, None),
+            KeepAlive::Ping,
+            "a note nobody types in still has to speak before the server drops it"
+        );
+        assert_eq!(
+            keepalive_action(PING_INTERVAL, Some(Duration::from_secs(1))),
+            KeepAlive::Ping,
+            "a ping already waiting for its answer is not sent again"
+        );
+        assert_eq!(
+            keepalive_action(PING_INTERVAL, Some(PONG_TIMEOUT)),
+            KeepAlive::Gone,
+            "an unanswered ping means the link is not carrying anything"
+        );
     }
 
     #[test]
