@@ -155,6 +155,11 @@ pub struct AppSettings {
     #[serde(default)]
     pub window: Option<WindowState>,
 
+    /// The folder the last HTML export was written into, so the next one starts there. `None` means
+    /// the downloads folder, where an export goes until somebody picks somewhere else.
+    #[serde(default)]
+    pub export_dir: Option<String>,
+
     /// Whether a card in the sidebar shows the first lines of its note. Off unless it is turned
     /// on, which leaves just the title, the date and the tags, so more notes fit in the list.
     ///
@@ -207,6 +212,7 @@ impl Default for AppSettings {
             roomy_cards: false,
             sort: NoteSort::default(),
             window: None,
+            export_dir: None,
             show_card_previews: default_show_card_previews(),
         }
     }

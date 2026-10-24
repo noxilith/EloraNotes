@@ -1657,7 +1657,69 @@ fn styled_to_html(text: &str, style: SpanStyle) -> String {
     out
 }
 
-fn inline_to_html(line: &str) -> String {
+/// What an exported page may point at. A wiki link becomes an `<a>` only when its target has a page
+/// beside it, and a picture becomes an `<img>` only when it has been written there; anything else
+/// keeps the words the note was written with, so nothing disappears quietly.
+pub struct ExportTargets<'a> {
+    /// Maps a wiki link's target (`[[My Note]]`) to the page that opens it, or `None` when there is
+    /// no such page in the export.
+    pub link: &'a dyn Fn(&str) -> Option<String>,
+    /// Maps a picture's address in the note to where the page should load it from.
+    pub picture: &'a dyn Fn(&str) -> Option<String>,
+}
+
+impl ExportTargets<'static> {
+    /// A page that points at nothing: pictures stay as they were written and links stay words.
+    pub fn none() -> Self {
+        fn nothing(_: &str) -> Option<String> {
+            None
+        }
+        Self {
+            link: &nothing,
+            picture: &nothing,
+        }
+    }
+}
+
+/// A line of a note as HTML, pictures and all: the words go through the inline parser, and a
+/// picture becomes an `<img>` when it can be reached from the page.
+fn inline_to_html(line: &str, targets: &ExportTargets<'_>) -> String {
+    let mut out = String::new();
+    for piece in split_images(line) {
+        match piece {
+            LinePiece::Text(text) => out.push_str(&spans_to_html(&text, targets)),
+            LinePiece::Image { alt, src, width } => match (targets.picture)(&src) {
+                Some(href) => out.push_str(&picture_to_html(&href, &alt, width)),
+                // Nothing to load it from: the marker stays the words it was written with.
+                None => out.push_str(&html_escape(&picture_markdown(&alt, &src, width))),
+            },
+        }
+    }
+    out
+}
+
+/// A picture in the page: where it loads from, its alt text, and the width the note gave it.
+fn picture_to_html(href: &str, alt: &str, width: Option<u32>) -> String {
+    let size = match width {
+        Some(width) => format!(" width=\"{width}\""),
+        None => String::new(),
+    };
+    format!(
+        "<img src=\"{}\" alt=\"{}\"{size}>",
+        html_escape(href),
+        html_escape(alt)
+    )
+}
+
+/// A picture put back into the Markdown it was written as, for a page that cannot show it.
+fn picture_markdown(alt: &str, src: &str, width: Option<u32>) -> String {
+    match width {
+        Some(width) => format!("![{alt}]({src}){{width={width}}}"),
+        None => format!("![{alt}]({src})"),
+    }
+}
+
+fn spans_to_html(line: &str, targets: &ExportTargets<'_>) -> String {
     let mut out = String::new();
     for span in parse_inline_spans(line) {
         match span {
@@ -1686,35 +1748,323 @@ fn inline_to_html(line: &str) -> String {
             InlineSpan::Tag(t) => {
                 out.push_str(&format!("<span class=\"tag\">{}</span>", html_escape(&t)))
             }
-            InlineSpan::WikiLink { display, .. } => out.push_str(&html_escape(&display)),
+            InlineSpan::WikiLink { target, display } => match (targets.link)(&target) {
+                Some(href) => out.push_str(&format!(
+                    "<a href=\"{}\">{}</a>",
+                    html_escape(&href),
+                    html_escape(&display)
+                )),
+                None => out.push_str(&html_escape(&display)),
+            },
         }
     }
     out
 }
 
-/// Converts a note into a standalone HTML document. Handles headings, lists, task lists,
-/// blockquotes, fenced code and the inline syntax understood by `parse_inline_spans`.
+/// Strips the `>` marker from one line of a quote and gives back what is written after it, or
+/// `None` when the line is not part of a quote. The space after the marker is optional, the way
+/// `> quoted` and `>quoted` both read as one quote everywhere else.
+pub fn quote_line(line: &str) -> Option<&str> {
+    let rest = line.trim_start().strip_prefix('>')?;
+    Some(rest.strip_prefix(' ').unwrap_or(rest))
+}
+
+/// The quote that starts at `lines[0]`: every line in a row that carries a marker, with the
+/// markers taken off. A line without one ends it, so a table written inside a quote arrives as
+/// ordinary table lines. Returns the quote's contents and how many lines they used.
+pub fn quote_block<'a>(lines: &[&'a str]) -> Option<(Vec<&'a str>, usize)> {
+    let mut inner = Vec::new();
+    for line in lines {
+        match quote_line(line) {
+            Some(content) => inner.push(content),
+            None => break,
+        }
+    }
+    let used = inner.len();
+    (used > 0).then_some((inner, used))
+}
+
+/// How many characters of whitespace a line starts with.
+fn indent_width(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// Removes up to `count` characters of leading whitespace, leaving the rest of the line be.
+fn strip_indent(line: &str, count: usize) -> &str {
+    let mut rest = line;
+    for _ in 0..count {
+        match rest.strip_prefix(' ').or_else(|| rest.strip_prefix('\t')) {
+            Some(after) => rest = after,
+            None => break,
+        }
+    }
+    rest
+}
+
+/// What belongs to the list item above: the lines under it that are indented past its marker, with
+/// that indent taken off. A table, a nested list or another paragraph all arrive here the same
+/// way, so an item can hold a block of its own. A blank line in the middle comes along; a blank
+/// line followed by something back at the item's own level does not. Returns the content and how
+/// many lines it used, or `None` when the item is just the one line.
+pub fn list_item_body<'a>(
+    lines: &[&'a str],
+    marker_indent: usize,
+) -> Option<(Vec<&'a str>, usize)> {
+    let mut scanned = 0usize;
+    let mut last_content = 0usize;
+    let mut indent = usize::MAX;
+    for line in lines {
+        if line.trim().is_empty() {
+            scanned += 1;
+            continue;
+        }
+        let line_indent = indent_width(line);
+        if line_indent <= marker_indent {
+            break;
+        }
+        indent = indent.min(line_indent);
+        scanned += 1;
+        last_content = scanned;
+    }
+    // Trailing blank lines are the gap after the item, not part of it.
+    if last_content == 0 || indent == usize::MAX {
+        return None;
+    }
+    let body = lines[..last_content]
+        .iter()
+        .map(|line| strip_indent(line, indent))
+        .collect();
+    Some((body, last_content))
+}
+
+/// How a table column lines its cells up, from the colons in the delimiter row under the header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnAlign {
+    Left,
+    Center,
+    Right,
+}
+
+impl ColumnAlign {
+    pub fn css(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Center => "center",
+            Self::Right => "right",
+        }
+    }
+}
+
+/// A pipe table: its header cells, how each column is aligned, and the body rows. Every row is
+/// trimmed or padded to the header's number of columns, so a short or long row still lines up
+/// under the right headings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Table {
+    pub header: Vec<String>,
+    pub aligns: Vec<ColumnAlign>,
+    pub rows: Vec<Vec<String>>,
+}
+
+/// Splits one table line into its cells. A pipe at either end is the table's border rather than
+/// an empty cell, and `\|` stays a literal pipe inside a cell.
+pub fn table_cells(line: &str) -> Vec<String> {
+    let mut rest = line.trim();
+    if let Some(after) = rest.strip_prefix('|') {
+        rest = after;
+    }
+    if rest.ends_with('|') && !rest.ends_with("\\|") {
+        rest = &rest[..rest.len() - 1];
+    }
+
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut chars = rest.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' if chars.peek() == Some(&'|') => {
+                chars.next();
+                cell.push('|');
+            }
+            '|' => {
+                cells.push(cell.trim().to_string());
+                cell.clear();
+            }
+            other => cell.push(other),
+        }
+    }
+    cells.push(cell.trim().to_string());
+    cells
+}
+
+/// The alignment a delimiter cell asks for: `---` and `:--` line up left, `--:` right, `:-:`
+/// centred. Anything else is not a delimiter at all.
+fn column_align(cell: &str) -> Option<ColumnAlign> {
+    let cell = cell.trim();
+    let left = cell.starts_with(':');
+    let right = cell.ends_with(':');
+    let dashes = cell.trim_start_matches(':').trim_end_matches(':');
+    if dashes.is_empty() || !dashes.chars().all(|ch| ch == '-') {
+        return None;
+    }
+    Some(match (left, right) {
+        (true, true) => ColumnAlign::Center,
+        (false, true) => ColumnAlign::Right,
+        _ => ColumnAlign::Left,
+    })
+}
+
+/// Reads the pipe table that starts at `lines[0]`: a header row, a delimiter row of dashes and
+/// colons, then body rows until a blank line or a line with no pipe in it. Returns the table and
+/// how many lines it used, or `None` when the lines are not a table — which is why a heading
+/// underlined with `---` is left alone: neither of its two lines carries a pipe.
+pub fn parse_table(lines: &[&str]) -> Option<(Table, usize)> {
+    let [header_line, delimiter_line, ..] = lines else {
+        return None;
+    };
+    let header_line = header_line.trim();
+    let delimiter_line = delimiter_line.trim();
+    if header_line.starts_with("```")
+        || delimiter_line.starts_with("```")
+        || !header_line.contains('|')
+        || !delimiter_line.contains('|')
+    {
+        return None;
+    }
+
+    let header = table_cells(header_line);
+    let delimiters = table_cells(delimiter_line);
+    if header.is_empty() || header.len() != delimiters.len() {
+        return None;
+    }
+    let aligns: Vec<ColumnAlign> = delimiters
+        .iter()
+        .map(|cell| column_align(cell))
+        .collect::<Option<_>>()?;
+
+    let mut rows = Vec::new();
+    let mut used = 2;
+    for line in &lines[2..] {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || !trimmed.contains('|') || trimmed.starts_with("```") {
+            break;
+        }
+        let mut cells = table_cells(trimmed);
+        cells.truncate(header.len());
+        while cells.len() < header.len() {
+            cells.push(String::new());
+        }
+        rows.push(cells);
+        used += 1;
+    }
+
+    Some((
+        Table {
+            header,
+            aligns,
+            rows,
+        },
+        used,
+    ))
+}
+
+/// A table as HTML, with each column's alignment kept in the cells themselves so a reader that
+/// ignores the stylesheet still lines the numbers up.
+fn table_to_html(table: &Table, targets: &ExportTargets<'_>) -> String {
+    let mut out = String::from("<table>\n<thead><tr>");
+    for (cell, align) in table.header.iter().zip(&table.aligns) {
+        out.push_str(&format!(
+            "<th style=\"text-align:{}\">{}</th>",
+            align.css(),
+            inline_to_html(cell, targets)
+        ));
+    }
+    out.push_str("</tr></thead>\n<tbody>\n");
+    for row in &table.rows {
+        out.push_str("<tr>");
+        for (cell, align) in row.iter().zip(&table.aligns) {
+            out.push_str(&format!(
+                "<td style=\"text-align:{}\">{}</td>",
+                align.css(),
+                inline_to_html(cell, targets)
+            ));
+        }
+        out.push_str("</tr>\n");
+    }
+    out.push_str("</tbody>\n</table>\n");
+    out
+}
+
+/// Converts a note into a standalone HTML document, with pictures and wiki links left as the words
+/// they were written with: the page points at nothing it does not have beside it.
 pub fn markdown_to_html(title: &str, body: &str) -> String {
+    markdown_to_html_with(title, body, &ExportTargets::none())
+}
+
+/// Converts a note into a standalone HTML document. Handles headings, lists, task lists,
+/// blockquotes, pipe tables, fenced code, pictures and the inline syntax understood by
+/// `parse_inline_spans`. `targets` decides what the page's pictures load from and which notes its
+/// wiki links open.
+pub fn markdown_to_html_with(title: &str, body: &str, targets: &ExportTargets<'_>) -> String {
     let mut out = String::new();
     out.push_str("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>");
     out.push_str(&html_escape(title));
-    out.push_str("</title>\n<style>body{max-width:720px;margin:2rem auto;padding:0 1rem;font-family:system-ui,sans-serif;line-height:1.6;color:#222}mark{background:#ffe9a8}code{background:#f2f2f2;padding:0 .2em}pre{background:#f2f2f2;padding:.8rem;overflow:auto}blockquote{border-left:3px solid #ccc;margin:0;padding-left:1rem;color:#555}.tag{color:#2a6fdb}@media print{body{margin:0}}</style>\n</head>\n<body>\n<h1>");
+    out.push_str("</title>\n<style>body{max-width:720px;margin:2rem auto;padding:0 1rem;font-family:system-ui,sans-serif;line-height:1.6;color:#222}mark{background:#ffe9a8}code{background:#f2f2f2;padding:0 .2em}pre{background:#f2f2f2;padding:.8rem;overflow:auto}blockquote{border-left:3px solid #ccc;margin:0;padding-left:1rem;color:#555}table{border-collapse:collapse;margin:.8rem 0}th,td{border:1px solid #ddd;padding:.35rem .6rem;vertical-align:top}th{background:#f5f5f5;font-weight:600}.tag{color:#2a6fdb}a{color:#2a6fdb}img{max-width:100%;height:auto;border-radius:4px;margin:.3rem 0}@media print{body{margin:0}}</style>\n</head>\n<body>\n<h1>");
     out.push_str(&html_escape(title));
     out.push_str("</h1>\n");
 
+    let lines: Vec<&str> = body.lines().collect();
+    out.push_str(&body_to_html(&lines, targets));
+    out.push_str("</body>\n</html>\n");
+    out
+}
+
+fn flush_para(out: &mut String, para: &mut Vec<String>) {
+    if !para.is_empty() {
+        out.push_str(&format!("<p>{}</p>\n", para.join("<br>\n")));
+        para.clear();
+    }
+}
+
+/// Writes one list item, with whatever belongs under it — a table, a nested list, a paragraph —
+/// inside the same `<li>`, so the nesting survives into the exported page. Returns how many lines
+/// the item's own block used.
+fn push_list_item(
+    out: &mut String,
+    list_open: &mut bool,
+    tasks: bool,
+    item_html: &str,
+    body: Option<(Vec<&str>, usize)>,
+    targets: &ExportTargets<'_>,
+) -> usize {
+    if !*list_open {
+        out.push_str(if tasks {
+            "<ul class=\"tasks\">\n"
+        } else {
+            "<ul>\n"
+        });
+        *list_open = true;
+    }
+    let used = body.as_ref().map_or(0, |(_, used)| *used);
+    out.push_str("<li>");
+    out.push_str(item_html);
+    if let Some((inner, _)) = body {
+        out.push_str(&body_to_html(&inner, targets));
+    }
+    out.push_str("</li>\n");
+    used
+}
+
+/// Converts a note's blocks into HTML. A quote and the content under a list item are converted by
+/// this same function, so a table or a list nested inside either one keeps its own markup.
+fn body_to_html(lines: &[&str], targets: &ExportTargets<'_>) -> String {
+    let mut out = String::new();
     let mut para: Vec<String> = Vec::new();
     let mut list_open = false;
-    let mut quote_open = false;
     let mut in_code = false;
-
-    fn flush_para(out: &mut String, para: &mut Vec<String>) {
-        if !para.is_empty() {
-            out.push_str(&format!("<p>{}</p>\n", para.join("<br>\n")));
-            para.clear();
-        }
-    }
-
-    for line in body.lines() {
+    let mut index = 0usize;
+    while index < lines.len() {
+        let line = lines[index];
+        index += 1;
         let trimmed = line.trim();
         if in_code {
             if trimmed.starts_with("```") {
@@ -1732,10 +2082,6 @@ pub fn markdown_to_html(title: &str, body: &str) -> String {
                 out.push_str("</ul>\n");
                 list_open = false;
             }
-            if quote_open {
-                out.push_str("</blockquote>\n");
-                quote_open = false;
-            }
             out.push_str("<pre><code>");
             in_code = true;
             continue;
@@ -1746,17 +2092,24 @@ pub fn markdown_to_html(title: &str, body: &str) -> String {
                 out.push_str("</ul>\n");
                 list_open = false;
             }
-            if quote_open {
-                out.push_str("</blockquote>\n");
-                quote_open = false;
+            continue;
+        }
+
+        if let Some((table, used)) = parse_table(&lines[index - 1..]) {
+            flush_para(&mut out, &mut para);
+            if list_open {
+                out.push_str("</ul>\n");
+                list_open = false;
             }
+            out.push_str(&table_to_html(&table, targets));
+            index += used - 1;
             continue;
         }
 
         let hashes = trimmed.chars().take_while(|c| *c == '#').count();
         if (1..=6).contains(&hashes) && trimmed[hashes..].starts_with(' ') {
             flush_para(&mut out, &mut para);
-            let text = inline_to_html(trimmed[hashes..].trim());
+            let text = inline_to_html(trimmed[hashes..].trim(), targets);
             out.push_str(&format!("<h{hashes}>{text}</h{hashes}>\n"));
             continue;
         }
@@ -1767,16 +2120,14 @@ pub fn markdown_to_html(title: &str, body: &str) -> String {
             .or_else(|| trimmed.strip_prefix("- [X] "))
         {
             flush_para(&mut out, &mut para);
-            if !list_open {
-                out.push_str("<ul class=\"tasks\">\n");
-                list_open = true;
-            }
             let checked = trimmed.starts_with("- [x] ") || trimmed.starts_with("- [X] ");
             let box_attr = if checked { " checked" } else { "" };
-            out.push_str(&format!(
-                "<li><input type=\"checkbox\" disabled{box_attr}> {}</li>\n",
-                inline_to_html(item)
-            ));
+            let content = format!(
+                "<input type=\"checkbox\" disabled{box_attr}> {}",
+                inline_to_html(item, targets)
+            );
+            let body = list_item_body(&lines[index..], indent_width(line));
+            index += push_list_item(&mut out, &mut list_open, true, &content, body, targets);
             continue;
         }
 
@@ -1785,21 +2136,22 @@ pub fn markdown_to_html(title: &str, body: &str) -> String {
             .or_else(|| trimmed.strip_prefix("* "))
         {
             flush_para(&mut out, &mut para);
-            if !list_open {
-                out.push_str("<ul>\n");
-                list_open = true;
-            }
-            out.push_str(&format!("<li>{}</li>\n", inline_to_html(item)));
+            let body = list_item_body(&lines[index..], indent_width(line));
+            let content = inline_to_html(item, targets);
+            index += push_list_item(&mut out, &mut list_open, false, &content, body, targets);
             continue;
         }
 
-        if let Some(quote) = trimmed.strip_prefix("> ") {
+        if let Some((inner, used)) = quote_block(&lines[index - 1..]) {
             flush_para(&mut out, &mut para);
-            if !quote_open {
-                out.push_str("<blockquote>\n");
-                quote_open = true;
+            if list_open {
+                out.push_str("</ul>\n");
+                list_open = false;
             }
-            out.push_str(&format!("<p>{}</p>\n", inline_to_html(quote)));
+            out.push_str("<blockquote>\n");
+            out.push_str(&body_to_html(&inner, targets));
+            out.push_str("</blockquote>\n");
+            index += used - 1;
             continue;
         }
 
@@ -1807,7 +2159,7 @@ pub fn markdown_to_html(title: &str, body: &str) -> String {
             out.push_str("</ul>\n");
             list_open = false;
         }
-        para.push(inline_to_html(trimmed));
+        para.push(inline_to_html(trimmed, targets));
     }
 
     if in_code {
@@ -1817,10 +2169,6 @@ pub fn markdown_to_html(title: &str, body: &str) -> String {
     if list_open {
         out.push_str("</ul>\n");
     }
-    if quote_open {
-        out.push_str("</blockquote>\n");
-    }
-    out.push_str("</body>\n</html>\n");
     out
 }
 
@@ -1860,6 +2208,215 @@ mod tests {
         assert!(html.contains("<blockquote>"));
         assert!(html.contains("<pre><code>&lt;raw&gt;\n</code></pre>"));
         assert!(html.trim_end().ends_with("</html>"));
+    }
+
+    /// A pipe table reads its header, the alignment asked for under it and the rows below; the
+    /// border pipes are not cells, and an escaped pipe stays inside its cell.
+    #[test]
+    fn test_pipe_table_is_read_with_its_alignment_and_rows() {
+        let lines = [
+            "| Name | Count | Price |",
+            "| :--- | :---: | ---: |",
+            "| apples | 3 | 1.20 |",
+            "| pears | 12 | 0.90 |",
+            "",
+            "after",
+        ];
+        let (table, used) = parse_table(&lines).expect("a table");
+        assert_eq!(table.header, vec!["Name", "Count", "Price"]);
+        assert_eq!(
+            table.aligns,
+            vec![ColumnAlign::Left, ColumnAlign::Center, ColumnAlign::Right]
+        );
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.rows[1], vec!["pears", "12", "0.90"]);
+        assert_eq!(used, 4, "the header, the delimiter row and the two rows");
+
+        assert_eq!(table_cells("| a | b |"), vec!["a", "b"]);
+        assert_eq!(table_cells("a | b"), vec!["a", "b"]);
+        assert_eq!(table_cells("| a \\| b | c |"), vec!["a | b", "c"]);
+        assert_eq!(table_cells("|  | b |"), vec!["", "b"]);
+    }
+
+    /// A row with too few or too many cells still lines up under the header instead of shifting
+    /// the columns, and lines that are not a table are left to the rest of the renderer.
+    #[test]
+    fn test_table_rows_line_up_and_ordinary_lines_stay_out() {
+        let lines = [
+            "| a | b | c |",
+            "| --- | --- | --- |",
+            "| one |",
+            "| one | two | three | four |",
+        ];
+        let (table, used) = parse_table(&lines).expect("a table");
+        assert_eq!(used, 4);
+        assert_eq!(table.rows[0], vec!["one", "", ""]);
+        assert_eq!(table.rows[1], vec!["one", "two", "three"]);
+
+        // A title underlined with dashes, a mismatch in the delimiter row, a lone row, and a
+        // code fence are not tables.
+        assert!(parse_table(&["Title", "---", "text"]).is_none());
+        assert!(parse_table(&["| a | b |", "| --- |"]).is_none());
+        assert!(parse_table(&["| a | b |", "| --- | x |"]).is_none());
+        assert!(parse_table(&["| a | b |"]).is_none());
+        assert!(parse_table(&["```", "| --- | --- |"]).is_none());
+    }
+
+    /// The HTML export writes a real table, with the alignment on the cells themselves so the
+    /// columns still line up without the stylesheet.
+    #[test]
+    fn test_table_becomes_html_with_aligned_cells() {
+        let body = "Intro\n\n| Left | Middle | Right |\n| :--- | :---: | ---: |\n| **bold** | a | b |\n\nAfter";
+        let html = markdown_to_html("T", body);
+        assert!(html.contains("<table>"), "{html}");
+        assert!(html.contains("<thead><tr><th style=\"text-align:left\">Left</th>"));
+        assert!(html.contains("<th style=\"text-align:center\">Middle</th>"));
+        assert!(html.contains("<th style=\"text-align:right\">Right</th>"));
+        assert!(html.contains("<td style=\"text-align:left\"><strong>bold</strong></td>"));
+        assert!(html.contains("<p>Intro</p>"));
+        assert!(html.contains("<p>After</p>"));
+        assert!(
+            !html.contains("<p>| Left"),
+            "the pipes should not be left as a paragraph"
+        );
+
+        let heading = markdown_to_html("T", "Title\n---\ntext");
+        assert!(
+            !heading.contains("<table>"),
+            "a setext heading is not a table"
+        );
+    }
+
+    /// A quote is read as one block: the marker and its optional space come off every line in a
+    /// row, a bare marker is a blank line inside the quote, and a line without one ends it.
+    #[test]
+    fn test_a_quote_is_read_as_one_block() {
+        assert_eq!(quote_line("> quoted"), Some("quoted"));
+        assert_eq!(quote_line(">quoted"), Some("quoted"));
+        assert_eq!(quote_line("  >  indented"), Some(" indented"));
+        assert_eq!(quote_line("plain"), None);
+
+        let lines = ["> one", ">", "> two", "after"];
+        let (inner, used) = quote_block(&lines).expect("a quote");
+        assert_eq!(inner, vec!["one", "", "two"]);
+        assert_eq!(used, 3, "the line after the quote is not part of it");
+        assert!(quote_block(&["plain"]).is_none());
+    }
+
+    /// The lines under a list item belong to it: their indent comes off so the block can be read
+    /// on its own, blank lines in the middle stay, and a line back at the item's level ends it.
+    #[test]
+    fn test_a_list_item_owns_the_lines_under_it() {
+        let lines = [
+            "  | a | b |",
+            "  | --- | --- |",
+            "  | 1 | 2 |",
+            "",
+            "Back at the margin",
+        ];
+        let (body, used) = list_item_body(&lines, 0).expect("an indented block");
+        assert_eq!(body, vec!["| a | b |", "| --- | --- |", "| 1 | 2 |"]);
+        assert_eq!(used, 3, "the gap after the item is not part of it");
+
+        // A blank line in the middle carries on the same item.
+        let (body, used) = list_item_body(&["  one", "", "  two"], 0).expect("an indented block");
+        assert_eq!(body, vec!["one", "", "two"]);
+        assert_eq!(used, 3);
+
+        // Nothing indented leaves the item as just its own line.
+        assert!(list_item_body(&["same level"], 0).is_none());
+        assert!(list_item_body(&[], 0).is_none());
+
+        // Under an already-nested item, that item's own indent is the measure.
+        let (body, _) = list_item_body(&["    deeper", "    still"], 2).expect("nested content");
+        assert_eq!(body, vec!["deeper", "still"]);
+    }
+
+    /// A table written inside a quote keeps its markers off the page: the export puts the table
+    /// itself inside the blockquote, header row and alignment intact.
+    #[test]
+    fn test_a_table_inside_a_quote_is_exported_as_a_table() {
+        let body = "> | Name | Count |\n> | :--- | ---: |\n> | apples | 3 |\n\nAfter";
+        let html = markdown_to_html("T", body);
+        assert!(html.contains("<blockquote>\n<table>"), "{html}");
+        assert!(
+            html.contains("<th style=\"text-align:left\">Name</th>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<td style=\"text-align:right\">3</td>"),
+            "{html}"
+        );
+        assert!(html.contains("</table>\n</blockquote>"), "{html}");
+        assert!(
+            !html.contains("&gt; |"),
+            "the markers should not reach the page: {html}"
+        );
+        assert!(html.contains("<p>After</p>"), "{html}");
+    }
+
+    /// The exported page carries the note's pictures and opens its wiki links: a target that has a
+    /// page beside the export becomes an anchor, and anything the page cannot reach keeps the
+    /// words it was written with instead of turning into a broken link or picture.
+    #[test]
+    fn test_export_writes_pictures_and_wiki_link_anchors() {
+        let link = |target: &str| match target {
+            "Other Note" => Some("other.html".to_string()),
+            _ => None,
+        };
+        let picture = |src: &str| match src {
+            "cat.png" => Some("pictures/1-cat.png".to_string()),
+            _ => None,
+        };
+        let targets = ExportTargets {
+            link: &link,
+            picture: &picture,
+        };
+        let body = "See [[Other Note|the other one]] and [[Nobody]], with ![a cat](cat.png){width=320}.\n\n> ![quoted](cat.png)\n\n| Pic |\n| --- |\n| ![a cell](cat.png) |\n\n![missing](gone.png)";
+        let html = markdown_to_html_with("T", body, &targets);
+
+        assert!(
+            html.contains("<a href=\"other.html\">the other one</a>"),
+            "a link with a page opens it, keeping its own words: {html}"
+        );
+        assert!(
+            html.contains("Nobody") && !html.contains("other.html\">Nobody"),
+            "a link with no page stays words: {html}"
+        );
+        assert!(
+            html.contains("<img src=\"pictures/1-cat.png\" alt=\"a cat\" width=\"320\">"),
+            "a picture is written with the width the note gave it: {html}"
+        );
+        // Inside a quote and inside a table cell as well.
+        assert!(html.contains("alt=\"quoted\""), "{html}");
+        assert!(html.contains("alt=\"a cell\""), "{html}");
+        assert!(
+            html.contains("![missing](gone.png)"),
+            "a picture with nothing to load keeps its marker: {html}"
+        );
+
+        // A page exported with nothing to point at keeps every marker as words.
+        let plain = markdown_to_html("T", "![a cat](cat.png) and [[Other Note]]");
+        assert!(plain.contains("![a cat](cat.png)"), "{plain}");
+        assert!(
+            !plain.contains("<img") && !plain.contains("<a "),
+            "a bare export points at nothing: {plain}"
+        );
+    }
+
+    /// A table under a list item is part of that item: the export nests it inside the `<li>`, and
+    /// the item after it is still a list item of its own.
+    #[test]
+    fn test_a_table_under_a_list_item_is_exported_inside_the_item() {
+        let body = "- Point\n  | A | B |\n  | --- | --- |\n  | x | y |\n- Next";
+        let html = markdown_to_html("T", body);
+        assert!(html.contains("<li>Point<table>"), "{html}");
+        assert!(html.contains("</table>\n</li>"), "{html}");
+        assert!(html.contains("<li>Next</li>"), "{html}");
+        assert!(
+            !html.contains("| A |"),
+            "the pipes should not reach the page: {html}"
+        );
     }
 
     #[test]

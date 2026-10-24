@@ -25,6 +25,29 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.9.25" date="2026-10-24">
+      <description>
+        <p>
+          Pipe tables are now drawn as tables everywhere they are written, with each column lined
+          up the way its delimiter row asks for: bold, code, highlights, wiki links and pictures
+          work inside the cells, and a table written inside a quote or indented under a list item
+          is drawn inside that quote or item. A picture on a quoted line belongs to the quote, and
+          a picture in a table cell is fitted to its column and can be dragged to resize.
+        </p>
+        <p>
+          Notes can be exported to standalone HTML pages from the command palette. Each page
+          carries its pictures, copied into a pictures folder beside it, and its wiki links become
+          links to the pages the export wrote. Exporting one note also writes the notes linked to
+          it either way, so its links open real pages. Before anything is written a dialog says
+          how many pages and pictures the export is and where it would go, so a note that pulls in
+          half the vault can be called off; the folder it goes into can be picked there and is
+          remembered.
+        </p>
+        <p>
+          Clicking a note's name in the sidebar now opens it instead of selecting the words.
+        </p>
+      </description>
+    </release>
     <release version="0.9.24" date="2026-10-23">
       <description>
         <p>

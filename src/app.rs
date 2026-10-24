@@ -1,11 +1,12 @@
 use crate::collab::{Collab, ConnectionState, Incoming, ServerProfile};
 use crate::icon_names::TABLER_ICON_NAMES;
 use crate::icons::{icon, install_tabler_icons, tabler_glyph};
-use crate::images::NoteImages;
+use crate::images::{resolve, ImageRef, NoteImages};
 use crate::markdown::{
     apply_highlight_selection, build_editor_layout_job, clear_formatting_selection,
-    color_swatch_button, insert_at_selection, markdown_to_html, render_inline_spans_ui, rgb_to_hex,
-    set_image_width, split_images, wrap_selection, LinePiece, HIGHLIGHT_PRESETS,
+    color_swatch_button, insert_at_selection, list_item_body, markdown_to_html_with, parse_table,
+    quote_block, render_inline_spans_ui, rgb_to_hex, set_image_width, split_images, wrap_selection,
+    ColumnAlign, ExportTargets, LinePiece, Table, HIGHLIGHT_PRESETS,
 };
 use crate::net::{NoteMeta, PresenceUser};
 use crate::people::MIN_IDENTIFIER;
@@ -22,7 +23,7 @@ use egui::{
     Rect, RichText, ScrollArea, Sense, Stroke, TextEdit, TextStyle, Ui, UiBuilder, Vec2,
 };
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::f32::consts::TAU;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -191,6 +192,15 @@ pub struct EloraApp {
     pending_server_move: Option<PendingMove>,
     confirm_delete_id: Option<String>,
     command_palette_open: bool,
+    /// Where the last export went, so the next one starts there. `None` until somebody picks a
+    /// folder: exports go to the downloads folder until then.
+    export_dir: Option<PathBuf>,
+    /// A "choose a folder" dialog running on a thread of its own, so the window keeps drawing
+    /// while somebody browses.
+    export_folder_pick: Option<Receiver<Option<PathBuf>>>,
+    /// An export that has been worked out and is waiting for a yes. Nothing is written until the
+    /// size has been shown and confirmed.
+    export_offer: Option<ExportPlan>,
     /// The "who can see this note" panel, and the note it was opened for.
     share_picker_open: bool,
     share_picker_note_id: Option<String>,
@@ -435,6 +445,9 @@ impl EloraApp {
             broken_links_open: false,
             broken_links: Vec::new(),
             show_card_previews: settings.show_card_previews,
+            export_offer: None,
+            export_dir: settings.export_dir.as_ref().map(PathBuf::from),
+            export_folder_pick: None,
             highlight_rgb: settings.highlight_rgb,
             colors: settings.colors,
             font_size: settings.font_size,
@@ -511,6 +524,10 @@ impl EloraApp {
             roomy_cards: self.roomy_cards,
             sort: self.sort,
             window: self.window_state,
+            export_dir: self
+                .export_dir
+                .as_ref()
+                .map(|dir| dir.display().to_string()),
             show_card_previews: self.show_card_previews,
             highlight_rgb: self.highlight_rgb,
             text_color_rgb: self.text_color_rgb,
@@ -2651,46 +2668,86 @@ impl EloraApp {
         }
     }
 
+    /// Works out what an export would write and keeps it for the confirmation: the size is shown
+    /// before anything touches the disk.
     fn export_html(&mut self, whole_vault: bool) {
+        match self.plan_export(whole_vault) {
+            Some(plan) => self.export_offer = Some(plan),
+            None => self.status_message = Some("Select a note to export".to_string()),
+        }
+    }
+
+    /// The pages an export would write, the pictures that go beside them and where they land.
+    /// Nothing is read from or written to the export folder here, so this is safe to call for a
+    /// count.
+    fn plan_export(&self, whole_vault: bool) -> Option<ExportPlan> {
         let notes: Vec<&Note> = if whole_vault {
             self.notes.iter().filter(|n| !n.trashed).collect()
         } else {
-            match self
+            let start = self
                 .selected_id
                 .as_ref()
-                .and_then(|id| self.notes.iter().find(|n| &n.id == id))
-            {
-                Some(note) => vec![note],
-                None => {
-                    self.status_message = Some("Select a note to export".to_string());
-                    return;
+                .and_then(|id| self.notes.iter().find(|n| &n.id == id))?;
+            // The note and the notes linked to it either way, so no page it writes links to a
+            // page that was not written.
+            notes_linked_around(&self.notes, start)
+        };
+
+        // A folder somebody picked is used as it is: they chose where the pages go. Until then a
+        // single note goes to the downloads folder, and a whole vault gets a folder of its own
+        // inside it so it does not mix with everything else.
+        let dir = match self.export_dir.clone() {
+            Some(dir) => dir,
+            None => {
+                let base =
+                    dirs::download_dir().unwrap_or_else(|| self.storage.root_dir().to_path_buf());
+                if whole_vault {
+                    base.join("EloraNotes Export")
+                } else {
+                    base
                 }
             }
         };
 
-        let base = dirs::download_dir().unwrap_or_else(|| self.storage.root_dir().to_path_buf());
-        let dir = if whole_vault {
-            base.join("EloraNotes Export")
-        } else {
-            base
-        };
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            self.status_message = Some(format!("Export failed: {e}"));
-            return;
-        }
-
-        // File names use the note id so two notes with the same title never overwrite each other.
-        let mut written = 0;
+        let mut pictures = Vec::new();
+        let mut copies = Vec::new();
+        let mut number = 0usize;
+        let mut pages = Vec::new();
         for note in &notes {
-            let html = markdown_to_html(&note.display_title(), &note.body);
-            let path = dir.join(format!("{}.html", note.id));
-            if let Err(e) = std::fs::write(&path, html) {
-                self.status_message = Some(format!("Export failed: {e}"));
-                return;
+            // The same folder the preview resolves a note's pictures from: a shared note has no
+            // file of its own here, so the library folder is the closest thing it has.
+            let note_dir = if self.is_remote(&note.id) {
+                Some(self.storage.root_dir().to_path_buf())
+            } else {
+                note.file_path.parent().map(Path::to_path_buf)
+            };
+            let plan = plan_pictures(&note.id, &note.body, note_dir.as_deref(), &mut number);
+            copies.extend(plan.copies);
+            pictures.push(plan.mapped);
+
+            // A wiki link matches either title a note can have, the same rule clicking one uses.
+            let heading = note.display_title();
+            let mut titles = vec![note.title.clone()];
+            if !titles
+                .iter()
+                .any(|title| title.eq_ignore_ascii_case(&heading))
+            {
+                titles.push(heading.clone());
             }
-            written += 1;
+            pages.push(ExportPage {
+                id: note.id.clone(),
+                heading,
+                titles,
+                body: note.body.clone(),
+            });
         }
-        self.status_message = Some(format!("Exported {written} note(s) to {}", dir.display()));
+        Some(ExportPlan {
+            dir,
+            whole_vault,
+            pages,
+            pictures,
+            copies,
+        })
     }
 
     fn create_note_from_template(&mut self, template: NoteTemplate) {
@@ -2772,11 +2829,7 @@ impl EloraApp {
         if target_trimmed.is_empty() {
             return;
         }
-        if let Some(existing) = self.notes.iter().find(|n| {
-            !n.trashed
-                && (n.title.eq_ignore_ascii_case(target_trimmed)
-                    || n.display_title().eq_ignore_ascii_case(target_trimmed))
-        }) {
+        if let Some(existing) = note_for_link(&self.notes, target_trimmed) {
             self.selected_id = Some(existing.id.clone());
             self.status_message = Some(format!("Opened [[{target_trimmed}]]"));
             return;
@@ -4948,6 +5001,158 @@ impl EloraApp {
         }
     }
 
+    /// The export that was worked out, waiting for a yes: how many pages and pictures it writes, and
+    /// where. Nothing is written until **Export** is pressed, so a single note that turns out to
+    /// pull in a hundred through its links can be called off first.
+    fn render_export_offer(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some(mut plan) = self.export_offer.take() else {
+            return;
+        };
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            // A folder answer that arrives after this is not for anything.
+            self.export_folder_pick = None;
+            return;
+        }
+
+        // The folder dialog answers between frames, on its own thread.
+        let answer = self.export_folder_pick.as_ref().map(|pick| pick.try_recv());
+        match answer {
+            Some(Ok(Some(dir))) => {
+                self.export_folder_pick = None;
+                self.export_dir = Some(dir.clone());
+                // Remembered, so the next export starts where this one went.
+                self.persist_settings();
+                plan.dir = dir;
+            }
+            Some(Ok(None)) | Some(Err(TryRecvError::Disconnected)) => {
+                self.export_folder_pick = None;
+            }
+            _ => {}
+        }
+        let picking = self.export_folder_pick.is_some();
+        let mut pick_folder = false;
+
+        let pages = plan.pages.len();
+        let pictures = plan.copies.len();
+        let question = if pictures == 0 {
+            format!(
+                "Write {pages} {}?",
+                if pages == 1 { "page" } else { "pages" }
+            )
+        } else {
+            format!(
+                "Write {pages} {} and {pictures} {}?",
+                if pages == 1 { "page" } else { "pages" },
+                if pictures == 1 { "picture" } else { "pictures" },
+            )
+        };
+        let scope = if plan.whole_vault {
+            "Every note in the vault.".to_string()
+        } else if pages == 1 {
+            "The note on its own: it links to nothing, and nothing links to it.".to_string()
+        } else {
+            format!(
+                "The note and the {} linked to it, either way.",
+                if pages == 2 {
+                    "one note".to_string()
+                } else {
+                    format!("{} notes", pages - 1)
+                }
+            )
+        };
+
+        let mut open = true;
+        let mut confirmed = false;
+        let mut cancelled = false;
+        egui::Window::new("Export to HTML")
+            .id(Id::new("elora_export_offer"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 68.0))
+            .frame(
+                Frame::new()
+                    .fill(p.bg_sidebar)
+                    .stroke(Stroke::new(1.5_f32, p.accent))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::symmetric(14, 12)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.label(
+                    RichText::new(question)
+                        .size(13.5)
+                        .strong()
+                        .color(p.fg_primary),
+                );
+                ui.label(RichText::new(scope).size(11.0).color(p.fg_muted));
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(format!("Into {}", plan.dir.display()))
+                            .size(10.5)
+                            .color(p.fg_secondary),
+                    );
+                    if ui
+                        .add_enabled(
+                            !picking,
+                            egui::Button::new(RichText::new("Choose…").size(10.5)).frame(false),
+                        )
+                        .on_hover_text("Pick the folder the pages and pictures go into")
+                        .clicked()
+                    {
+                        pick_folder = true;
+                    }
+                });
+                if pictures > 0 {
+                    ui.label(
+                        RichText::new(
+                            "Pictures are copied into a pictures folder beside the pages.",
+                        )
+                        .size(10.0)
+                        .color(p.fg_muted),
+                    );
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let export = ui.add(
+                        egui::Button::new(
+                            RichText::new(format!("{}  Export", icon::DOWNLOAD))
+                                .color(p.bg_canvas)
+                                .strong()
+                                .size(12.5),
+                        )
+                        .fill(p.accent)
+                        .corner_radius(CornerRadius::same(6)),
+                    );
+                    if export.clicked() {
+                        confirmed = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancelled = true;
+                    }
+                });
+            });
+
+        if pick_folder {
+            self.export_folder_pick = Some(choose_folder(ctx, &plan.dir));
+        }
+
+        if confirmed {
+            // A folder answer that arrives after this is not for anything.
+            self.export_folder_pick = None;
+            self.status_message = Some(match write_export(&plan) {
+                Ok(summary) => summary,
+                Err(e) => format!("Export failed: {e}"),
+            });
+        } else if open && !cancelled {
+            // Still waiting for an answer: keep the offer for the next frame.
+            self.export_offer = Some(plan);
+        } else {
+            self.export_folder_pick = None;
+        }
+    }
+
     /// Floating, searchable Tabler icon picker for the selected note.
     /// Returns `Some(Some(name))` to set an icon, `Some(None)` to remove it.
     fn render_icon_picker(
@@ -6162,6 +6367,7 @@ impl eframe::App for EloraApp {
 
         self.render_command_palette(ctx, &p);
         self.render_share_picker(ctx, &p);
+        self.render_export_offer(ctx, &p);
         self.update_window(ctx, &p);
         self.status_toast(ctx, &p);
     }
@@ -6322,6 +6528,230 @@ fn picture_references(body: &str) -> BTreeSet<String> {
         }
     }
     names
+}
+
+/// The note a `[[link]]` opens, by the rule a click uses: the title the note was written with or
+/// the title it shows, either case, and never a note in the trash.
+fn note_for_link<'a>(notes: &'a [Note], target: &str) -> Option<&'a Note> {
+    let wanted = target.trim();
+    if wanted.is_empty() {
+        return None;
+    }
+    notes.iter().find(|note| {
+        !note.trashed
+            && (note.title.eq_ignore_ascii_case(wanted)
+                || note.display_title().eq_ignore_ascii_case(wanted))
+    })
+}
+
+/// The note to export and the notes linked to it either way: the ones its `[[links]]` reach, the
+/// ones that link to it, and so on until nothing new turns up. Exporting that set is what keeps a
+/// page's links from pointing at a page the export never wrote. The note comes first, then the
+/// notes it links to, then the ones linked to it, each in the order they were found.
+fn notes_linked_around<'a>(notes: &'a [Note], start: &'a Note) -> Vec<&'a Note> {
+    // Each note's links, resolved once: following them in both directions is then a lookup. A note
+    // in the trash links to nothing and is linked to by nothing, the way it is everywhere else.
+    let links: Vec<Vec<usize>> = notes
+        .iter()
+        .map(|note| {
+            if note.trashed {
+                return Vec::new();
+            }
+            extract_wiki_links(&note.body)
+                .iter()
+                .filter_map(|target| {
+                    let found = note_for_link(notes, target)?;
+                    notes.iter().position(|note| note.id == found.id)
+                })
+                .collect()
+        })
+        .collect();
+    let Some(start) = notes.iter().position(|note| note.id == start.id) else {
+        return vec![start];
+    };
+
+    let mut picked = vec![start];
+    let mut next = 0;
+    while next < picked.len() {
+        let current = picked[next];
+        // The notes this one links to...
+        for &target in &links[current] {
+            if !picked.contains(&target) {
+                picked.push(target);
+            }
+        }
+        // ...and the notes that link to it.
+        for (from, targets) in links.iter().enumerate() {
+            if !picked.contains(&from) && targets.contains(&current) {
+                picked.push(from);
+            }
+        }
+        next += 1;
+    }
+    picked.into_iter().map(|index| &notes[index]).collect()
+}
+
+/// One page an export will write: the note it comes from, what its heading says and every title a
+/// `[[link]]` can use to reach it.
+struct ExportPage {
+    id: String,
+    heading: String,
+    titles: Vec<String>,
+    body: String,
+}
+
+/// An export worked out but not yet written: the pages, the picture files that go beside them and
+/// where they all land. Kept so the size can be shown before anything touches the disk.
+struct ExportPlan {
+    dir: PathBuf,
+    whole_vault: bool,
+    pages: Vec<ExportPage>,
+    /// What each page's picture addresses become, indexed like `pages`.
+    pictures: Vec<HashMap<String, String>>,
+    /// Each picture file to copy and the name it goes under beside the pages.
+    copies: Vec<(PathBuf, String)>,
+}
+
+/// What one exported page will do with the pictures it names.
+#[derive(Default)]
+struct PicturePlan {
+    /// Files to copy beside the page, each with the name it goes under.
+    copies: Vec<(PathBuf, String)>,
+    /// What each picture address in the note becomes on the page.
+    mapped: HashMap<String, String>,
+}
+
+/// Works out what one exported page will do with its pictures, without writing anything. A picture
+/// on this computer is copied beside the page; one on the web is pointed at where it already lives;
+/// one that is not on this computer is left out, so the page keeps the words the note was written
+/// with instead of a broken picture.
+fn plan_pictures(
+    note_id: &str,
+    body: &str,
+    note_dir: Option<&Path>,
+    number: &mut usize,
+) -> PicturePlan {
+    let mut plan = PicturePlan::default();
+    for line in body.lines() {
+        for piece in split_images(line) {
+            let LinePiece::Image { src, .. } = piece else {
+                continue;
+            };
+            if plan.mapped.contains_key(&src) {
+                continue;
+            }
+            match resolve(&src, note_dir) {
+                Some(ImageRef::Remote(url)) => {
+                    plan.mapped.insert(src, url);
+                }
+                Some(ImageRef::File(path)) if path.is_file() => {
+                    let Some(name) = path.file_name() else {
+                        continue;
+                    };
+                    let name = export_picture_name(&name.to_string_lossy());
+                    // The note id keeps one export's pictures apart from another's, and the
+                    // counter apart from each other's inside a single note.
+                    let href = format!("pictures/{note_id}-{number}-{name}");
+                    *number += 1;
+                    plan.copies.push((path, href.clone()));
+                    plan.mapped.insert(src, href);
+                }
+                _ => {}
+            }
+        }
+    }
+    plan
+}
+
+/// Writes an export plan: the pictures first, then the pages that point at them. Returns what to
+/// tell the user, or what went wrong.
+fn write_export(plan: &ExportPlan) -> Result<String, String> {
+    std::fs::create_dir_all(&plan.dir)
+        .map_err(|e| format!("could not create {}: {e}", plan.dir.display()))?;
+    for (from, href) in &plan.copies {
+        let target = plan.dir.join(href);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
+        }
+        std::fs::copy(from, &target).map_err(|e| {
+            format!(
+                "could not copy {} to {}: {e}",
+                from.display(),
+                target.display()
+            )
+        })?;
+    }
+
+    // A wiki link can only open a page that was written in this export, so the pages are the ones
+    // in the plan — a single-note export already followed its links to pick those.
+    let link = |target: &str| {
+        let wanted = target.trim();
+        plan.pages
+            .iter()
+            .find(|page| {
+                page.titles
+                    .iter()
+                    .any(|title| title.eq_ignore_ascii_case(wanted))
+            })
+            .map(|page| format!("{}.html", page.id))
+    };
+
+    for (page, pictures) in plan.pages.iter().zip(&plan.pictures) {
+        let picture = |src: &str| pictures.get(src).cloned();
+        let html = markdown_to_html_with(
+            &page.heading,
+            &page.body,
+            &ExportTargets {
+                link: &link,
+                picture: &picture,
+            },
+        );
+        let path = plan.dir.join(format!("{}.html", page.id));
+        std::fs::write(&path, html)
+            .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    }
+
+    let written = plan.pages.len();
+    let summary = if plan.whole_vault {
+        format!(
+            "Exported {written} {}",
+            if written == 1 { "note" } else { "notes" }
+        )
+    } else if written == 1 {
+        "Exported the note".to_string()
+    } else {
+        let linked = written - 1;
+        format!(
+            "Exported the note, plus {linked} linked {}",
+            if linked == 1 { "note" } else { "notes" }
+        )
+    };
+    let pictures = match plan.copies.len() {
+        0 => String::new(),
+        1 => " and 1 picture".to_string(),
+        pictures => format!(" and {pictures} pictures"),
+    };
+    Ok(format!("{summary}{pictures} to {}", plan.dir.display()))
+}
+
+/// A picture's file name as it can stand in a link and a folder: letters, digits, dashes, dots and
+/// underscores stay, everything else becomes a dash.
+fn export_picture_name(name: &str) -> String {
+    let mut safe: String = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if safe.trim_matches(|ch| ch == '-' || ch == '.').is_empty() {
+        safe = "picture".to_string();
+    }
+    safe
 }
 
 fn is_picture_extension(extension: &str) -> bool {
@@ -6808,6 +7238,24 @@ fn choose_picture_file(ctx: &egui::Context) -> Receiver<Option<PathBuf>> {
     receiver
 }
 
+/// Opens the system's "choose a folder" dialog on a thread of its own, the way the picture chooser
+/// does, so the window keeps drawing while somebody browses.
+fn choose_folder(ctx: &egui::Context, start: &Path) -> Receiver<Option<PathBuf>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let wake = ctx.clone();
+    let start = start.to_path_buf();
+    std::thread::spawn(move || {
+        let mut dialog = rfd::FileDialog::new().set_title("Where should the export go?");
+        if start.is_dir() {
+            dialog = dialog.set_directory(start);
+        }
+        let chosen = dialog.pick_folder();
+        let _ = sender.send(chosen);
+        wake.request_repaint();
+    });
+    receiver
+}
+
 /// Runs `add` shifted right by `indent`, so a nested group reads as inside its parent.
 fn indented<R>(ui: &mut Ui, indent: i8, add: impl FnOnce(&mut Ui) -> R) -> R {
     if indent <= 0 {
@@ -6914,6 +7362,9 @@ fn render_note_card(
             // so the card fills the list exactly instead of leaving a strip on its right.
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 2.0;
+            // The whole card is a button: a press on the name has to open the note, not start
+            // selecting the words.
+            ui.style_mut().interaction.selectable_labels = false;
             ui.horizontal(|ui| {
                 // A note's own icon wins; pinned notes fall back to a pin, then a file glyph.
                 let (glyph, color) = note
@@ -7056,6 +7507,8 @@ fn render_compact_note_row(
             .layout(Layout::left_to_right(Align::Center)),
     );
     row.spacing_mut().item_spacing = Vec2::new(6.0, 0.0);
+    // The row is a button: a press on the name has to open the note, not start selecting it.
+    row.style_mut().interaction.selectable_labels = false;
     row.label(RichText::new(glyph).size(12.0).color(color));
     // The title is elided into the room the brushes do not need, so a long name never pushes
     // them out of the row.
@@ -7742,22 +8195,72 @@ fn render_markdown_preview(
     images: &mut NoteImages,
     actions: &mut PreviewActions,
 ) {
+    let lines: Vec<&str> = markdown.lines().collect();
+    let mut counters = PreviewCounters::default();
+    render_preview_lines(
+        ui,
+        &lines,
+        PreviewLook {
+            p,
+            note_dir,
+            muted: false,
+        },
+        images,
+        actions,
+        &mut counters,
+    );
+}
+
+/// The picture and task numbers of a note, carried from one block to the next, so a table inside a
+/// quote does not restart the numbering of the pictures around it.
+#[derive(Default)]
+struct PreviewCounters {
+    images: usize,
+    tasks: usize,
+    /// One per nested block drawn, so each gets an id of its own.
+    blocks: usize,
+}
+
+/// How a run of lines is being drawn: the colours of the note, where its pictures live, and
+/// whether this is the dimmer text inside a quote.
+#[derive(Clone, Copy)]
+struct PreviewLook<'a> {
+    p: &'a Palette,
+    note_dir: Option<&'a Path>,
+    muted: bool,
+}
+
+/// Draws a run of lines. A quote's contents and the block under a list item are drawn by this same
+/// function one level in, so a table, a list or another quote nested in either one is read the way
+/// it would be at the top of the note.
+fn render_preview_lines(
+    ui: &mut Ui,
+    lines: &[&str],
+    look: PreviewLook<'_>,
+    images: &mut NoteImages,
+    actions: &mut PreviewActions,
+    counters: &mut PreviewCounters,
+) {
+    let p = look.p;
+    let body_color = if look.muted {
+        p.fg_secondary
+    } else {
+        p.fg_primary
+    };
     let mut in_code_block = false;
     let mut code_buffer = String::new();
-    let mut task_counter = 0usize;
-    // Pictures are counted across the whole note, so a width the user drags is written back to
-    // the picture they dragged and not to one that merely looks like it (a code block also
-    // counts, because the note's own text is scanned the same way).
-    let mut image_count = 0usize;
+    let mut index = 0usize;
 
-    for line in markdown.lines() {
+    while index < lines.len() {
+        let line = lines[index];
+        index += 1;
         let trimmed = line.trim_end();
         let pictures_here = split_images(line)
             .iter()
             .filter(|piece| matches!(piece, LinePiece::Image { .. }))
             .count();
         if trimmed.trim_start().starts_with("```") {
-            image_count += pictures_here;
+            counters.images += pictures_here;
             if in_code_block {
                 Frame::new()
                     .fill(p.bg_elevated)
@@ -7785,12 +8288,46 @@ fn render_markdown_preview(
         if in_code_block {
             code_buffer.push_str(line);
             code_buffer.push('\n');
-            image_count += pictures_here;
+            counters.images += pictures_here;
             continue;
         }
 
         if trimmed.is_empty() {
             ui.add_space(6.0);
+            continue;
+        }
+
+        // A header row followed by a delimiter row is a table: it takes the lines it owns, and the
+        // pictures inside its cells are drawn there and counted as they are drawn.
+        if let Some((table, used)) = parse_table(&lines[index - 1..]) {
+            index += used - 1;
+            render_table(ui, &table, look, images, actions, counters);
+            continue;
+        }
+
+        // A quote is a block of its own: its lines are read again with the markers off, so a
+        // table, a list or a picture written inside it is drawn inside the quote.
+        if let Some((quote, used)) = quote_block(&lines[index - 1..]) {
+            Frame::new()
+                .fill(p.bg_sidebar)
+                .stroke(Stroke::new(1.5_f32, p.accent))
+                .corner_radius(CornerRadius::same(4))
+                .inner_margin(Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    render_preview_lines(
+                        ui,
+                        &quote,
+                        PreviewLook {
+                            p,
+                            note_dir: look.note_dir,
+                            muted: true,
+                        },
+                        images,
+                        actions,
+                        counters,
+                    );
+                });
+            index += used - 1;
             continue;
         }
 
@@ -7812,16 +8349,16 @@ fn render_markdown_preview(
                                 text.trim(),
                                 14.5,
                                 p,
-                                p.fg_primary,
+                                body_color,
                                 &mut actions.wiki_link,
                                 false,
                             );
                         });
                     }
                     LinePiece::Image { alt, src, width } => {
-                        let index = image_count;
-                        image_count += 1;
-                        if let Some(kept) = images.show(ui, &src, &alt, width, note_dir, p) {
+                        let index = counters.images;
+                        counters.images += 1;
+                        if let Some(kept) = images.show(ui, &src, &alt, width, look.note_dir, p) {
                             actions.image = Some((index, kept));
                         }
                         ui.add_space(4.0);
@@ -7861,31 +8398,12 @@ fn render_markdown_preview(
                     true,
                 );
             });
-        } else if let Some(quote) = trimmed_start.strip_prefix("> ") {
-            Frame::new()
-                .fill(p.bg_sidebar)
-                .stroke(Stroke::new(1.5_f32, p.accent))
-                .corner_radius(CornerRadius::same(4))
-                .inner_margin(Margin::symmetric(10, 6))
-                .show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        render_inline_spans_ui(
-                            ui,
-                            quote,
-                            14.5,
-                            p,
-                            p.fg_secondary,
-                            &mut actions.wiki_link,
-                            false,
-                        );
-                    });
-                });
         } else if let Some(done) = trimmed_start
             .strip_prefix("- [x] ")
             .or_else(|| trimmed_start.strip_prefix("- [X] "))
         {
-            let this_idx = task_counter;
-            task_counter += 1;
+            let this_idx = counters.tasks;
+            counters.tasks += 1;
             ui.horizontal_wrapped(|ui| {
                 if ui
                     .add(
@@ -7907,9 +8425,11 @@ fn render_markdown_preview(
                         .size(14.5),
                 );
             });
+            index +=
+                render_list_item_body(ui, &lines[index..], line, look, images, actions, counters);
         } else if let Some(todo) = trimmed_start.strip_prefix("- [ ] ") {
-            let this_idx = task_counter;
-            task_counter += 1;
+            let this_idx = counters.tasks;
+            counters.tasks += 1;
             ui.horizontal_wrapped(|ui| {
                 if ui
                     .add(
@@ -7929,11 +8449,13 @@ fn render_markdown_preview(
                     todo,
                     14.5,
                     p,
-                    p.fg_primary,
+                    body_color,
                     &mut actions.wiki_link,
                     false,
                 );
             });
+            index +=
+                render_list_item_body(ui, &lines[index..], line, look, images, actions, counters);
         } else if let Some(bullet) = trimmed_start
             .strip_prefix("- ")
             .or_else(|| trimmed_start.strip_prefix("* "))
@@ -7946,11 +8468,13 @@ fn render_markdown_preview(
                     bullet,
                     14.5,
                     p,
-                    p.fg_primary,
+                    body_color,
                     &mut actions.wiki_link,
                     false,
                 );
             });
+            index +=
+                render_list_item_body(ui, &lines[index..], line, look, images, actions, counters);
         } else {
             ui.horizontal_wrapped(|ui| {
                 render_inline_spans_ui(
@@ -7958,13 +8482,225 @@ fn render_markdown_preview(
                     trimmed_start,
                     14.5,
                     p,
-                    p.fg_primary,
+                    body_color,
                     &mut actions.wiki_link,
                     false,
                 );
             });
         }
     }
+}
+
+/// Draws what belongs to a list item under its text — a table, a nested list, another paragraph —
+/// a step in from the marker, so it reads as part of the item. Returns how many lines it used.
+fn render_list_item_body(
+    ui: &mut Ui,
+    lines: &[&str],
+    marker_line: &str,
+    look: PreviewLook<'_>,
+    images: &mut NoteImages,
+    actions: &mut PreviewActions,
+    counters: &mut PreviewCounters,
+) -> usize {
+    let marker_indent = marker_line.len() - marker_line.trim_start().len();
+    let Some((body, used)) = list_item_body(lines, marker_indent) else {
+        return 0;
+    };
+    let block = counters.blocks;
+    counters.blocks += 1;
+    ui.indent(Id::new(("preview_list_item", block)), |ui| {
+        render_preview_lines(ui, &body, look, images, actions, counters);
+    });
+    used
+}
+
+/// Room kept at either side of a cell's words, and between two columns.
+const TABLE_CELL_PAD: f32 = 10.0;
+const TABLE_GAP: f32 = 16.0;
+/// Room a picture in a cell is given when the note did not set a width for it, so the column starts
+/// out big enough to show it; the table's own squeeze still keeps it inside the pane.
+const TABLE_PICTURE_WIDTH: f32 = 160.0;
+
+/// The shape of the row being drawn: how wide each column is, where each one lines up, and whether
+/// this is the header.
+struct TableRow<'a> {
+    widths: &'a [f32],
+    aligns: &'a [ColumnAlign],
+    header: bool,
+}
+
+/// Draws a pipe table: the header in bold with a hairline under it, and every cell in a column of
+/// its own width, lined up the way the delimiter row asked for. Cells keep the inline formatting,
+/// wiki links, tags and pictures a note has everywhere else, so a link in a cell opens like any
+/// other and a picture in a cell is drawn in it.
+fn render_table(
+    ui: &mut Ui,
+    table: &Table,
+    look: PreviewLook<'_>,
+    images: &mut NoteImages,
+    actions: &mut PreviewActions,
+    counters: &mut PreviewCounters,
+) {
+    let p = look.p;
+    let columns = table.header.len();
+    if columns == 0 {
+        return;
+    }
+
+    // Every column is as wide as its widest cell, so a row never shifts the one under it. The
+    // table is only squeezed when it would not fit the pane, and then the cells wrap.
+    let mut widths = vec![0.0f32; columns];
+    for (cell, width) in table.header.iter().zip(widths.iter_mut()) {
+        *width = width.max(cell_width(ui, cell));
+    }
+    for row in &table.rows {
+        for (cell, width) in row.iter().zip(widths.iter_mut()) {
+            *width = width.max(cell_width(ui, cell));
+        }
+    }
+    for width in &mut widths {
+        *width += TABLE_CELL_PAD;
+    }
+    let gaps = TABLE_GAP * (columns - 1) as f32;
+    let available = (ui.available_width() - 2.0 * 12.0).max(120.0);
+    let total: f32 = widths.iter().sum::<f32>() + gaps;
+    if total > available {
+        let scale = (available - gaps).max(48.0) / widths.iter().sum::<f32>().max(1.0);
+        for width in &mut widths {
+            *width *= scale;
+        }
+    }
+
+    Frame::new()
+        .fill(p.bg_elevated)
+        .stroke(Stroke::new(1.0_f32, p.border))
+        .corner_radius(CornerRadius::same(6))
+        .inner_margin(Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let header = TableRow {
+                widths: &widths,
+                aligns: &table.aligns,
+                header: true,
+            };
+            render_table_row(ui, &table.header, &header, look, images, actions, counters);
+
+            // A hairline under the header, across the whole table.
+            let line = ui.cursor().top() + 2.0;
+            ui.painter().hline(
+                ui.max_rect().x_range(),
+                line,
+                Stroke::new(1.0_f32, p.border),
+            );
+            ui.add_space(6.0);
+
+            let body = TableRow {
+                widths: &widths,
+                aligns: &table.aligns,
+                header: false,
+            };
+            for row in &table.rows {
+                render_table_row(ui, row, &body, look, images, actions, counters);
+            }
+        });
+    ui.add_space(6.0);
+}
+
+/// One row of a [table](render_table): each cell gets its column's width, and that column's
+/// alignment decides where its words sit inside it. A picture in a cell is drawn the way one on a
+/// line of its own is — under the words beside it, inside the cell — and counted in the note's
+/// picture numbering as it is drawn, so dragging its corner writes back to the right one.
+fn render_table_row(
+    ui: &mut Ui,
+    cells: &[String],
+    row: &TableRow<'_>,
+    look: PreviewLook<'_>,
+    images: &mut NoteImages,
+    actions: &mut PreviewActions,
+    counters: &mut PreviewCounters,
+) {
+    let p = look.p;
+    ui.horizontal_top(|ui| {
+        for (i, cell) in cells.iter().enumerate() {
+            if i > 0 {
+                ui.add_space(TABLE_GAP);
+            }
+            let width = row.widths[i];
+            // egui's grid and its layouts line a cell's first widget up on the left whatever
+            // alignment it is given, so the words are moved in from that edge by the space their
+            // own measurement leaves over. The measurement is the one the column widths came
+            // from, so the widest cell sits flush and the others line up with it.
+            let room = (width - cell_width(ui, cell)).max(0.0);
+            let leading = match row.aligns[i] {
+                ColumnAlign::Left => 0.0,
+                ColumnAlign::Center => room / 2.0,
+                ColumnAlign::Right => room,
+            };
+            ui.allocate_ui_with_layout(Vec2::new(width, 0.0), Layout::top_down(Align::Min), |ui| {
+                ui.set_width(width);
+                for piece in split_images(cell) {
+                    match piece {
+                        LinePiece::Text(text) if !text.trim().is_empty() => {
+                            ui.horizontal_wrapped(|ui| {
+                                if leading > 0.0 {
+                                    ui.add_space(leading);
+                                }
+                                render_inline_spans_ui(
+                                    ui,
+                                    text.trim(),
+                                    14.0,
+                                    p,
+                                    p.fg_primary,
+                                    &mut actions.wiki_link,
+                                    row.header,
+                                );
+                            });
+                        }
+                        LinePiece::Image { alt, src, width } => {
+                            let index = counters.images;
+                            counters.images += 1;
+                            let kept = ui
+                                .horizontal(|ui| {
+                                    ui.add_space(leading);
+                                    images.show(ui, &src, &alt, width, look.note_dir, p)
+                                })
+                                .inner;
+                            if let Some(kept) = kept {
+                                actions.image = Some((index, kept));
+                            }
+                        }
+                        LinePiece::Text(_) => {}
+                    }
+                }
+            });
+        }
+    });
+    ui.add_space(3.0);
+}
+
+/// How wide a cell needs to be: its words in the preview's own font, or a picture in it that is
+/// wider. Markers are left out; bold and code runs come out a little wider than this, which is what
+/// the cell padding is for. A picture asks for the width the note gave it, or else room for a
+/// thumbnail-sized view.
+fn cell_width(ui: &Ui, text: &str) -> f32 {
+    let mut words = String::new();
+    let mut picture = 0.0f32;
+    for piece in split_images(text) {
+        match piece {
+            LinePiece::Text(text) => words.push_str(&text),
+            LinePiece::Image { width, .. } => {
+                picture = picture.max(width.map_or(TABLE_PICTURE_WIDTH, |width| width as f32));
+            }
+        }
+    }
+    let plain = crate::markdown::strip_all_inline_markers(&words);
+    let words = ui.fonts(|fonts| {
+        fonts
+            .layout_no_wrap(plain, FontId::proportional(14.0), Color32::WHITE)
+            .size()
+            .x
+    });
+    words.max(picture)
 }
 
 #[cfg(test)]
@@ -8799,6 +9535,797 @@ mod tests {
         assert_eq!(images.ready_pictures(), 1, "the picture should be decoded");
         // Nothing was dragged, so the note's own width is untouched.
         assert_eq!(preview.image, None);
+    }
+
+    /// A pipe table is drawn cell by cell, not left as a paragraph of pipes: the header and the
+    /// rows arrive as their own labels, and the table takes the lines that belong to it.
+    #[test]
+    fn test_preview_draws_a_pipe_table_as_cells() {
+        let ctx = egui::Context::default();
+        install_tabler_icons(&ctx);
+        let p = ThemeMode::Obsidian.palette();
+        let markdown = "Before.\n\n| Name | Count |\n| :--- | ---: |\n| apples | 3 |\n| pears | 12 |\n\nAfter the table.";
+
+        fn collect(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => out.push(text.galley.text().to_string()),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Two frames: a grid measures itself on the first one and draws on the next.
+        let mut drawn = Vec::new();
+        for _ in 0..2 {
+            let mut images = NoteImages::default();
+            let mut preview = PreviewActions::default();
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0))),
+                ..Default::default()
+            };
+            let output = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_markdown_preview(ui, markdown, &p, None, &mut images, &mut preview);
+                });
+            });
+            drawn.clear();
+            for clipped in &output.shapes {
+                collect(&clipped.shape, &mut drawn);
+            }
+        }
+
+        for cell in ["Name", "Count", "apples", "3", "pears", "12"] {
+            assert!(
+                drawn.iter().any(|text| text == cell),
+                "the cell {cell:?} should be drawn on its own: {drawn:?}"
+            );
+        }
+        assert!(
+            !drawn.iter().any(|text| text.contains('|')),
+            "the pipes should not be drawn as text: {drawn:?}"
+        );
+        assert!(
+            drawn.iter().any(|text| text == "After the table."),
+            "the line under the table is still drawn"
+        );
+    }
+
+    /// The colons under the header decide where each column's words sit: a right-aligned column
+    /// ends every cell on the same edge, and a centred one keeps every cell on the same middle.
+    #[test]
+    fn test_preview_lines_table_columns_up_as_the_header_asks() {
+        let ctx = egui::Context::default();
+        install_tabler_icons(&ctx);
+        let p = ThemeMode::Obsidian.palette();
+        let markdown =
+            "| L | C | R |\n| :--- | :---: | ---: |\n| a | mid | 1 |\n| b | wider text | 12345 |";
+
+        // Where the glyphs actually land. A galley carries the room the layout gave it, so its
+        // size is not the width of the words; the ink of its rows is.
+        fn collect_text(shape: &egui::Shape, out: &mut Vec<(String, Rect)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    let mut ink = Rect::NOTHING;
+                    for row in &text.galley.rows {
+                        ink = ink.union(row.visuals.mesh_bounds);
+                    }
+                    if ink.is_finite() {
+                        out.push((
+                            text.galley.text().to_string(),
+                            ink.translate(text.pos.to_vec2()),
+                        ));
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect_text(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut drawn: Vec<(String, Rect)> = Vec::new();
+        for _ in 0..3 {
+            let mut images = NoteImages::default();
+            let mut preview = PreviewActions::default();
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0))),
+                ..Default::default()
+            };
+            let output = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_markdown_preview(ui, markdown, &p, None, &mut images, &mut preview);
+                });
+            });
+            drawn.clear();
+            for clipped in &output.shapes {
+                collect_text(&clipped.shape, &mut drawn);
+            }
+        }
+
+        let placed = |needle: &str| -> Rect {
+            drawn
+                .iter()
+                .find(|(text, _)| text == needle)
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| panic!("{needle:?} was not drawn: {drawn:?}"))
+        };
+
+        // Both right-aligned cells end on the column's right edge.
+        let (short, long) = (placed("1").right(), placed("12345").right());
+        assert!(
+            (short - long).abs() <= 1.5,
+            "right-aligned cells should share a right edge: {short} vs {long}: {drawn:?}"
+        );
+
+        // Both centred cells share a middle.
+        let (mid, wider) = (placed("mid").center().x, placed("wider text").center().x);
+        assert!(
+            (mid - wider).abs() <= 1.5,
+            "centred cells should share a middle: {mid} vs {wider}: {drawn:?}"
+        );
+
+        // The left column stays a left column.
+        assert!(
+            (placed("a").left() - placed("b").left()).abs() <= 1.5,
+            "left-aligned cells should share a left edge: {drawn:?}"
+        );
+    }
+
+    /// A cell keeps the inline formatting of a note's line: bold, code and plain words in one
+    /// cell run on after each other on the same line instead of each starting its own.
+    #[test]
+    fn test_preview_keeps_a_formatted_cell_on_one_line() {
+        let ctx = egui::Context::default();
+        install_tabler_icons(&ctx);
+        let p = ThemeMode::Obsidian.palette();
+        let markdown = "| Head |\n| --- |\n| **bold** tail |";
+
+        fn collect_text(shape: &egui::Shape, out: &mut Vec<(String, Rect)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    let mut ink = Rect::NOTHING;
+                    for row in &text.galley.rows {
+                        ink = ink.union(row.visuals.mesh_bounds);
+                    }
+                    if ink.is_finite() {
+                        out.push((
+                            text.galley.text().to_string(),
+                            ink.translate(text.pos.to_vec2()),
+                        ));
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect_text(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut drawn: Vec<(String, Rect)> = Vec::new();
+        for _ in 0..3 {
+            let mut images = NoteImages::default();
+            let mut preview = PreviewActions::default();
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0))),
+                ..Default::default()
+            };
+            let output = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_markdown_preview(ui, markdown, &p, None, &mut images, &mut preview);
+                });
+            });
+            drawn.clear();
+            for clipped in &output.shapes {
+                collect_text(&clipped.shape, &mut drawn);
+            }
+        }
+
+        let find = |needle: &str| -> Rect {
+            drawn
+                .iter()
+                .find(|(text, _)| text == needle)
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| panic!("{needle:?} was not drawn: {drawn:?}"))
+        };
+        let bold = find("bold");
+        let tail = find(" tail");
+        assert!(
+            (bold.top() - tail.top()).abs() <= 1.5,
+            "the words of one cell share a line: {bold:?} vs {tail:?}"
+        );
+        assert!(
+            tail.left() + 1.0 >= bold.right() - 1.0,
+            "the plain words follow the bold ones: {bold:?} vs {tail:?}"
+        );
+    }
+
+    /// A table written inside a quote is drawn as a table there too: neither the pipes nor the
+    /// quote markers reach the text, and the paragraphs around the quote are untouched.
+    #[test]
+    fn test_preview_draws_a_table_inside_a_quote() {
+        let ctx = egui::Context::default();
+        install_tabler_icons(&ctx);
+        let p = ThemeMode::Obsidian.palette();
+        let markdown =
+            "Before.\n\n> | Name | Count |\n> | :--- | ---: |\n> | apples | 3 |\n\nAfter the quote.";
+
+        fn collect(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => out.push(text.galley.text().to_string()),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut drawn = Vec::new();
+        for _ in 0..3 {
+            let mut images = NoteImages::default();
+            let mut preview = PreviewActions::default();
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0))),
+                ..Default::default()
+            };
+            let output = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_markdown_preview(ui, markdown, &p, None, &mut images, &mut preview);
+                });
+            });
+            drawn.clear();
+            for clipped in &output.shapes {
+                collect(&clipped.shape, &mut drawn);
+            }
+        }
+
+        for cell in ["Name", "Count", "apples", "3"] {
+            assert!(
+                drawn.iter().any(|text| text == cell),
+                "the cell {cell:?} should be drawn on its own: {drawn:?}"
+            );
+        }
+        assert!(
+            !drawn
+                .iter()
+                .any(|text| text.contains('|') || text.contains('>')),
+            "neither the pipes nor the markers should be drawn as text: {drawn:?}"
+        );
+        assert!(
+            drawn.iter().any(|text| text == "After the quote."),
+            "the line under the quote is still drawn: {drawn:?}"
+        );
+    }
+
+    /// A picture written on a quoted line belongs to the quote: the marker never reaches the text,
+    /// and the picture is decoded the same way one on an ordinary line is.
+    #[test]
+    fn test_preview_draws_a_picture_inside_a_quote() {
+        let ctx = egui::Context::default();
+        install_tabler_icons(&ctx);
+        let dir = std::env::temp_dir().join(format!(
+            "elora-preview-quoted-image-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pixels = image::RgbaImage::from_pixel(6, 4, image::Rgba([40, 120, 190, 255]));
+        pixels.save(dir.join("dot.png")).unwrap();
+
+        let markdown = "Before.\n\n> A quoted line\n> ![a blue dot](dot.png) after it\n\nAfter.";
+        let p = ThemeMode::Obsidian.palette();
+        let mut images = NoteImages::default();
+
+        fn collect(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => out.push(text.galley.text().to_string()),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut drawn = Vec::new();
+        for _ in 0..2 {
+            let mut preview = PreviewActions::default();
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0))),
+                ..Default::default()
+            };
+            let output = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_markdown_preview(
+                        ui,
+                        markdown,
+                        &p,
+                        Some(&dir),
+                        &mut images,
+                        &mut preview,
+                    );
+                });
+            });
+            drawn.clear();
+            for clipped in &output.shapes {
+                collect(&clipped.shape, &mut drawn);
+            }
+        }
+
+        assert_eq!(images.ready_pictures(), 1, "the picture should be decoded");
+        assert!(
+            drawn.iter().any(|text| text == "A quoted line"),
+            "the quoted words are drawn without their marker: {drawn:?}"
+        );
+        assert!(
+            drawn.iter().any(|text| text == "after it"),
+            "the words beside the picture stay in the quote: {drawn:?}"
+        );
+        assert!(
+            !drawn.iter().any(|text| text.contains('>')),
+            "the quote marker should not be drawn as text: {drawn:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A picture written in a table cell is drawn inside the cell, fitted to its column instead of
+    /// left as a marker, and the cell beside it keeps its place.
+    #[test]
+    fn test_preview_draws_a_picture_inside_a_table_cell() {
+        let ctx = egui::Context::default();
+        install_tabler_icons(&ctx);
+        let dir = std::env::temp_dir().join(format!(
+            "elora-preview-cell-image-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pixels = image::RgbaImage::from_pixel(400, 40, image::Rgba([90, 150, 210, 255]));
+        pixels.save(dir.join("wide.png")).unwrap();
+        let pixels = image::RgbaImage::from_pixel(20, 10, image::Rgba([200, 120, 60, 255]));
+        pixels.save(dir.join("after.png")).unwrap();
+
+        let markdown = "| Pic | Name |\n| --- | --- |\n| ![a wide picture](wide.png) | apples |\n\n![after the table](after.png)";
+        let p = ThemeMode::Obsidian.palette();
+        let mut images = NoteImages::default();
+
+        fn collect_text(shape: &egui::Shape, out: &mut Vec<(String, Rect)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    let mut ink = Rect::NOTHING;
+                    for row in &text.galley.rows {
+                        ink = ink.union(row.visuals.mesh_bounds);
+                    }
+                    if ink.is_finite() {
+                        out.push((
+                            text.galley.text().to_string(),
+                            ink.translate(text.pos.to_vec2()),
+                        ));
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect_text(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut drawn: Vec<(String, Rect)> = Vec::new();
+        for _ in 0..3 {
+            let mut preview = PreviewActions::default();
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0))),
+                ..Default::default()
+            };
+            let output = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_markdown_preview(
+                        ui,
+                        markdown,
+                        &p,
+                        Some(&dir),
+                        &mut images,
+                        &mut preview,
+                    );
+                });
+            });
+            drawn.clear();
+            for clipped in &output.shapes {
+                collect_text(&clipped.shape, &mut drawn);
+            }
+        }
+        assert_eq!(
+            images.ready_pictures(),
+            2,
+            "both pictures should be decoded"
+        );
+
+        // They are drawn in the order they sit in the note, which is the order the index a drag
+        // writes back to counts them in, cell or not.
+        let pair = &images.drawn[images.drawn.len() - 2..];
+        assert!(
+            pair[0].0.contains("wide.png") && pair[1].0.contains("after.png"),
+            "the cell's picture comes first, the one under the table after it: {pair:?}"
+        );
+        let picture = pair[0].1;
+        assert!(
+            (120.0..=172.0).contains(&picture.width()),
+            "a picture in a cell is fitted to its column, not drawn at its own 400px: {picture:?}"
+        );
+        assert!(
+            pair[1].1.top() > picture.bottom(),
+            "the picture under the table stays under it: {pair:?}"
+        );
+
+        let header = drawn
+            .iter()
+            .find(|(text, _)| text == "Pic")
+            .map(|(_, rect)| *rect)
+            .unwrap_or_else(|| panic!("the header cell should be drawn: {drawn:?}"));
+        assert!(
+            picture.top() > header.top() + 1.0,
+            "the picture belongs to the row under the header: {picture:?} vs {header:?}"
+        );
+        assert!(
+            drawn.iter().any(|(text, _)| text == "apples"),
+            "the cell beside the picture keeps its words: {drawn:?}"
+        );
+        assert!(
+            !drawn.iter().any(|(text, _)| text.contains("![")),
+            "the picture marker should not be drawn as text: {drawn:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Working out an export counts the pictures it would copy, points at the ones on the web and
+    /// leaves out the ones that are not on this computer — and touches nothing while doing it.
+    #[test]
+    fn test_planning_an_export_counts_the_pictures_without_copying() {
+        let dir = std::env::temp_dir().join(format!(
+            "elora-export-pictures-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let vault = dir.join("vault");
+        std::fs::create_dir_all(vault.join("attachments")).unwrap();
+        std::fs::write(vault.join("attachments/cat-photo.png"), [9u8, 8, 7]).unwrap();
+        // A name written with a `%20` finds a file with a space in it, whose name cannot stand in
+        // a link as it is.
+        std::fs::write(vault.join("my pic.png"), [1u8, 2]).unwrap();
+
+        let body = "One\n![a cat](attachments/cat-photo.png)\n![web](https://example.com/x.png)\n![gone](attachments/none.png)\n![again](attachments/cat-photo.png)\n![odd name](my%20pic.png)";
+        let mut number = 0usize;
+        let plan = plan_pictures("note-1", body, Some(&vault), &mut number);
+
+        assert_eq!(
+            plan.mapped
+                .get("attachments/cat-photo.png")
+                .map(String::as_str),
+            Some("pictures/note-1-0-cat-photo.png"),
+            "{:?}",
+            plan.mapped
+        );
+        assert_eq!(
+            plan.mapped.get("my%20pic.png").map(String::as_str),
+            Some("pictures/note-1-1-my-pic.png"),
+            "a name with a space in it is made safe for a link: {:?}",
+            plan.mapped
+        );
+        assert_eq!(
+            plan.mapped
+                .get("https://example.com/x.png")
+                .map(String::as_str),
+            Some("https://example.com/x.png"),
+            "a picture on the web is pointed at where it lives"
+        );
+        assert!(
+            !plan.mapped.contains_key("attachments/none.png"),
+            "the picture that is not there is left out: {:?}",
+            plan.mapped
+        );
+        assert_eq!(
+            plan.copies.len(),
+            2,
+            "only the two files that exist are copied"
+        );
+        assert_eq!(number, 2, "a picture named twice is counted once");
+        assert!(
+            !dir.join("pictures").exists(),
+            "working out an export writes nothing"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What the confirmation promises is what the export writes: the pages, the pictures beside
+    /// them, and the links between the pages.
+    #[test]
+    fn test_a_planned_export_writes_what_it_promised() {
+        let dir = std::env::temp_dir().join(format!(
+            "elora-export-plan-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let storage = NoteStorage::new(dir.join("notes")).unwrap();
+        let root = storage.root_dir().to_path_buf();
+        std::fs::create_dir_all(root.join("attachments")).unwrap();
+        std::fs::write(root.join("attachments/pic.png"), [7u8, 7, 7]).unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = EloraApp::with_context(&ctx, storage);
+        let first = Note::new(
+            "First",
+            "See [[Second]] and ![a picture](attachments/pic.png)",
+            &root,
+        );
+        let second = Note::new("Second", "Back to [[First]].", &root);
+        let (first_id, second_id) = (first.id.clone(), second.id.clone());
+        app.notes = vec![first, second];
+        app.selected_id = Some(first_id.clone());
+
+        // Asking for an export only offers it: nothing is written until it is confirmed.
+        app.export_html(false);
+        assert!(
+            app.export_offer.is_some(),
+            "the export waits for a yes before writing"
+        );
+
+        let mut plan = app.plan_export(false).expect("a note is selected");
+        assert_eq!(plan.pages.len(), 2, "the note and the one it links to");
+        assert_eq!(plan.copies.len(), 1, "the one picture it names");
+        // Into a folder of the test's own instead of Downloads.
+        let out = dir.join("out");
+        plan.dir = out.clone();
+
+        let summary = write_export(&plan).expect("the export should be written");
+        assert!(
+            summary.contains("plus 1 linked note") && summary.contains("1 picture"),
+            "the summary says what was written: {summary}"
+        );
+        let html = |id: &str| {
+            std::fs::read_to_string(out.join(format!("{id}.html")))
+                .unwrap_or_else(|e| panic!("the page for {id} should be there: {e}"))
+        };
+        let page = html(&first_id);
+        assert!(
+            page.contains(&format!("href=\"{second_id}.html\"")),
+            "the link opens the page that was written: {page}"
+        );
+        assert!(page.contains("<img src=\"pictures/"), "{page}");
+        assert!(
+            out.join("pictures").is_dir(),
+            "the picture is copied beside the pages"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A single-note export writes the notes its links point at and the notes that point back at
+    /// it, and the same for those, so every link in the exported pages opens a page that was
+    /// written. A link to a note in the trash, or to no note at all, pulls nothing in.
+    #[test]
+    fn test_exporting_one_note_follows_its_links_both_ways() {
+        let now = Utc::now();
+        let note = |id: &str, body: &str, trashed: bool| Note {
+            id: id.to_string(),
+            title: id.to_string(),
+            body: body.to_string(),
+            pinned: false,
+            trashed,
+            explicit_tags: Vec::new(),
+            icon: None,
+            folder: None,
+            owner: None,
+            owner_key: None,
+            private: false,
+            shared_with: Vec::new(),
+            shared_keys: Vec::new(),
+            created_at: now,
+            updated_at: now,
+            file_path: PathBuf::new(),
+        };
+        let notes = vec![
+            note("start", "Go to [[middle]] and [[nowhere]].", false),
+            note(
+                "middle",
+                "Then [[end]], [[gone]] and back to [[Start]].",
+                false,
+            ),
+            note("end", "Nothing more.", false),
+            note("gone", "In the trash.", true),
+            note(
+                "loose",
+                "Nobody points here, and [[outsider]] neither.",
+                false,
+            ),
+            note("backlink", "Context for [[start]].", false),
+            note("trashed backlink", "Old context for [[start]].", true),
+        ];
+
+        let picked = notes_linked_around(&notes, &notes[0]);
+        let ids: Vec<&str> = picked.iter().map(|note| note.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["start", "middle", "backlink", "end"],
+            "the note, the notes it links to and the one linking back to it: {ids:?}"
+        );
+    }
+
+    /// A table under a list item is drawn inside the item: its cells start to the right of the
+    /// item's own words, and the item after it is still drawn.
+    #[test]
+    fn test_preview_draws_a_table_under_a_list_item() {
+        let ctx = egui::Context::default();
+        install_tabler_icons(&ctx);
+        let p = ThemeMode::Obsidian.palette();
+        let markdown = "- Point\n  | A | B |\n  | --- | --- |\n  | x | y |\n- Next";
+
+        fn collect_text(shape: &egui::Shape, out: &mut Vec<(String, Rect)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    let mut ink = Rect::NOTHING;
+                    for row in &text.galley.rows {
+                        ink = ink.union(row.visuals.mesh_bounds);
+                    }
+                    if ink.is_finite() {
+                        out.push((
+                            text.galley.text().to_string(),
+                            ink.translate(text.pos.to_vec2()),
+                        ));
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect_text(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut drawn: Vec<(String, Rect)> = Vec::new();
+        for _ in 0..3 {
+            let mut images = NoteImages::default();
+            let mut preview = PreviewActions::default();
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0))),
+                ..Default::default()
+            };
+            let output = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_markdown_preview(ui, markdown, &p, None, &mut images, &mut preview);
+                });
+            });
+            drawn.clear();
+            for clipped in &output.shapes {
+                collect_text(&clipped.shape, &mut drawn);
+            }
+        }
+
+        let find = |needle: &str| -> Rect {
+            drawn
+                .iter()
+                .find(|(text, _)| text == needle)
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| panic!("{needle:?} was not drawn: {drawn:?}"))
+        };
+        let point = find("Point");
+        let cell = find("x");
+        assert!(
+            cell.left() > point.left() + 8.0,
+            "the table should sit in from the item's own words: {point:?} vs {cell:?}"
+        );
+        assert!(
+            drawn.iter().any(|(text, _)| text == "Next"),
+            "the item under the table is still drawn: {drawn:?}"
+        );
+        assert!(
+            !drawn.iter().any(|(text, _)| text.contains('|')),
+            "the pipes should not be drawn as text: {drawn:?}"
+        );
+    }
+
+    /// A table can be nested twice over — quoted inside a list item — and both levels are
+    /// unwrapped: the cells arrive on their own, drawn in from the item's words.
+    #[test]
+    fn test_preview_draws_a_table_quoted_inside_a_list_item() {
+        let ctx = egui::Context::default();
+        install_tabler_icons(&ctx);
+        let p = ThemeMode::Obsidian.palette();
+        let markdown = "- Point\n  > | A | B |\n  > | --- | --- |\n  > | x | y |\n- Next";
+
+        fn collect_text(shape: &egui::Shape, out: &mut Vec<(String, Rect)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    let mut ink = Rect::NOTHING;
+                    for row in &text.galley.rows {
+                        ink = ink.union(row.visuals.mesh_bounds);
+                    }
+                    if ink.is_finite() {
+                        out.push((
+                            text.galley.text().to_string(),
+                            ink.translate(text.pos.to_vec2()),
+                        ));
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect_text(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut drawn: Vec<(String, Rect)> = Vec::new();
+        for _ in 0..3 {
+            let mut images = NoteImages::default();
+            let mut preview = PreviewActions::default();
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0))),
+                ..Default::default()
+            };
+            let output = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_markdown_preview(ui, markdown, &p, None, &mut images, &mut preview);
+                });
+            });
+            drawn.clear();
+            for clipped in &output.shapes {
+                collect_text(&clipped.shape, &mut drawn);
+            }
+        }
+
+        let find = |needle: &str| -> Rect {
+            drawn
+                .iter()
+                .find(|(text, _)| text == needle)
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| panic!("{needle:?} was not drawn: {drawn:?}"))
+        };
+        for cell in ["A", "B", "x", "y"] {
+            find(cell);
+        }
+        assert!(
+            find("x").left() > find("Point").left() + 8.0,
+            "the quoted table is still drawn in from the item's words: {drawn:?}"
+        );
+        assert!(
+            !drawn
+                .iter()
+                .any(|(text, _)| text.contains('|') || text.contains('>')),
+            "neither the pipes nor the markers should be drawn as text: {drawn:?}"
+        );
+        assert!(
+            drawn.iter().any(|(text, _)| text == "Next"),
+            "the item under it is still drawn: {drawn:?}"
+        );
     }
 
     fn png_bytes() -> Vec<u8> {
@@ -10589,6 +12116,160 @@ mod tests {
             row_height <= 24.0,
             "a row taller than 24 points is not a file-list row: {row_height}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A folder somebody picked is where the pages go — for a whole vault too — and the choice is
+    /// remembered. Without one, a whole vault gets a folder of its own inside downloads.
+    #[test]
+    fn test_the_export_goes_to_the_chosen_folder() {
+        let dir = std::env::temp_dir().join(format!(
+            "elora-export-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let storage = NoteStorage::new(dir.join("notes")).unwrap();
+        let root = storage.root_dir().to_path_buf();
+        let ctx = egui::Context::default();
+        let mut app = EloraApp::with_context(&ctx, storage);
+        app.notes = vec![Note::new("Only", "nothing here", &root)];
+        app.selected_id = Some(app.notes[0].id.clone());
+
+        let chosen = dir.join("somewhere else");
+        app.export_dir = Some(chosen.clone());
+        assert_eq!(
+            app.plan_export(false).expect("a plan").dir,
+            chosen,
+            "one note goes where it was told"
+        );
+        assert_eq!(
+            app.plan_export(true).expect("a plan").dir,
+            chosen,
+            "a whole vault goes where it was told too"
+        );
+
+        app.export_dir = None;
+        let default = app.plan_export(true).expect("a plan").dir;
+        assert!(
+            default.ends_with("EloraNotes Export"),
+            "the default whole-vault export keeps a folder of its own: {default:?}"
+        );
+
+        // The choice is remembered: it is in the settings file.
+        app.export_dir = Some(chosen.clone());
+        app.persist_settings();
+        assert_eq!(
+            app.storage.load_settings().export_dir,
+            Some(chosen.display().to_string()),
+            "the folder outlives the window"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A note's name is part of the button, not a piece of text to select: a click on the name
+    /// opens the note, in the one-line row and in the tall card alike.
+    #[test]
+    fn test_clicking_a_note_name_opens_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "elora-card-click-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let note = Note::new("A note to click on", "the body of the note", &dir);
+
+        let ctx = egui::Context::default();
+        install_tabler_icons(&ctx);
+        let p = ThemeMode::Obsidian.palette();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(320.0, 240.0));
+
+        fn collect_text(shape: &egui::Shape, out: &mut Vec<(String, Rect)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    let mut ink = Rect::NOTHING;
+                    for row in &text.galley.rows {
+                        ink = ink.union(row.visuals.mesh_bounds);
+                    }
+                    if ink.is_finite() {
+                        out.push((
+                            text.galley.text().to_string(),
+                            ink.translate(text.pos.to_vec2()),
+                        ));
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect_text(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for roomy in [false, true] {
+            let mut opened = false;
+            let mut click_at: Option<Pos2> = None;
+            for frame in 0..3 {
+                let mut events = Vec::new();
+                if let Some(at) = click_at {
+                    if frame >= 1 {
+                        events.push(egui::Event::PointerMoved(at));
+                        events.push(egui::Event::PointerButton {
+                            pos: at,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::default(),
+                        });
+                        events.push(egui::Event::PointerButton {
+                            pos: at,
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: egui::Modifiers::default(),
+                        });
+                    }
+                }
+                let raw = egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                };
+                let output = ctx.run(raw, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let action = if roomy {
+                            render_note_card(ui, &note, false, &p, "", &[], false)
+                        } else {
+                            render_compact_note_row(ui, &note, false, &p, &[])
+                        };
+                        if let Some(CardAction::SelectNote(id)) = action {
+                            opened = id == note.id;
+                        }
+                    });
+                });
+                if click_at.is_none() {
+                    let mut drawn = Vec::new();
+                    for clipped in &output.shapes {
+                        collect_text(&clipped.shape, &mut drawn);
+                    }
+                    click_at = drawn
+                        .iter()
+                        .find(|(text, _)| text == &note.display_title())
+                        .map(|(_, rect)| rect.center());
+                }
+            }
+            assert!(click_at.is_some(), "the note's name should be drawn");
+            assert!(
+                opened,
+                "clicking the name should open the note (tall card: {roomy})"
+            );
+        }
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
