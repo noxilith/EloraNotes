@@ -25,6 +25,17 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.9.27" date="2026-10-24">
+      <description>
+        <p>
+          Deleting text in a shared note now reaches everybody. A backspace adds no new content,
+          only a removal, and the server judged an edit by what it added: every deletion was
+          dropped, so a word typed and then deleted again stayed on the note for everyone else and
+          was never written to the note on the server either. Typing worked, deleting did not, and
+          a note opened later brought the deleted words back.
+        </p>
+      </description>
+    </release>
     <release version="0.9.26" date="2026-10-24">
       <description>
         <p>

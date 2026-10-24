@@ -998,3 +998,63 @@ fn test_a_chosen_colour_is_what_the_other_person_sees() {
         |c, _| colour_of(c, "alice") == Some(default_peer_color("alice")),
     );
 }
+
+/// Typing a word and then backspacing it again is a change made of nothing but removals. A
+/// removal adds no new blocks, so an update that only removes them looks empty to the state
+/// vector — and a server that judged the update by that dropped it, leaving the word on the note
+/// for everybody else while the person who deleted it watched it go.
+#[test]
+fn test_a_word_that_is_typed_and_then_deleted_goes_away_for_everybody() {
+    let _turn = SERVER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let harness = start_server();
+    let note_id = harness.note_id.clone();
+
+    let mut alice = Collab::new();
+    alice.connect(profile(harness.port), "alice".into(), key("alice"));
+    let mut alice_body = String::new();
+    settle(&mut alice, &mut alice_body, "alice", |c, _| {
+        c.is_connected()
+    });
+    alice.open_note(&note_id, "hello");
+    settle(&mut alice, &mut alice_body, "alice", |_, body| {
+        body == "hello"
+    });
+
+    let mut bob = Collab::new();
+    bob.connect(profile(harness.port), "bob".into(), key("bob"));
+    let mut bob_body = String::new();
+    settle(&mut bob, &mut bob_body, "bob", |c, _| c.is_connected());
+    bob.open_note(&note_id, "hello");
+    settle(&mut bob, &mut bob_body, "bob", |_, body| body == "hello");
+
+    // One keystroke at a time, the way the editor hands its text over. Alice's own window keeps
+    // what she typed, so only Bob's side is waited on; Alice's events are drained, not awaited.
+    for typed in ["hello ", "hello w", "hello wo", "hello wor", "hello word"] {
+        alice.send_body(&note_id, typed);
+        settle(&mut alice, &mut alice_body, "alice", |_, _| true);
+        settle(&mut bob, &mut bob_body, "bob sees the word", |_, body| {
+            body == typed
+        });
+    }
+
+    // …and now every one of those characters comes off again. Each of these is a removal only.
+    for left in ["hello wor", "hello wo", "hello w", "hello ", "hello"] {
+        alice.send_body(&note_id, left);
+        settle(&mut alice, &mut alice_body, "alice", |_, _| true);
+        settle(&mut bob, &mut bob_body, "bob sees it go", |_, body| {
+            body == left
+        });
+    }
+
+    assert_eq!(bob_body, "hello", "the deleted word is still on bob's note");
+
+    // The removal is what the note on the server's disk holds too.
+    let saved = std::fs::read_to_string(harness.notes_dir.join(format!("{note_id}.md"))).unwrap();
+    assert!(
+        saved.trim_end().ends_with("hello"),
+        "the note on the server still has the deleted word: {saved:?}"
+    );
+
+    alice.disconnect();
+    bob.disconnect();
+}

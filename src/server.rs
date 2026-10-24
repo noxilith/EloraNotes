@@ -846,9 +846,20 @@ impl Server {
             let Ok(decoded) = yrs::Update::decode_v1(&update) else {
                 return;
             };
+            // A removal adds no blocks, so an update made only of removals leaves the state
+            // vector exactly where it was. Judging the update by that alone dropped every
+            // backspace: the word came off the typist's screen and stayed on the note for
+            // everybody else. For those the text is what tells a real removal from a stale one
+            // that removes what somebody else already did.
+            let removals_only =
+                decoded.state_vector().is_empty() && !decoded.delete_set().is_empty();
+            let before_text = removals_only.then(|| {
+                let txn = room.doc.transact();
+                room.text.get_string(&txn)
+            });
             // A client answering our own state request sends its document even when it is
             // empty, and opening a note is not an edit: without this, merely clicking a shared
-            // note moved it to the top of the list for everyone. Only an update that adds
+            // note moved it to the top of the list for everyone. Only an update that changes
             // something counts.
             let before = room.doc.transact().state_vector().encode_v1();
             {
@@ -858,7 +869,13 @@ impl Server {
                 }
             }
             if room.doc.transact().state_vector().encode_v1() == before {
-                return;
+                let changed_nothing = before_text.is_none_or(|was| {
+                    let txn = room.doc.transact();
+                    room.text.get_string(&txn) == was
+                });
+                if changed_nothing {
+                    return;
+                }
             }
             room.subscribers.clone()
         };
