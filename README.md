@@ -304,6 +304,38 @@ elora-server people release Skorp
 Notes that already carry a key need nothing: their `owner:` line is only the label the sidebar
 prints, so a stale one is harmless.
 
+### Releasing a name when the server runs as a service
+
+`people release` rewrites the name list on disk, but a running server keeps its own copy in
+memory and saves it again the next time somebody connects — the release would be undone. Stop
+the service for the minute it takes, run the command as the service user with the same settings
+folder the unit names, then start it again:
+
+```sh
+# What this machine's service really uses (User=, Environment=, ExecStart=)
+systemctl cat elora-server | grep -E '^(User|Environment|ExecStart)'
+
+sudo systemctl stop elora-server
+sudo -u elora env ELORA_SERVER_DIR=/var/lib/elora-server elora-server people list
+sudo -u elora env ELORA_SERVER_DIR=/var/lib/elora-server elora-server people release Skorp
+sudo systemctl start elora-server
+```
+
+`elora` and `/var/lib/elora-server` are the installer's defaults; the `systemctl cat` line above
+prints the ones this machine uses. A per-user install (immutable systems, or
+`ELORA_SERVICE_MODE=user`) is `systemctl --user`, with `~/.local/share/elora-server` and no
+`sudo`.
+
+Run it **as the service user, not root**. `sudo ELORA_SERVER_DIR=… elora-server …` does not work
+at all — `sudo` reads `VAR=value` as the command name — and root would leave `people.json` owned
+by root, so the service could no longer save a name claimed afterwards. `sudo -u elora env …`
+sets it without changing the owner.
+
+`people list` shows every name with the key bound to it (`Your key` in Settings → Shared library
+is yours), before and after the release. The name is then free, not given away: the next person
+to connect with it claims it, so let that be its owner. If notes were locked before keys existed,
+`people adopt --write` finishes the job while the service is still stopped.
+
 ### If it stays on "Connecting…"
 
 A wrong password or an outdated client says so by itself, so being stuck at *Connecting…* means

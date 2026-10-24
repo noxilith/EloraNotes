@@ -409,7 +409,11 @@ impl Note {
         let local: DateTime<Local> = DateTime::from(self.updated_at);
         let now = Local::now();
         if local.date_naive() == now.date_naive() {
-            local.format("Today, %H:%M").to_string()
+            // A 12-hour clock, the way a note reads on paper: 3:04 PM, not 15:04. The hour comes
+            // out of `%I` zero-padded, and a leading zero on a clock is not how anybody says it.
+            let clock = local.format("%I:%M %p").to_string();
+            let clock = clock.strip_prefix('0').unwrap_or(&clock);
+            format!("Today, {clock}")
         } else {
             local.format("%b %d, %Y").to_string()
         }
@@ -1199,6 +1203,39 @@ mod tests {
         assert_eq!(fs::read_to_string(target.join("b.md")).unwrap(), "old b");
         assert!(!target.join("notes.txt").exists());
         let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A note updated today says the time the way a clock does: 12-hour, and no leading zero.
+    #[test]
+    fn test_a_note_says_the_time_the_way_a_clock_does() {
+        use chrono::TimeZone;
+        let dir = std::path::Path::new("/tmp");
+        let mut note = Note::new("Clock", "body", dir);
+        let today = chrono::Local::now().date_naive();
+        let stamp = |hour: u32, minute: u32| {
+            chrono::Local
+                .from_local_datetime(&today.and_hms_opt(hour, minute, 0).unwrap())
+                .earliest()
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+
+        note.updated_at = stamp(15, 4);
+        assert_eq!(note.formatted_updated(), "Today, 3:04 PM");
+        note.updated_at = stamp(9, 7);
+        assert_eq!(note.formatted_updated(), "Today, 9:07 AM");
+        note.updated_at = stamp(0, 30);
+        assert_eq!(note.formatted_updated(), "Today, 12:30 AM");
+        note.updated_at = stamp(12, 5);
+        assert_eq!(note.formatted_updated(), "Today, 12:05 PM");
+
+        // Anything older keeps its date instead of a time.
+        note.updated_at = stamp(15, 4) - chrono::Duration::days(3);
+        let older = note.formatted_updated();
+        assert!(
+            !older.contains(':') && older.contains(", 20"),
+            "an older note shows its date: {older}"
+        );
     }
 
     #[test]

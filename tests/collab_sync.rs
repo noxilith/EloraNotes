@@ -799,3 +799,35 @@ fn test_taking_somebodys_name_does_not_open_their_note() {
         |_, body| body == "the secret",
     );
 }
+
+/// A title arrives one character at a time, so a space typed at the end of a half-written word
+/// has to survive the round trip. The server used to trim it, hand the trimmed title back, and
+/// the next letter then joined the word before it.
+#[test]
+fn test_a_title_keeps_the_space_at_the_end_of_a_half_typed_word() {
+    let _turn = SERVER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let harness = start_server();
+    let note_id = harness.note_id.clone();
+
+    let mut alice = Collab::new();
+    alice.connect(profile(harness.port), "alice".into(), key("alice"));
+    settle(&mut alice, &mut String::new(), "alice", |c, _| {
+        c.is_connected() && !c.notes().is_empty()
+    });
+
+    for typed in ["Meeting", "Meeting ", "Meeting n", "Meeting notes "] {
+        let mut meta = alice.notes()[0].clone();
+        meta.title = typed.to_string();
+        alice.update_note(&meta);
+        settle(&mut alice, &mut String::new(), "the new title", |c, _| {
+            c.notes().first().is_some_and(|m| m.title == typed)
+        });
+    }
+
+    // What the server keeps on disk is the same, trailing space and all.
+    let saved = std::fs::read_to_string(harness.notes_dir.join(format!("{note_id}.md"))).unwrap();
+    assert!(
+        saved.contains("title: \"Meeting notes \""),
+        "the note on the server lost its title: {saved:?}"
+    );
+}

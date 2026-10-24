@@ -34,9 +34,17 @@ use std::time::{Duration, Instant};
 const SIDEBAR_WIDTH: f32 = 210.0;
 /// Where the footer's Ko-fi button sends people.
 const KOFI_URL: &str = "https://ko-fi.com/noxilith";
+/// The note title's text field. The sync code and the field itself agree on this id, so a copy
+/// of the note arriving from a server can tell when its title is the one being typed.
+const TITLE_FIELD_ID: &str = "elora_note_title_input";
 /// How long the editor waits for a shared note's own text before trusting the copy it has. A
 /// note that opens normally answers in a few milliseconds; this only covers one that never does.
 const ROOM_BODY_WAIT: Duration = Duration::from_millis(800);
+/// Widest a status notice gets, in points. A longer message wraps inside it instead of running
+/// across the window in one line; in a narrow window it is held to the window instead.
+const TOAST_MAX_WIDTH: f32 = 420.0;
+/// The notice's frame keeps this much room for its padding and border, on both sides together.
+const TOAST_PADDING: f32 = 24.0;
 /// Inset of the sidebar's content, in points. Also used to place the divider at the panel edge.
 const SIDEBAR_MARGIN_X: i8 = 12;
 const SIDEBAR_MARGIN_Y: i8 = 10;
@@ -505,11 +513,34 @@ impl EloraApp {
         let lower = message.to_lowercase();
         let is_problem =
             lower.contains("error") || lower.contains("failed") || lower.contains("fail");
+
+        // The text is laid out here, at a width the window really has, because an `egui::Area`
+        // hands its content the width of the *previous* frame's area. A long message arriving
+        // after a short one — "Connecting…", then "could not connect to …" — was squeezed into
+        // that smaller width and came out as a column one word wide.
+        let screen = ctx.screen_rect();
+        let toast_width = (screen.width() - 32.0).clamp(120.0, TOAST_MAX_WIDTH);
+        let wrap = (toast_width - TOAST_PADDING).max(80.0);
+        // Normally the notice sits beside the sidebar; in a window too narrow for a readable
+        // sentence it moves left so the words stay in lines instead of a strip.
         let toast_left = if self.focus_mode {
             16.0
         } else {
             SIDEBAR_WIDTH + 16.0
         };
+        let toast_left = toast_left.min((screen.right() - 16.0 - toast_width).max(16.0));
+
+        let glyph = if is_problem { icon::X } else { icon::CHECK };
+        let color = if is_problem { p.danger } else { p.fg_secondary };
+        let galley = ctx.fonts(|fonts| {
+            fonts.layout(
+                format!("{glyph} {message}"),
+                egui::FontId::proportional(11.5),
+                color,
+                wrap,
+            )
+        });
+
         egui::Area::new(egui::Id::new("elora_status_toast"))
             .anchor(egui::Align2::LEFT_BOTTOM, Vec2::new(toast_left, -16.0))
             .order(egui::Order::Foreground)
@@ -521,12 +552,8 @@ impl EloraApp {
                     .corner_radius(CornerRadius::same(6))
                     .inner_margin(Margin::symmetric(10, 6))
                     .show(ui, |ui| {
-                        let glyph = if is_problem { icon::X } else { icon::CHECK };
-                        ui.label(
-                            RichText::new(format!("{glyph} {message}"))
-                                .size(11.5)
-                                .color(if is_problem { p.danger } else { p.fg_secondary }),
-                        );
+                        let (rect, _) = ui.allocate_exact_size(galley.size(), Sense::hover());
+                        ui.painter().galley(rect.min, galley.clone(), color);
                     });
             });
         ctx.request_repaint_after(Duration::from_secs_f32(remaining as f32));
@@ -1828,8 +1855,11 @@ impl EloraApp {
 
     /// Rebuilds the server's notes from what the connection last reported, keeping the body the
     /// editor is currently showing for the open note so typing is never yanked backwards.
-    fn apply_library(&mut self) {
+    /// `editing_title` says the caret is in the title field of the note on screen: that title is
+    /// being typed, so a copy arriving from the server does not replace it.
+    fn apply_library(&mut self, editing_title: bool) {
         let metas = self.collab.notes().to_vec();
+        let selected = self.selected_id.clone();
         let live: BTreeSet<String> = metas.iter().map(|m| m.id.clone()).collect();
         self.notes
             .retain(|n| !self.remote_ids.contains(&n.id) || live.contains(&n.id));
@@ -1841,7 +1871,9 @@ impl EloraApp {
                 .unwrap_or_else(Utc::now);
             match self.notes.iter_mut().find(|n| n.id == meta.id) {
                 Some(note) => {
-                    note.title = meta.title;
+                    if !(editing_title && selected.as_deref() == Some(meta.id.as_str())) {
+                        note.title = meta.title;
+                    }
                     note.folder = meta.folder;
                     note.explicit_tags = meta.tags;
                     note.pinned = meta.pinned;
@@ -2074,7 +2106,8 @@ impl EloraApp {
         }
 
         if library_changed {
-            self.apply_library();
+            let editing_title = ctx.memory(|m| m.has_focus(Id::new(TITLE_FIELD_ID)));
+            self.apply_library(editing_title);
         }
     }
 
@@ -4260,10 +4293,18 @@ impl EloraApp {
                         });
                     }
                     ui.horizontal(|ui| {
+                        let field_id = Id::new("elora_share_name_input");
+                        // The hint says what the field is for, so it goes away as soon as the
+                        // caret is in it instead of sitting under the name being typed.
+                        let hint = match ui.memory(|m| m.has_focus(field_id)) {
+                            true => "",
+                            false => "Their name, e.g. Goku",
+                        };
                         let field = ui.add_enabled(
                             mine,
                             TextEdit::singleline(&mut self.share_input)
-                                .hint_text("Their name, e.g. SuperSaiyan")
+                                .id(field_id)
+                                .hint_text(hint)
                                 .desired_width(200.0),
                         );
                         let entered = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
@@ -4921,7 +4962,7 @@ impl EloraApp {
         ui.add_space(8.0);
 
         // Title Field
-        let title_id = Id::new("elora_note_title_input");
+        let title_id = Id::new(TITLE_FIELD_ID);
         let title_resp = ui.add(
             TextEdit::singleline(&mut self.notes[note_idx].title)
                 .id(title_id)
@@ -7344,6 +7385,74 @@ mod tests {
         out
     }
 
+    /// A notice is not laid out at the width of the one before it. "Connecting…" followed by
+    /// the reason it failed used to squeeze the long message into a column one word wide.
+    #[test]
+    fn test_a_long_notice_after_a_short_one_stays_a_line() {
+        let (mut app, _dir, _root) = app_with_note("");
+        let ctx = egui::Context::default();
+        ThemeMode::Obsidian.apply(&ctx, &ColorOverrides::default(), 15.0, 0.0);
+        let p = ThemeMode::Obsidian.palette();
+
+        let frame = |app: &mut EloraApp, window: f32| -> (Vec2, Vec2) {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(window, 700.0))),
+                ..Default::default()
+            };
+            let out = ctx.run(raw, |ctx| {
+                egui::SidePanel::left("side")
+                    .exact_width(SIDEBAR_WIDTH)
+                    .show(ctx, |_ui| {});
+                egui::CentralPanel::default().show(ctx, |_ui| {});
+                app.status_toast(ctx, &p);
+            });
+            let mut text = Vec2::ZERO;
+            for clipped in &out.shapes {
+                if let egui::Shape::Text(drawn) = &clipped.shape {
+                    text = drawn.galley.size();
+                }
+            }
+            let area = ctx
+                .memory(|m| m.area_rect(Id::new("elora_status_toast")))
+                .map(|rect| rect.size())
+                .unwrap_or_default();
+            (text, area)
+        };
+
+        let long = "could not connect to 192.168.1.20: connection refused (os error 111)";
+        for window in [1200.0_f32, 720.0, 640.0] {
+            // A short notice first, the way a connection starts, then the long one.
+            app.status_message = Some("Connecting…".to_string());
+            app.status_shown = None;
+            frame(&mut app, window);
+            frame(&mut app, window);
+
+            app.status_message = Some(long.to_string());
+            app.status_shown = None;
+            frame(&mut app, window);
+            let (text, area) = frame(&mut app, window);
+
+            assert!(
+                text.x > 300.0,
+                "in a {window}-wide window the notice is still a column: {text:?}"
+            );
+            assert!(
+                text.y <= 40.0,
+                "in a {window}-wide window the notice wrapped into {} rows",
+                (text.y / 16.0).round()
+            );
+            assert!(
+                area.x > 300.0 && area.x <= TOAST_MAX_WIDTH + 1.0,
+                "in a {window}-wide window the notice box is {area:?}"
+            );
+            assert!(
+                area.y < 60.0,
+                "in a {window}-wide window the notice box is {area:?}"
+            );
+            app.status_message = None;
+        }
+    }
+
     /// The name is on screen because it is public; the identifier never is, even in Settings, so
     /// nobody reading over a shoulder gets the key. The two also have to fit side by side in the
     /// settings column.
@@ -7672,6 +7781,91 @@ mod tests {
         assert!(reworded.contains("![first](wide.png){width=460}"));
         assert!(reworded.contains("```\n![inline](wide.png)\n```"));
         assert!(reworded.ends_with("![second](wide.png)"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The corner drag in the real note view: the pane's column, its scroll area, and the
+    /// write-back into the note's text. A size chosen by dragging has to end up in the note.
+    #[test]
+    fn test_dragging_a_picture_in_the_note_view_writes_the_size_into_the_note() {
+        let (mut app, dir, root) = app_with_note("A picture:\n\n![wide](wide.png)\n\nAfter it.");
+        image::RgbaImage::from_pixel(400, 200, image::Rgba([90, 150, 210, 255]))
+            .save(root.join("wide.png"))
+            .unwrap();
+        app.view_mode = EditorViewMode::Preview;
+
+        let ctx = egui::Context::default();
+        install_tabler_icons(&ctx);
+        ThemeMode::Obsidian.apply(&ctx, &ColorOverrides::default(), 15.0, 0.0);
+        let p = ThemeMode::Obsidian.palette();
+        let mut handle = Pos2::ZERO;
+        let frame = |events: Vec<egui::Event>, app: &mut EloraApp, handle: &mut Pos2| {
+            app.note_images.handles.clear();
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, 900.0))),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.render_editor(ui, &p, 700.0, 0.0);
+                });
+            });
+            *handle = app
+                .note_images
+                .handles
+                .first()
+                .map(|(_, rect)| rect.center())
+                .unwrap_or(Pos2::ZERO);
+        };
+
+        frame(Vec::new(), &mut app, &mut handle);
+        assert_ne!(handle, Pos2::ZERO, "the picture was drawn with its handle");
+        frame(
+            vec![
+                egui::Event::PointerMoved(handle),
+                egui::Event::PointerButton {
+                    pos: handle,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+            &mut app,
+            &mut handle,
+        );
+        let moved_to = handle + Vec2::new(60.0, 0.0);
+        frame(
+            vec![egui::Event::PointerMoved(moved_to)],
+            &mut app,
+            &mut handle,
+        );
+        // The size reaches the note while the picture is still being dragged, so letting go
+        // late, or not at all, cannot throw it away.
+        assert!(
+            app.notes
+                .iter()
+                .any(|note| note.body.contains("![wide](wide.png){width=460}")),
+            "the size should be in the note before the pointer is released",
+        );
+        frame(
+            vec![egui::Event::PointerButton {
+                pos: moved_to,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+            &mut app,
+            &mut handle,
+        );
+
+        assert!(
+            app.notes
+                .iter()
+                .any(|note| note.body.contains("![wide](wide.png){width=460}")),
+            "the dragged size should be in the note, got {:?}",
+            app.notes.iter().map(|note| &note.body).collect::<Vec<_>>()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

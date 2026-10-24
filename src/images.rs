@@ -21,6 +21,9 @@ const MAX_CACHED: usize = 128;
 const MIN_WIDTH: f32 = 48.0;
 /// Side of the square that sits in a picture's bottom-right corner to resize it.
 const HANDLE: f32 = 13.0;
+/// How far past the picture the corner still counts as the handle. People drag the corner
+/// itself, and usually a point or two beside it, so the resize starts there too.
+const GRAB_SLACK: f32 = 6.0;
 
 /// Where an image in a note points.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -228,7 +231,8 @@ impl NoteImages {
             self.handles.push((key.clone(), handle));
             self.drawn.push((key.clone(), response.rect));
         }
-        let grab = ui.interact(handle, response.id.with("resize"), Sense::drag());
+        let grab_area = egui::Rect::from_min_max(handle.min, handle.max + Vec2::splat(GRAB_SLACK));
+        let grab = ui.interact(grab_area, response.id.with("resize"), Sense::drag());
         let hovering = response.hovered() || grab.hovered() || grab.dragged();
         if hovering || grab.dragged() {
             ui.ctx().set_cursor_icon(CursorIcon::ResizeNwSe);
@@ -241,18 +245,21 @@ impl NoteImages {
                 width: size.x,
             });
         }
+        // The size is handed back while the picture is still being dragged, not when the pointer
+        // is let go: the note carries the size from the first moment it differs, so the size the
+        // user dragged to is never lost if the release never reaches this corner.
+        let mut kept = None;
         if let Some(resizing) = self.resizing.as_mut().filter(|r| r.key == key) {
             if grab.dragged() {
                 resizing.width = (resizing.start + grab.drag_delta().x).clamp(MIN_WIDTH, available);
+                let rounded = resizing.width.round().max(MIN_WIDTH) as u32;
+                if width != Some(rounded) {
+                    kept = Some(rounded);
+                }
             }
         }
         if grab.drag_stopped() {
-            if let Some(resizing) = self.resizing.take() {
-                let kept = resizing.width.round().max(MIN_WIDTH) as u32;
-                if width != Some(kept) {
-                    return Some(kept);
-                }
-            }
+            self.resizing = None;
         }
 
         if hovering {
@@ -272,7 +279,7 @@ impl NoteImages {
             painter.galley(chip.min + Vec2::new(4.0, 2.0), galley, p.fg_primary);
         }
 
-        None
+        kept
     }
 
     /// How many pictures are ready to draw. Used by the tests to prove a preview really decoded
@@ -618,7 +625,11 @@ mod tests {
             &mut kept,
             &mut handle,
         );
-        assert_eq!(kept, None, "nothing is written until the drag is released");
+        assert_eq!(
+            kept,
+            Some(460),
+            "the size is handed back while the picture is still being dragged"
+        );
         frame(
             vec![egui::Event::PointerButton {
                 pos: moved_to,
@@ -634,7 +645,177 @@ mod tests {
         assert_eq!(
             kept,
             Some(460),
-            "the picture should ask for the width it was dragged to"
+            "the picture should keep the width it was dragged to"
+        );
+    }
+
+    /// The same drag, but inside the scrolling preview pane the note is really drawn in.
+    #[test]
+    fn test_dragging_the_corner_handle_inside_the_scrolling_preview() {
+        let dir = temp_dir("resize-scroll");
+        std::fs::write(dir.join("wide.png"), png_of(400, 200)).unwrap();
+        let ctx = Context::default();
+        let mut images = NoteImages::default();
+        let mut kept: Option<u32> = None;
+        let mut handle = egui::Pos2::ZERO;
+
+        let frame = |events: Vec<egui::Event>,
+                     images: &mut NoteImages,
+                     kept: &mut Option<u32>,
+                     handle: &mut egui::Pos2| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 480.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let origin = ui.next_widget_position();
+                            if let Some(width) = images.show(
+                                ui,
+                                "wide.png",
+                                "a wide picture",
+                                None,
+                                Some(&dir),
+                                &ThemeMode::Obsidian.palette(),
+                            ) {
+                                *kept = Some(width);
+                            }
+                            *handle = origin + Vec2::new(400.0, 200.0) - Vec2::splat(HANDLE / 2.0);
+                            // Enough text under the picture that the pane really scrolls.
+                            ui.add_space(2000.0);
+                        });
+                });
+            });
+        };
+
+        frame(Vec::new(), &mut images, &mut kept, &mut handle);
+        frame(
+            vec![
+                egui::Event::PointerMoved(handle),
+                egui::Event::PointerButton {
+                    pos: handle,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+            &mut images,
+            &mut kept,
+            &mut handle,
+        );
+        let moved_to = handle + Vec2::new(60.0, 0.0);
+        frame(
+            vec![egui::Event::PointerMoved(moved_to)],
+            &mut images,
+            &mut kept,
+            &mut handle,
+        );
+        frame(
+            vec![egui::Event::PointerButton {
+                pos: moved_to,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+            &mut images,
+            &mut kept,
+            &mut handle,
+        );
+
+        assert_eq!(
+            kept,
+            Some(460),
+            "the handle should work the same inside the scrolling preview"
+        );
+    }
+
+    /// The corner people drag is the picture's own, and they aim just beside it as often as on
+    /// it. That still grabs the handle.
+    #[test]
+    fn test_the_corner_is_grabbable_a_little_outside_the_picture() {
+        let dir = temp_dir("resize-beside");
+        std::fs::write(dir.join("wide.png"), png_of(400, 200)).unwrap();
+        let ctx = Context::default();
+        let mut images = NoteImages::default();
+        let mut kept: Option<u32> = None;
+        let mut grab = egui::Pos2::ZERO;
+
+        let frame = |events: Vec<egui::Event>,
+                     images: &mut NoteImages,
+                     kept: &mut Option<u32>,
+                     grab: &mut egui::Pos2| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 480.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let origin = ui.next_widget_position();
+                    if let Some(width) = images.show(
+                        ui,
+                        "wide.png",
+                        "a wide picture",
+                        None,
+                        Some(&dir),
+                        &ThemeMode::Obsidian.palette(),
+                    ) {
+                        *kept = Some(width);
+                    }
+                    // Three points past the corner of a 400 × 200 picture, not on it.
+                    *grab = origin + Vec2::new(400.0, 200.0) + Vec2::new(3.0, 3.0);
+                });
+            });
+        };
+
+        frame(Vec::new(), &mut images, &mut kept, &mut grab);
+        frame(
+            vec![
+                egui::Event::PointerMoved(grab),
+                egui::Event::PointerButton {
+                    pos: grab,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+            &mut images,
+            &mut kept,
+            &mut grab,
+        );
+        let moved_to = grab + Vec2::new(60.0, 0.0);
+        frame(
+            vec![egui::Event::PointerMoved(moved_to)],
+            &mut images,
+            &mut kept,
+            &mut grab,
+        );
+        frame(
+            vec![egui::Event::PointerButton {
+                pos: moved_to,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+            &mut images,
+            &mut kept,
+            &mut grab,
+        );
+
+        assert_eq!(
+            kept,
+            Some(460),
+            "the picture should resize when the corner is grabbed just outside"
         );
     }
 

@@ -1116,9 +1116,12 @@ impl Library {
         }
         let meta = self.notes.get_mut(id).expect("the note was just found");
         if let Some(title) = title {
-            let title = title.trim();
-            if !title.is_empty() {
-                meta.title = title.to_string();
+            // The title is kept exactly as it was typed. Trimming it here used to eat the space
+            // at the end of a half-typed word: the trimmed title came back to the typist, the
+            // space vanished, and the next letter joined the previous word. Only a title with
+            // nothing in it is refused, so a note never loses its name.
+            if !title.trim().is_empty() {
+                meta.title = title;
             }
         }
         match folder {
@@ -1764,6 +1767,67 @@ mod tests {
         let reloaded = Library::load(&dir).unwrap();
         let note = reloaded.notes.get(&meta.id).unwrap();
         assert_eq!(note.folder, None, "the folder should have been cleared");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A title is typed one character at a time, so the server keeps it exactly as it arrives.
+    /// Trimming it used to swallow the space at the end of a half-typed word and send the
+    /// trimmed title back, which joined the next word onto the last one.
+    #[test]
+    fn test_a_typing_title_keeps_the_space_at_its_end() {
+        let dir = temp_dir("title-space");
+        let mut library = Library::load(&dir).unwrap();
+        let meta = library
+            .create(
+                "Untitled",
+                None,
+                Vec::new(),
+                "",
+                false,
+                None,
+                "nox",
+                &key_of("nox"),
+            )
+            .unwrap();
+
+        for typed in ["Meeting", "Meeting ", "Meeting n", "Meeting notes "] {
+            library
+                .update(
+                    &meta.id,
+                    &key_of("nox"),
+                    Some(typed.to_string()),
+                    Field::Keep,
+                    None,
+                    None,
+                    None,
+                    Field::Keep,
+                )
+                .unwrap();
+            assert_eq!(
+                library.notes[&meta.id].title, typed,
+                "the title is kept as it was typed"
+            );
+        }
+        // And it is still there after a restart, trailing space and all.
+        drop(library);
+        let reloaded = Library::load(&dir).unwrap();
+        assert_eq!(reloaded.notes[&meta.id].title, "Meeting notes ");
+
+        // A title with nothing in it is not a title: the note keeps the one it had.
+        let mut library = reloaded;
+        library
+            .update(
+                &meta.id,
+                &key_of("nox"),
+                Some("   ".to_string()),
+                Field::Keep,
+                None,
+                None,
+                None,
+                Field::Keep,
+            )
+            .unwrap();
+        assert_eq!(library.notes[&meta.id].title, "Meeting notes ");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
