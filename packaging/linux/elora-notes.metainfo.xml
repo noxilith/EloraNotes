@@ -25,6 +25,26 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.9.24" date="2026-10-23">
+      <description>
+        <p>
+          The note list is now one line per note, the way a file list reads, so about twice as many
+          fit in the sidebar; hovering a row shows when it was last edited and its tags, and
+          Settings → Tall note cards brings back the fuller card with its date, tag row and
+          optional preview. A glyph beside the filter menu orders each group by last edited,
+          created or title, the window remembers its size, place and maximised state, and the
+          command palette can list every wiki link that points at no note.
+        </p>
+        <p>
+          Writing got a table of keys: Tab and Shift+Tab step the caret's line in and out, and a
+          selection moves every line it touches. Enter starts the next line laid out like the one
+          above it — the same indentation, list marker, quote depth and nesting, with numbers
+          counting on and done tasks coming back unchecked — and takes an empty item or quote
+          away one level at a time. Shift+Enter stays inside the item or quote instead of starting
+          a new one, lining its words up under them.
+        </p>
+      </description>
+    </release>
     <release version="0.9.23" date="2026-10-23">
       <description>
         <p>

@@ -68,6 +68,39 @@ impl NoteTemplate {
     }
 }
 
+/// What the notes inside each sidebar group are ordered by. The default is the order a notes
+/// app shows: what was written last sits at the top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteSort {
+    #[default]
+    Updated,
+    Created,
+    Title,
+}
+
+impl NoteSort {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Updated => "Last edited",
+            Self::Created => "Created",
+            Self::Title => "Title",
+        }
+    }
+}
+
+/// The window as it was left: its size, where it sat, and whether it was maximised. A maximised
+/// window keeps the size and position it had before, so restoring it does not open it huge.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WindowState {
+    pub width: f32,
+    pub height: f32,
+    pub x: f32,
+    pub y: f32,
+    #[serde(default)]
+    pub maximized: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub theme_name: String,
@@ -107,6 +140,20 @@ pub struct AppSettings {
     /// colour picker have. It only changes what other people see in a shared note.
     #[serde(default)]
     pub peer_color: Option<[u8; 3]>,
+
+    /// Whether a note in the sidebar is drawn as the tall card — icon, title, date and tags — or
+    /// as the one-line row a file list uses. Off by default: the compact row fits twice as many
+    /// notes in the same list.
+    #[serde(default)]
+    pub roomy_cards: bool,
+
+    /// What the notes inside each sidebar group are ordered by.
+    #[serde(default)]
+    pub sort: NoteSort,
+
+    /// Where the window was last left, so the next launch opens in the same place.
+    #[serde(default)]
+    pub window: Option<WindowState>,
 
     /// Whether a card in the sidebar shows the first lines of its note. Off unless it is turned
     /// on, which leaves just the title, the date and the tags, so more notes fit in the list.
@@ -157,6 +204,9 @@ impl Default for AppSettings {
             display_name: String::new(),
             identifier: String::new(),
             peer_color: None,
+            roomy_cards: false,
+            sort: NoteSort::default(),
+            window: None,
             show_card_previews: default_show_card_previews(),
         }
     }
@@ -1592,6 +1642,38 @@ And a number #123 should be ignored, while #valid_tag is kept.";
         assert!(text.contains("\"note_previews\":true"), "{text}");
         let back: AppSettings = serde_json::from_str(&text).unwrap();
         assert!(back.show_card_previews);
+    }
+
+    /// A settings file from before the compact list existed opens in the compact style, sorts by
+    /// last edited and has no window to restore; the chosen style, sort and window round-trip.
+    #[test]
+    fn test_cards_sort_and_window_start_compact_and_are_kept() {
+        let old = serde_json::json!({
+            "theme_name": "Obsidian",
+            "show_formatting_bar": true,
+        });
+        let settings: AppSettings = serde_json::from_value(old).unwrap();
+        assert!(!settings.roomy_cards, "the compact list is the default");
+        assert_eq!(settings.sort, NoteSort::Updated);
+        assert_eq!(settings.window, None);
+
+        let chosen = AppSettings {
+            roomy_cards: true,
+            sort: NoteSort::Title,
+            window: Some(WindowState {
+                width: 1200.0,
+                height: 800.0,
+                x: 40.0,
+                y: 60.0,
+                maximized: true,
+            }),
+            ..AppSettings::default()
+        };
+        let text = serde_json::to_string(&chosen).unwrap();
+        let back: AppSettings = serde_json::from_str(&text).unwrap();
+        assert!(back.roomy_cards);
+        assert_eq!(back.sort, NoteSort::Title);
+        assert_eq!(back.window, chosen.window);
     }
 
     /// A colour picked for a person's caret is kept, and a settings file from before colours

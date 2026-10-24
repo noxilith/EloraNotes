@@ -27,11 +27,21 @@ fn main() -> eframe::Result<()> {
     // vsync so they stay tear-free.
     let vsync = std::env::var_os("WAYLAND_DISPLAY").is_none();
 
-    let viewport = egui::ViewportBuilder::default()
+    let mut viewport = egui::ViewportBuilder::default()
         .with_title("EloraNotes")
         .with_app_id("elora-notes")
         .with_inner_size([1060.0, 700.0])
         .with_min_inner_size([640.0, 420.0]);
+    // The window the last run left behind. A size below the minimum is asked for at the minimum,
+    // since the window manager would only clamp it after the title bar had been placed.
+    if let Some(window) = storage.load_settings().window {
+        viewport = viewport
+            .with_inner_size([window.width.max(640.0), window.height.max(420.0)])
+            .with_maximized(window.maximized);
+        if !window.maximized {
+            viewport = viewport.with_position([window.x, window.y]);
+        }
+    }
     // Windows and macOS take the taskbar icon from the running window; the Linux builds also
     // install a .desktop file and hicolor icons, which is what compositors look up by app id.
     let viewport = match window_icon() {

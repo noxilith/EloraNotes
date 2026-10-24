@@ -134,6 +134,7 @@ pub mod icon {
     pub const DOTS: &str = "\u{ea95}";
     pub const CHEVRON_RIGHT: &str = "\u{ea61}";
     pub const CHEVRON_DOWN: &str = "\u{ea5f}";
+    pub const CHEVRON_UP: &str = "\u{ea62}";
     pub const BOOK: &str = "\u{ea39}";
     pub const BOOKMARK: &str = "\u{ea3a}";
     pub const BULB: &str = "\u{ea51}";

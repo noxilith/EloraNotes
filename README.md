@@ -15,7 +15,9 @@ A calm, minimalistic cross-platform desktop notes application written in **Rust*
 - **Bundled Tabler Icons**: Crisp outline glyphs from the Tabler Icons font embedded directly into the binary (`assets/tabler-icons.ttf`) across navigation, search, tags, checklists, formatting actions, and the command palette.
 - **Stackable Inline Formatting**: Markers nest, so `**==bold inside a glow==**`, `==**glow then bold**==`, `***==triple stack==***` and `{color:#4ECDFF}**colored bold**{/color}` each render as one run carrying several styles at once. Headings are drawn in the bold face and can carry highlights and text colors too.
 - **Collapsible Folders**: File any note into a folder from the header's folder menu (or type a new folder name there). Folders group the sidebar, show their note count, and fold shut with a click so the list takes less room. A folder's notes sit stepped in from its header, so the list shows what belongs to what. Fold state is remembered between runs. New notes join the folder of the note you had open.
-- **Compact Sidebar with One Filter Menu**: The sidebar is a fixed, narrow panel — only the accent **New** button shares the logo row, while the daily note, command palette and settings actions sit in a footer row at the bottom. Note cards show just the title, date and tags, so more notes fit at once; **Settings** can add a preview line of each note to them. The notes folder path and keyboard shortcuts are listed in Settings. Every tag filter lives in a single **Filter** dropdown with counts, so a growing tag list never pushes the note list down.
+- **Compact Sidebar with One Filter Menu**: The sidebar is a fixed, narrow panel — only the accent **New** button shares the logo row, while the daily note, command palette and settings actions sit in a footer row at the bottom. Each note is one line — a small icon and its title, the way a file list reads — so about twice as many fit at once; hovering a row shows when it was last edited and its tags. **Settings → Tall note cards** brings back the taller card with a date and tag row, with an optional preview line of the note's text. The small glyph beside the **Filter** dropdown orders every group by last edited, created or title. The notes folder path and keyboard shortcuts are listed in Settings, and every tag filter lives in that one **Filter** dropdown with counts, so a growing tag list never pushes the note list down.
+- **Find in a Note (`Ctrl+F`)**: Looks through the note in front of you rather than the whole vault, washing every match and stepping through them with Enter, Shift+Enter or the arrows beside the count. `Ctrl+Shift+F` keeps the vault search in the sidebar.
+- **Links That Lead Nowhere**: **Show Links That Lead Nowhere** in the command palette lists every `[[link]]` pointing at a note that does not exist, with the notes it was found in; clicking one writes that note and opens it.
 - **Updates Itself from GitHub Releases**: On launch EloraNotes asks GitHub for the latest release. If one is newer it offers to download it, starts the downloaded build once to confirm it runs on this machine, then installs it the way this copy was installed and restarts. **Settings → Updates** has the same thing on demand: check, then **Update and restart**. "Later" dismisses the launch prompt for that run, and a failed launch-time check (for example while offline) stays silent.
 - **Plain Markdown on Disk**: Every note is stored as a portable `.md` file with lightweight YAML frontmatter (`title`, `folder`, `pinned`, `trashed`, `tags`, `icon`, `created_at`, `updated_at`).
 - **Command Palette & Quick Switcher (`Ctrl+K`)**: Fuzzy-jump to any note, create notes from templates, switch color themes, or toggle views without leaving the keyboard.
@@ -28,7 +30,7 @@ A calm, minimalistic cross-platform desktop notes application written in **Rust*
 - **Safe Trash & Restore**: Deleted notes move to the **Trash** view first where they can be restored with one click or permanently deleted.
 - **Import Markdown Folder**: Copy `.md` files into an `Import` folder inside your notes folder, then run **Import Markdown From Import Folder** from the Command Palette. Each file becomes a new note with its frontmatter kept. Importing the same files twice creates duplicates.
 - **Shared Notes (Google-Docs style)**: Point the app at an EloraNotes server — address, port, password — and the server's notes appear in the sidebar under its name. Everyone with a note open sees each other's edits as they are typed, with a coloured caret and a name tag at each person's cursor, a dot on the note's card while somebody is in it, and a presence list above the editor. Each person has a **name** everyone sees and a secret **identifier** only the server ever reads, both from Settings, which is what lets a note be closed to everybody but its owner or opened to a few names on it.
-- **Color Themes**: Choose **Obsidian** (dark slate), **Paper** (warm light), **Nordic** (arctic dark), **Matcha** (soft sage light), or **Matugen** (colors from your wallpaper). Preferences and folded folders persist automatically.
+- **Color Themes**: Choose **Obsidian** (dark slate), **Paper** (warm light), **Nordic** (arctic dark), **Matcha** (soft sage light), or **Matugen** (colors from your wallpaper). Preferences, folded folders and the window's own size and place persist automatically, so the next launch opens where the last one was left.
 
 ## Install
 
@@ -416,12 +418,16 @@ The Flatpak reads the same `~/.config/elora/matugen.json` (mounted read-only), s
 | `Ctrl+K` / `Cmd+K` | Open Command Palette & Quick Note Switcher |
 | `Ctrl+N` / `Cmd+N` | Create a new blank note |
 | `Ctrl+D` / `Cmd+D` | Open or create today's Daily Note |
-| `Ctrl+F` / `Cmd+F` | Focus quick search bar |
+| `Ctrl+F` / `Cmd+F` | Find in the open note |
+| `Ctrl+Shift+F` | Search all notes |
 | `Ctrl+P` / `Cmd+P` | Pin or unpin the current note |
 | `Ctrl+E` / `Cmd+E` | Toggle Markdown Preview mode |
 | `Ctrl+Shift+E` | Toggle side-by-side Split Editor + Live Preview |
 | `Ctrl+\` / `Cmd+\` | Toggle distraction-free Focus Mode |
-| `Esc` | Close Command Palette or clear active filters |
+| `Tab` / `Shift+Tab` | Indent or unindent the caret's line, or every line a selection touches |
+| `Enter` | Start the next line with every quote and list marker the line is nested in, however deep; `1.` counts on to `2.`, a done task comes back unchecked, and Enter on an empty item or quote takes away just that level |
+| `Shift+Enter` | Stay inside the same list item or quote: a new line with no repeated marker, lined up under the item's text |
+| `Esc` | Close the find bar or Command Palette, or clear active filters |
 
 ## License
 

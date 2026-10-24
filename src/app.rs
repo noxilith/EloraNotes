@@ -11,7 +11,7 @@ use crate::net::{NoteMeta, PresenceUser};
 use crate::people::MIN_IDENTIFIER;
 use crate::storage::{
     extract_wiki_links, fuzzy_subsequence, normalize_folder, normalize_tag, sort_notes,
-    AppSettings, Note, NoteStorage, NoteTemplate,
+    AppSettings, Note, NoteSort, NoteStorage, NoteTemplate, WindowState,
 };
 use crate::theme::{ColorOverrides, Palette, ThemeMode};
 use crate::update::{self, Release, UpdateOffer};
@@ -58,8 +58,6 @@ const SIDEBAR_INDENT_STEP: i8 = 12;
 /// cards instead of painting over them. The bar is 9 points wide at its widest.
 const SIDEBAR_SCROLL_STRIP: f32 = 10.0;
 
-/// Height kept free at the bottom of the sidebar for the footer action row.
-const SIDEBAR_FOOTER_HEIGHT: f32 = 34.0;
 /// Space kept between the footer icons and the panel's right edge.
 const FOOTER_ICON_INSET: f32 = 5.0;
 
@@ -119,6 +117,27 @@ pub struct EloraApp {
     focus_mode: bool,
     view_mode: EditorViewMode,
     show_formatting_bar: bool,
+    /// Whether notes in the sidebar are the tall cards — icon, title, date and tags — instead of
+    /// the one-line rows. Off by default: the list then reads like a file list and fits twice as
+    /// many notes in the same height.
+    roomy_cards: bool,
+    /// What the notes inside each sidebar group are ordered by.
+    sort: NoteSort,
+    /// Where the window is now, so the next launch opens in the same place and size.
+    window_state: Option<WindowState>,
+    /// Whether the find bar is open over the editor.
+    find_open: bool,
+    /// What is being looked for in the open note.
+    find_query: String,
+    /// Which match is the one being stepped through, counted from zero.
+    find_current: usize,
+    /// Set when the match changed, so the editor moves its caret there and scrolls it into view.
+    find_pending_jump: bool,
+    /// One frame's request to put the caret in the find field.
+    focus_find_next_frame: bool,
+    /// The report of wiki links that point at no note, and whether its window is open.
+    broken_links_open: bool,
+    broken_links: Vec<(String, Vec<String>)>,
     /// Whether note cards in the sidebar show a line of the note's text under the title.
     show_card_previews: bool,
     /// Current glow highlight color `[R, G, B]` selected by the user's color picker.
@@ -303,6 +322,7 @@ enum PaletteCommand {
     ImportMarkdown,
     ToggleGraph,
     SwitchSection(SidebarSection),
+    BrokenLinks,
 }
 
 #[derive(Clone, Copy)]
@@ -404,6 +424,16 @@ impl EloraApp {
             focus_mode: false,
             view_mode: EditorViewMode::Split,
             show_formatting_bar: settings.show_formatting_bar,
+            roomy_cards: settings.roomy_cards,
+            sort: settings.sort,
+            window_state: settings.window,
+            find_open: false,
+            find_query: String::new(),
+            find_current: 0,
+            find_pending_jump: false,
+            focus_find_next_frame: false,
+            broken_links_open: false,
+            broken_links: Vec::new(),
             show_card_previews: settings.show_card_previews,
             highlight_rgb: settings.highlight_rgb,
             colors: settings.colors,
@@ -478,6 +508,9 @@ impl EloraApp {
         let settings = AppSettings {
             theme_name: self.theme.name().to_string(),
             show_formatting_bar: self.show_formatting_bar,
+            roomy_cards: self.roomy_cards,
+            sort: self.sort,
+            window: self.window_state,
             show_card_previews: self.show_card_previews,
             highlight_rgb: self.highlight_rgb,
             text_color_rgb: self.text_color_rgb,
@@ -813,6 +846,40 @@ impl EloraApp {
         }
     }
 
+    /// Follows the window as it moves and resizes, so what is written down at exit is the window
+    /// as it was. A maximised window keeps the size and place it had before: restoring it with
+    /// the maximised size would open it full-screen the next time it is un-maximised.
+    fn track_window(&mut self, ctx: &egui::Context) {
+        let (inner, outer, maximized) = ctx.input(|i| {
+            let viewport = i.viewport();
+            (
+                viewport.inner_rect,
+                viewport.outer_rect,
+                viewport.maximized.unwrap_or(false),
+            )
+        });
+        let Some(inner) = inner else {
+            return;
+        };
+        let mut state = self.window_state.unwrap_or(WindowState {
+            width: inner.width(),
+            height: inner.height(),
+            x: inner.min.x,
+            y: inner.min.y,
+            maximized,
+        });
+        state.maximized = maximized;
+        if !maximized {
+            state.width = inner.width();
+            state.height = inner.height();
+            if let Some(outer) = outer {
+                state.x = outer.min.x;
+                state.y = outer.min.y;
+            }
+        }
+        self.window_state = Some(state);
+    }
+
     /// Settings window: theme, text size, color overrides, glow strength and layout toggles.
     fn settings_window(&mut self, ctx: &egui::Context) {
         if !self.show_settings {
@@ -929,6 +996,14 @@ impl EloraApp {
                             .checkbox(&mut self.show_formatting_bar, "Show formatting bar")
                             .changed();
                         changed |= ui
+                            .checkbox(&mut self.roomy_cards, "Tall note cards")
+                            .on_hover_text(
+                                "Off, each note is one line — a small icon and its title — so about \
+                                 twice as many fit in the list; hovering shows the date and tags. \
+                                 On brings back the taller card with its date and tag row.",
+                            )
+                            .changed();
+                        changed |= ui
                             .checkbox(
                                 &mut self.show_card_previews,
                                 "Show a preview line on note cards",
@@ -936,7 +1011,7 @@ impl EloraApp {
                             .on_hover_text(
                                 "Off leaves just the title, date and tags, so the sidebar's \
                                  cards are shorter and more notes fit at once. On adds the first \
-                                 lines of each note.",
+                                 lines of each note. Only the tall cards have room for it.",
                             )
                             .changed();
                         ui.separator();
@@ -971,6 +1046,11 @@ impl EloraApp {
                                     ("Right-click selection", "Format / glow highlight"),
                                     ("Ctrl+B", "Bold"),
                                     ("Ctrl+Shift+H", "Glow highlight"),
+                                    ("Tab / Shift+Tab", "Indent / unindent"),
+                                    ("Enter", "Keep list & indentation"),
+                                    ("Shift+Enter", "Stay inside quote / item"),
+                                    ("Ctrl+F", "Find in the open note"),
+                                    ("Ctrl+Shift+F", "Search all notes"),
                                     ("Ctrl+K", "Command palette & quick switcher"),
                                 ] {
                                     ui.label(
@@ -1007,6 +1087,8 @@ impl EloraApp {
                             self.highlight_rgb = d.highlight_rgb;
                             self.show_formatting_bar = d.show_formatting_bar;
                             self.show_card_previews = d.show_card_previews;
+                            self.roomy_cards = d.roomy_cards;
+                            self.sort = d.sort;
                             self.peer_color = d.peer_color;
                             self.collab.set_color(self.peer_color);
                             changed = true;
@@ -2330,6 +2412,31 @@ impl EloraApp {
         indices
     }
 
+    /// Every `[[wiki link]]` in a live note that points at no note, with the titles of the notes
+    /// that link to it. The same rule the link itself follows decides whether it is broken, so
+    /// the report never lists something the link would have opened.
+    fn collect_broken_links(&self) -> Vec<(String, Vec<String>)> {
+        let live: Vec<&Note> = self.notes.iter().filter(|n| !n.trashed).collect();
+        let mut broken: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for note in &live {
+            for target in extract_wiki_links(&note.body) {
+                let found = live.iter().any(|n| {
+                    n.title.eq_ignore_ascii_case(&target)
+                        || n.display_title().eq_ignore_ascii_case(&target)
+                });
+                if found {
+                    continue;
+                }
+                let from = note.display_title();
+                let entry = broken.entry(target).or_default();
+                if !entry.iter().any(|title| title.eq_ignore_ascii_case(&from)) {
+                    entry.push(from);
+                }
+            }
+        }
+        broken.into_iter().collect()
+    }
+
     /// Opens the note graph, or closes it when it is already open. Builds the links once on open.
     fn toggle_graph(&mut self) {
         if self.graph.is_some() {
@@ -2363,6 +2470,79 @@ impl EloraApp {
 
     /// Floating window that places live notes on a ring and draws a line per wiki link.
     /// Clicking a note's dot opens that note.
+    /// The report of links that lead nowhere: one row per missing note, with where the links
+    /// were found. Clicking one creates that note and opens it, which is the fix for most of them.
+    fn broken_links_window(&mut self, ctx: &egui::Context) {
+        if !self.broken_links_open {
+            return;
+        }
+        let defaults = self.theme.palette();
+        let mut open = true;
+        let mut clicked: Option<String> = None;
+        egui::Window::new("Links that lead nowhere")
+            .id(Id::new("elora_broken_links"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                if self.broken_links.is_empty() {
+                    ui.label(
+                        RichText::new("Every [[link]] in your notes leads to a note that exists.")
+                            .size(12.0)
+                            .color(defaults.fg_secondary),
+                    );
+                    return;
+                }
+                ui.label(
+                    RichText::new(format!(
+                        "{} note{} linked to but not written yet. Click one to write it.",
+                        self.broken_links.len(),
+                        if self.broken_links.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    ))
+                    .size(11.5)
+                    .color(defaults.fg_muted),
+                );
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .max_height(320.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for (target, from) in &self.broken_links {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(format!("{} [[{target}]]", icon::LINK))
+                                            .size(12.0)
+                                            .color(defaults.accent),
+                                    )
+                                    .frame(false),
+                                )
+                                .on_hover_text("Create this note and open it")
+                                .clicked()
+                            {
+                                clicked = Some(target.clone());
+                            }
+                            let mut list = String::from("linked from ");
+                            list.push_str(&from.join(", "));
+                            ui.label(RichText::new(list).size(10.5).color(defaults.fg_muted));
+                            ui.add_space(3.0);
+                        }
+                    });
+            });
+        if let Some(target) = clicked {
+            self.broken_links_open = false;
+            self.open_or_create_wiki_link(&target);
+        }
+        if !open {
+            self.broken_links_open = false;
+        }
+    }
+
     fn graph_window(&mut self, ctx: &egui::Context) {
         let Some(nodes) = self.graph.as_ref() else {
             return;
@@ -2793,6 +2973,10 @@ impl EloraApp {
             PaletteCommand::ExportVaultHtml => self.export_html(true),
             PaletteCommand::ImportMarkdown => self.import_markdown(),
             PaletteCommand::ToggleGraph => self.toggle_graph(),
+            PaletteCommand::BrokenLinks => {
+                self.broken_links = self.collect_broken_links();
+                self.broken_links_open = true;
+            }
             PaletteCommand::CopyNoteMarkdown => {
                 if let Some(id) = &self.selected_id {
                     if let Some(note) = self.notes.iter().find(|n| &n.id == id) {
@@ -2812,6 +2996,7 @@ impl EloraApp {
         let mut create_note = false;
         let mut open_daily = false;
         let mut focus_search = false;
+        let mut open_find = false;
         let mut toggle_palette = false;
         let mut toggle_focus = false;
         let mut toggle_preview = false;
@@ -2837,8 +3022,12 @@ impl EloraApp {
             if i.consume_key(egui::Modifiers::COMMAND, Key::D) {
                 open_daily = true;
             }
-            if i.consume_key(egui::Modifiers::COMMAND, Key::F) {
+            // Ctrl+F looks in the note in front of you, the way an editor does; the vault search
+            // keeps the shifted version of the shortcut.
+            if i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::F) {
                 focus_search = true;
+            } else if i.consume_key(egui::Modifiers::COMMAND, Key::F) {
+                open_find = true;
             }
             if i.consume_key(egui::Modifiers::COMMAND, Key::Backslash) {
                 toggle_focus = true;
@@ -2880,6 +3069,10 @@ impl EloraApp {
                 self.command_palette_open = false;
                 return;
             }
+            if self.find_open {
+                self.find_open = false;
+                return;
+            }
             self.confirm_delete_id = None;
             if !self.search_query.is_empty()
                 || self.active_tag.is_some()
@@ -2900,6 +3093,22 @@ impl EloraApp {
         if focus_search {
             self.focus_mode = false;
             self.focus_search_next_frame = true;
+        }
+        if open_find {
+            // A note has to be open for there to be anything to look in.
+            if self.selected_id.is_some() {
+                self.focus_mode = false;
+                // The matches are drawn by the editor, so a preview-only window opens the split
+                // view to give the find bar something to sit above.
+                if self.view_mode == EditorViewMode::Preview {
+                    self.view_mode = EditorViewMode::Split;
+                }
+                self.find_open = true;
+                self.focus_find_next_frame = true;
+                self.find_pending_jump = true;
+            } else {
+                self.focus_search_next_frame = true;
+            }
         }
         if toggle_focus {
             self.focus_mode = !self.focus_mode;
@@ -3038,6 +3247,12 @@ impl EloraApp {
                 "Import Markdown From Import Folder",
                 "",
                 PaletteCommand::ImportMarkdown,
+            ),
+            (
+                icon::LINK,
+                "Show Links That Lead Nowhere",
+                "broken wiki link missing note",
+                PaletteCommand::BrokenLinks,
             ),
             (
                 icon::LINK,
@@ -3331,7 +3546,9 @@ impl EloraApp {
         }
     }
 
-    fn render_sidebar(&mut self, ui: &mut Ui, p: &Palette) {
+    /// Draws the sidebar and returns the rect the footer took at the bottom of it, so a test can
+    /// check that the icons stay inside the panel.
+    fn render_sidebar(&mut self, ui: &mut Ui, p: &Palette) -> Rect {
         ui.add_space(4.0);
 
         ui.horizontal(|ui| {
@@ -3396,7 +3613,7 @@ impl EloraApp {
                                 .frame(false)
                                 .desired_width(f32::INFINITY),
                         )
-                        .on_hover_text("Search notes or #tags (Ctrl+F)");
+                        .on_hover_text("Search notes or #tags (Ctrl+Shift+F)");
                     if self.focus_search_next_frame {
                         resp.request_focus();
                         self.focus_search_next_frame = false;
@@ -3473,12 +3690,31 @@ impl EloraApp {
             }
         });
 
+        // The tag filter and the sort chooser share one row: the filter takes what is left after
+        // the sort button, and the button stays put whether or not there are tags to filter.
         let all_tags = self.all_tags_with_counts();
-        if !all_tags.is_empty() && self.sidebar_section != SidebarSection::Trash {
+        if self.sidebar_section != SidebarSection::Trash {
             ui.add_space(4.0);
-            ui.scope(|ui| {
-                ui.set_max_width((ui.available_width() - 6.0).max(80.0));
-                tag_filter_menu(ui, p, &all_tags, &mut self.active_tag);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(5.0, 4.0);
+                // What the sort button needs: its glyph and padding, the gap before it, and the
+                // arrow the combo box puts on the right of its own field.
+                const SORT_RESERVE: f32 = 52.0;
+                let room = (ui.available_width() - SORT_RESERVE).max(80.0);
+                if !all_tags.is_empty() {
+                    ui.scope(|ui| {
+                        ui.set_max_width(room);
+                        tag_filter_menu(ui, p, &all_tags, &mut self.active_tag);
+                    });
+                } else {
+                    ui.add_space((ui.available_width() - SORT_RESERVE).max(0.0));
+                }
+                let mut chosen = self.sort;
+                sort_menu(ui, p, &mut chosen);
+                if chosen != self.sort {
+                    self.sort = chosen;
+                    self.persist_settings();
+                }
             });
         }
 
@@ -3486,13 +3722,28 @@ impl EloraApp {
         ui.separator();
         ui.add_space(4.0);
 
-        // Reserve room for the footer so the note list never scrolls under it.
-        let list_height = (ui.available_height() - SIDEBAR_FOOTER_HEIGHT).max(80.0);
+        // The footer is drawn first, from the bottom of the panel upwards, so it ends exactly at
+        // the panel's edge and the list above it gets exactly what is left. A height reserved in
+        // advance for it was a few points short, which pushed the icons past the bottom of the
+        // panel and cut them off; the same shortfall let the list run underneath them.
+        let content = ui.max_rect();
+        let mut footer_ui = ui.new_child(
+            UiBuilder::new()
+                .id_salt("elora_sidebar_footer")
+                .max_rect(content)
+                .layout(Layout::bottom_up(Align::Min)),
+        );
+        self.sidebar_footer(&mut footer_ui, p);
+        // The scroll area clips its content to the height it is given, so the list's own edge is
+        // the footer's top: the cards can never be drawn over the icons.
+        let list_height = (footer_ui.min_rect().top() - ui.next_widget_position().y).max(80.0);
         self.render_sidebar_notes(ui, p, list_height);
+        footer_ui.min_rect()
+    }
 
+    /// The row of icons along the bottom of the sidebar, drawn upwards from the panel's edge.
+    fn sidebar_footer(&mut self, ui: &mut Ui, p: &Palette) {
         ui.add_space(2.0);
-        ui.separator();
-        ui.add_space(3.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -3556,7 +3807,114 @@ impl EloraApp {
                 }
             });
         });
+        // Bottom-up, so this line sits above the icons and keeps them off the list.
+        ui.add_space(3.0);
+        ui.separator();
         ui.add_space(2.0);
+    }
+
+    /// The find bar: a field, how many matches the note holds, and the two arrows that step
+    /// through them. The editor paints every match, so the count always matches what is seen.
+    fn find_bar(&mut self, ui: &mut Ui, p: &Palette, note_idx: usize) {
+        let body = &self.notes[note_idx].body;
+        let hits = find_matches(body, &self.find_query);
+        if self.find_current >= hits.len() {
+            self.find_current = hits.len().saturating_sub(1);
+        }
+        let field_id = Id::new("elora_find_input");
+
+        Frame::new()
+            .fill(p.bg_elevated)
+            .stroke(Stroke::new(1.0_f32, p.border))
+            .corner_radius(CornerRadius::same(6))
+            .inner_margin(Margin::symmetric(9, 4))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 3.0);
+                    ui.label(RichText::new(icon::SEARCH).size(13.0).color(p.fg_muted));
+                    let field = ui.add(
+                        TextEdit::singleline(&mut self.find_query)
+                            .id(field_id)
+                            .hint_text("Find in this note…")
+                            .frame(false)
+                            .desired_width(180.0),
+                    );
+                    if self.focus_find_next_frame {
+                        field.request_focus();
+                        self.focus_find_next_frame = false;
+                    }
+                    if field.changed() {
+                        self.find_current = 0;
+                        self.find_pending_jump = true;
+                    }
+                    // Enter steps to the next match and shift+Enter back, then the field takes
+                    // the caret again so the next press works too.
+                    if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        let backwards = ui.input(|i| i.modifiers.shift);
+                        self.step_find(backwards, hits.len());
+                        self.focus_find_next_frame = true;
+                    }
+
+                    let count = if self.find_query.is_empty() {
+                        String::new()
+                    } else if hits.is_empty() {
+                        "No matches".to_string()
+                    } else {
+                        format!("{} of {}", self.find_current + 1, hits.len())
+                    };
+                    ui.label(RichText::new(count).size(10.5).color(p.fg_muted));
+
+                    if !hits.is_empty() {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(icon::CHEVRON_UP)
+                                        .size(12.5)
+                                        .color(p.fg_secondary),
+                                )
+                                .frame(false),
+                            )
+                            .on_hover_text("Previous match (Shift+Enter)")
+                            .clicked()
+                        {
+                            self.step_find(true, hits.len());
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(icon::CHEVRON_DOWN)
+                                        .size(12.5)
+                                        .color(p.fg_secondary),
+                                )
+                                .frame(false),
+                            )
+                            .on_hover_text("Next match (Enter)")
+                            .clicked()
+                        {
+                            self.step_find(false, hits.len());
+                        }
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new(icon::X).size(12.0).color(p.fg_muted))
+                                .frame(false),
+                        )
+                        .on_hover_text("Close find (Esc)")
+                        .clicked()
+                    {
+                        self.find_open = false;
+                    }
+                });
+            });
+    }
+
+    /// Moves to the next or previous match, wrapping around at either end.
+    fn step_find(&mut self, backwards: bool, total: usize) {
+        if total == 0 {
+            return;
+        }
+        self.find_current = step_match(self.find_current, total, backwards);
+        self.find_pending_jump = true;
     }
 
     /// The scrollable note list: pinned notes, folder groups, unfiled notes, then trash.
@@ -3587,11 +3945,12 @@ impl EloraApp {
             return;
         }
 
-        let pinned_indices: Vec<usize> = filtered
+        let mut pinned_indices: Vec<usize> = filtered
             .iter()
             .copied()
             .filter(|&i| self.notes[i].pinned && !self.notes[i].trashed)
             .collect();
+        self.sort_group(&mut pinned_indices);
 
         // Unpinned live notes are grouped by folder; trashed notes are listed flat. The
         // server's notes get their own group, titled with the server's name.
@@ -3618,6 +3977,13 @@ impl EloraApp {
             }
         }
         folder_groups.sort_by_key(|(name, _)| name.to_lowercase());
+        // Each group follows the sort the sidebar is set to; the groups themselves keep their
+        // own order, so folders stay alphabetical and pinned notes stay on top.
+        self.sort_group(&mut unfiled);
+        self.sort_group(&mut trashed_indices);
+        for (_, list) in &mut folder_groups {
+            self.sort_group(list);
+        }
 
         // Filtering a folder should reveal its matches instead of hiding them.
         let folders_open = !self.search_query.trim().is_empty() || self.active_tag.is_some();
@@ -3649,6 +4015,7 @@ impl EloraApp {
                             &mut picked,
                             0,
                             self.show_card_previews,
+                            self.roomy_cards,
                         );
                         ui.add_space(4.0);
                     }
@@ -3674,8 +4041,12 @@ impl EloraApp {
                             ui.add_space(2.0);
                             // The shared library keeps folders of its own, laid out the same
                             // way as local ones.
-                            let (remote_unfiled, remote_folders) =
+                            let (mut remote_unfiled, mut remote_folders) =
                                 split_by_folder(&self.notes, &remote_indices);
+                            self.sort_group(&mut remote_unfiled);
+                            for (_, list) in &mut remote_folders {
+                                self.sort_group(list);
+                            }
                             if !remote_unfiled.is_empty() {
                                 render_note_rows(
                                     ui,
@@ -3688,6 +4059,7 @@ impl EloraApp {
                                     &mut picked,
                                     SIDEBAR_INDENT_STEP,
                                     self.show_card_previews,
+                                    self.roomy_cards,
                                 );
                             }
                             for (name, indices) in &remote_folders {
@@ -3712,6 +4084,7 @@ impl EloraApp {
                                         &mut picked,
                                         SIDEBAR_INDENT_STEP * 2,
                                         self.show_card_previews,
+                                        self.roomy_cards,
                                     );
                                 }
                             }
@@ -3737,6 +4110,7 @@ impl EloraApp {
                                 &mut picked,
                                 SIDEBAR_INDENT_STEP,
                                 self.show_card_previews,
+                                self.roomy_cards,
                             );
                             ui.add_space(3.0);
                         }
@@ -3757,6 +4131,7 @@ impl EloraApp {
                             &mut picked,
                             0,
                             self.show_card_previews,
+                            self.roomy_cards,
                         );
                     }
 
@@ -3773,6 +4148,7 @@ impl EloraApp {
                             &mut picked,
                             0,
                             self.show_card_previews,
+                            self.roomy_cards,
                         );
                     }
                 });
@@ -3795,6 +4171,35 @@ impl EloraApp {
             } else {
                 self.active_tag = Some(tag);
             }
+        }
+    }
+
+    /// Orders one group's notes the way the sidebar is set to. A search keeps its relevance
+    /// order: the best match first is what somebody searching is looking for, not the newest.
+    fn sort_group(&self, indices: &mut [usize]) {
+        if !self.search_query.trim().is_empty() {
+            return;
+        }
+        let notes = &self.notes;
+        match self.sort {
+            NoteSort::Updated => indices.sort_by(|&a, &b| {
+                notes[b]
+                    .updated_at
+                    .cmp(&notes[a].updated_at)
+                    .then_with(|| notes[a].title.cmp(&notes[b].title))
+            }),
+            NoteSort::Created => indices.sort_by(|&a, &b| {
+                notes[b]
+                    .created_at
+                    .cmp(&notes[a].created_at)
+                    .then_with(|| notes[a].title.cmp(&notes[b].title))
+            }),
+            NoteSort::Title => indices.sort_by(|&a, &b| {
+                notes[a]
+                    .title
+                    .to_lowercase()
+                    .cmp(&notes[b].title.to_lowercase())
+            }),
         }
     }
 
@@ -4046,6 +4451,69 @@ impl EloraApp {
 
         self.last_seen_body = Some((note_id.clone(), self.notes[note_idx].body.clone()));
 
+        // Tab steps the caret's line in by one level and Shift+Tab takes a level away; a
+        // selection moves every line it touches. The key is taken here, before the field reads
+        // its events, so the editor never leaves a literal tab in the Markdown (the preview
+        // would show it as an uneven gap) and the focus stays in the note.
+        let mut indented = false;
+        if ui.memory(|m| m.has_focus(editor_id)) {
+            let dedent = ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, Key::Tab));
+            let indent =
+                !dedent && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Tab));
+            if indent || dedent {
+                let body = self.notes[note_idx].body.clone();
+                let mut state = TextEdit::load_state(ui.ctx(), editor_id).unwrap_or_default();
+                // The live cursor is the one in the field's state, not the one written down at
+                // the end of the last frame: a character typed since then has moved it on.
+                let (start, end, forward) = caret_range(&state, body.chars().count());
+                let (new_body, new_start, new_end) = indent_selection(&body, start, end, dedent);
+                if new_body != body {
+                    let range = if forward {
+                        CCursorRange::two(CCursor::new(new_start), CCursor::new(new_end))
+                    } else {
+                        CCursorRange::two(CCursor::new(new_end), CCursor::new(new_start))
+                    };
+                    state.cursor.set_char_range(Some(range));
+                    state.store(ui.ctx(), editor_id);
+                    self.notes[note_idx].body = new_body;
+                    self.notes[note_idx].updated_at = Utc::now();
+                    self.last_editor_selection = Some((new_start, new_end));
+                    self.last_editor_caret = Some(if forward { new_end } else { new_start });
+                    *needs_save = true;
+                    indented = true;
+                }
+            }
+        }
+
+        // Enter starts the next line the way the current one is laid out: the same indentation,
+        // and the same list marker so a list carries on. Shift+Enter stays inside the item and
+        // lines up under its words instead of starting a new one. The key is taken before the
+        // field reads its events, so this is the only line break that gets inserted.
+        if ui.memory(|m| m.has_focus(editor_id)) {
+            // Shift+Enter is asked for first, because the plain check matches it as well.
+            let soft = ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, Key::Enter));
+            let hard = !soft && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
+            if soft || hard {
+                let body = self.notes[note_idx].body.clone();
+                let mut state = TextEdit::load_state(ui.ctx(), editor_id).unwrap_or_default();
+                let (start, end, _) = caret_range(&state, body.chars().count());
+                let (new_body, caret) = if soft {
+                    newline_continuing_item(&body, start, end)
+                } else {
+                    newline_with_prefix(&body, start, end)
+                };
+                state
+                    .cursor
+                    .set_char_range(Some(CCursorRange::one(CCursor::new(caret))));
+                state.store(ui.ctx(), editor_id);
+                self.notes[note_idx].body = new_body;
+                self.notes[note_idx].updated_at = Utc::now();
+                self.last_editor_selection = Some((caret, caret));
+                self.last_editor_caret = Some(caret);
+                *needs_save = true;
+            }
+        }
+
         // Ctrl+V with a picture on the clipboard puts the picture into the note, the way a word
         // processor pastes a screenshot. The key is not consumed: when the clipboard holds text
         // instead, the editor pastes it exactly as before.
@@ -4098,6 +4566,23 @@ impl EloraApp {
                 ui.fonts(|f| f.layout_job(job))
             };
 
+        // Stepping to a match moves the caret there before the field is drawn, so the editor
+        // knows where it is when it decides what to reveal.
+        if self.find_open && self.find_pending_jump {
+            self.find_pending_jump = false;
+            let hits = find_matches(&self.notes[note_idx].body, &self.find_query);
+            if let Some(&byte) = hits.get(self.find_current) {
+                let char_index = self.notes[note_idx].body[..byte].chars().count();
+                // A note that has not been drawn yet has no state of its own; a fresh one is
+                // made so the caret is already at the match when the field is first shown.
+                let mut state = TextEdit::load_state(ui.ctx(), editor_id).unwrap_or_default();
+                state
+                    .cursor
+                    .set_char_range(Some(CCursorRange::one(CCursor::new(char_index))));
+                state.store(ui.ctx(), editor_id);
+            }
+        }
+
         let available = ui.available_size();
         let output = TextEdit::multiline(&mut self.notes[note_idx].body)
             .id(editor_id)
@@ -4109,7 +4594,16 @@ impl EloraApp {
             .desired_width(f32::INFINITY)
             .min_size(Vec2::new(available.x, min_height))
             .layouter(&mut layouter)
+            // Tab indents inside the note instead of moving to the next widget.
+            .lock_focus(true)
             .show(ui);
+
+        // The first Tab after the note is clicked is spent before the field has told egui to
+        // keep the key for itself, so egui may have moved on to the next widget while the line
+        // was stepping in. The caret stays in the note: that is the whole point of the key.
+        if indented {
+            output.response.request_focus();
+        }
 
         if let Some(cursor_range) = output.cursor_range {
             let a = cursor_range.primary.ccursor.index;
@@ -4156,6 +4650,44 @@ impl EloraApp {
             self.caret_in_view = false;
         }
         self.reveal_caret = false;
+
+        // Find in note: every match gets a wash, and the one being stepped through a stronger
+        // one. The editor has no focus of its own while somebody types in the find field, so the
+        // matches are painted here rather than left to a text selection.
+        if self.find_open && !self.find_query.is_empty() {
+            let hits = find_matches(&self.notes[note_idx].body, &self.find_query);
+            if !hits.is_empty() {
+                let current = self.find_current.min(hits.len() - 1);
+                let chars = self.find_query.chars().count();
+                let painter = ui.painter();
+                let mut current_rect = Rect::NOTHING;
+                for (index, &byte) in hits.iter().enumerate() {
+                    let start = self.notes[note_idx].body[..byte].chars().count();
+                    let strong = index == current;
+                    let alpha = if strong { 110 } else { 45 };
+                    let rect = paint_find_match(
+                        painter,
+                        &output.galley,
+                        output.galley_pos,
+                        start,
+                        chars,
+                        Color32::from_rgba_unmultiplied(
+                            p.accent.r(),
+                            p.accent.g(),
+                            p.accent.b(),
+                            alpha,
+                        ),
+                    );
+                    if strong {
+                        current_rect = rect;
+                    }
+                }
+                // Stepping past the edge of the view brings that match into it.
+                if current_rect != Rect::NOTHING && !ui.clip_rect().contains_rect(current_rect) {
+                    ui.scroll_to_rect(current_rect.expand(40.0), Some(Align::Center));
+                }
+            }
+        }
 
         // Other people's carets, drawn where their cursor sits in the text.
         if !peers.is_empty() {
@@ -5121,6 +5653,12 @@ impl EloraApp {
             }
         }
 
+        // Find in note, above the editor it belongs to.
+        if self.find_open && self.view_mode != EditorViewMode::Preview {
+            self.find_bar(ui, p, note_idx);
+            ui.add_space(2.0);
+        }
+
         // Formatting Bar (works on current selection + includes Glowing Highlight & Color Picker)
         if self.show_formatting_bar && self.view_mode != EditorViewMode::Preview {
             ui.add_space(4.0);
@@ -5509,7 +6047,14 @@ impl eframe::App for EloraApp {
             .to_normalized_gamma_f32()
     }
 
+    /// The window's place and size are written down as it is closed, so the next launch opens
+    /// where this one was left instead of at the size the app was first built with.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.persist_settings();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.track_window(ctx);
         self.handle_shortcuts(ctx);
         self.poll_update();
         self.poll_collab(ctx);
@@ -5517,6 +6062,7 @@ impl eframe::App for EloraApp {
         self.sync_open_note();
         self.settings_window(ctx);
         self.graph_window(ctx);
+        self.broken_links_window(ctx);
         self.trust_prompt_window(ctx);
         let p = self.theme.palette_with(&self.colors, self.glow_strength);
 
@@ -5919,6 +6465,27 @@ fn tag_filter_menu(
         });
 }
 
+/// The sort chooser at the right of the filter row: a small glyph that opens the three orders,
+/// with the current one ticked.
+fn sort_menu(ui: &mut Ui, p: &Palette, sort: &mut NoteSort) {
+    ui.menu_button(
+        RichText::new(icon::ARROWS_SORT)
+            .size(13.0)
+            .color(p.fg_secondary),
+        |ui| {
+            ui.set_min_width(150.0);
+            for order in [NoteSort::Updated, NoteSort::Created, NoteSort::Title] {
+                if ui.selectable_label(*sort == order, order.name()).clicked() {
+                    *sort = order;
+                    ui.close_menu();
+                }
+            }
+        },
+    )
+    .response
+    .on_hover_text(format!("Sort notes — now by {}", sort.name()));
+}
+
 /// A long tag is elided so the filter button always stays inside the sidebar width.
 fn short_tag(tag: &str, max_chars: usize) -> String {
     if tag.chars().count() <= max_chars {
@@ -5973,25 +6540,36 @@ fn folder_header_with(
     };
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing = Vec2::new(6.0, 2.0);
+        // The count that follows is measured first, so a long folder or server name is elided
+        // into the width that is actually left instead of pushing the count out of the panel.
+        let count_text = count.to_string();
+        let count_width = ui.fonts(|fonts| {
+            fonts
+                .layout_no_wrap(count_text.clone(), FontId::proportional(10.5), p.fg_muted)
+                .size()
+                .x
+        });
         let resp = ui
-            .add(
-                egui::Button::new(
-                    RichText::new(format!("{chevron} {glyph} {name}"))
-                        .size(11.5)
-                        .color(p.fg_secondary),
+            .scope(|ui| {
+                ui.set_max_width((ui.available_width() - count_width - 8.0).max(48.0));
+                ui.add(
+                    egui::Button::new(
+                        RichText::new(format!("{chevron} {glyph} {name}"))
+                            .size(11.5)
+                            .color(p.fg_secondary),
+                    )
+                    .truncate()
+                    .frame(false),
                 )
-                .frame(false),
-            )
-            .on_hover_text(if collapsed {
-                "Expand folder"
-            } else {
-                "Collapse folder"
-            });
-        ui.label(
-            RichText::new(count.to_string())
-                .size(10.5)
-                .color(p.fg_muted),
-        );
+                .on_hover_text(if collapsed {
+                    "Expand folder"
+                } else {
+                    "Collapse folder"
+                })
+            })
+            .inner;
+
+        ui.label(RichText::new(count_text).size(10.5).color(p.fg_muted));
         resp
     })
     .inner
@@ -6281,6 +6859,7 @@ fn render_note_rows(
     picked: &mut CardSelection,
     indent: i8,
     show_preview: bool,
+    roomy: bool,
 ) {
     indented(ui, indent, |ui| {
         for &idx in indices {
@@ -6288,15 +6867,18 @@ fn render_note_rows(
             let is_selected = selected_id == Some(note.id.as_str());
             let watchers: &[PresenceUser] =
                 collab.map(|c| c.watchers(&note.id)).unwrap_or_default();
-            if let Some(action) =
+            let action = if roomy {
                 render_note_card(ui, note, is_selected, p, query, watchers, show_preview)
-            {
+            } else {
+                render_compact_note_row(ui, note, is_selected, p, watchers)
+            };
+            if let Some(action) = action {
                 match action {
                     CardAction::SelectNote(id) => picked.note_id = Some(id),
                     CardAction::FilterTag(t) => picked.tag = Some(t),
                 }
             }
-            ui.add_space(3.0);
+            ui.add_space(if roomy { 3.0 } else { 1.0 });
         }
     });
 }
@@ -6347,11 +6929,17 @@ fn render_note_card(
                         }
                     });
                 ui.label(RichText::new(glyph).size(13.0).color(color));
-                ui.label(
-                    RichText::new(note.display_title())
-                        .strong()
-                        .size(13.5)
-                        .color(p.fg_primary),
+                // Truncated rather than allowed to run on: a long title in a one-line row used
+                // to widen the whole card past the sidebar, cutting its right edge and every
+                // card below it off at the panel's border.
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(note.display_title())
+                            .strong()
+                            .size(13.5)
+                            .color(p.fg_primary),
+                    )
+                    .truncate(),
                 );
                 // A brush per person with this note open, in the colour of their caret.
                 if !watchers.is_empty() {
@@ -6422,6 +7010,568 @@ fn render_note_card(
     }
 
     action
+}
+
+/// The one-line row the sidebar shows by default: a small glyph and the title, the way a file
+/// list reads. Two rows fit in the height one tall card takes, and the date and tags move into
+/// the row's hover text so nothing competes with the title for attention.
+fn render_compact_note_row(
+    ui: &mut Ui,
+    note: &Note,
+    is_selected: bool,
+    p: &Palette,
+    watchers: &[PresenceUser],
+) -> Option<CardAction> {
+    let height = ui.fonts(|fonts| fonts.row_height(&FontId::proportional(12.5))) + 6.0;
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
+    let fill = if is_selected {
+        p.bg_selected
+    } else if response.hovered() {
+        p.bg_hover
+    } else {
+        Color32::TRANSPARENT
+    };
+    if fill != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, CornerRadius::same(4), fill);
+    }
+
+    let (glyph, color) = note
+        .icon
+        .as_deref()
+        .and_then(tabler_glyph)
+        .map(|g| (g, p.accent))
+        .unwrap_or_else(|| {
+            if note.pinned {
+                (icon::PINNED, p.pin_color)
+            } else {
+                (icon::FILE_TEXT, p.fg_muted)
+            }
+        });
+
+    let brushes = watchers.len().min(3);
+    let mut row = ui.new_child(
+        UiBuilder::new()
+            .max_rect(rect.shrink2(Vec2::new(7.0, 0.0)))
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    row.spacing_mut().item_spacing = Vec2::new(6.0, 0.0);
+    row.label(RichText::new(glyph).size(12.0).color(color));
+    // The title is elided into the room the brushes do not need, so a long name never pushes
+    // them out of the row.
+    let reserve = if brushes > 0 {
+        brushes as f32 * 12.0 + 4.0
+    } else {
+        0.0
+    };
+    let title_width = (row.available_width() - reserve).max(24.0);
+    row.scope(|ui| {
+        ui.set_max_width(title_width);
+        ui.add(
+            egui::Label::new(
+                RichText::new(note.display_title())
+                    .size(12.5)
+                    .color(if is_selected { p.accent } else { p.fg_primary }),
+            )
+            .truncate(),
+        );
+    });
+    if brushes > 0 {
+        row.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            for user in watchers.iter().take(brushes) {
+                let [r, g, b] = user.color;
+                ui.label(
+                    RichText::new(icon::BRUSH)
+                        .size(10.0)
+                        .color(Color32::from_rgb(r, g, b)),
+                )
+                .on_hover_text(format!("{} is editing this note", user.name));
+            }
+        });
+    }
+
+    // What the tall card shows in its own rows: when it was last edited, and its tags.
+    let tags = note.all_tags();
+    let mut hint = note.formatted_updated();
+    if !tags.is_empty() {
+        hint.push_str("  ·  ");
+        hint.push_str(
+            &tags
+                .iter()
+                .take(4)
+                .map(|tag| format!("#{tag}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
+    if response.on_hover_text(hint).clicked() {
+        Some(CardAction::SelectNote(note.id.clone()))
+    } else {
+        None
+    }
+}
+
+/// One level of indentation, in spaces. Markdown nests lists and code with spaces, and a literal
+/// tab would show up in the preview as an uneven gap.
+pub const INDENT: &str = "    ";
+
+/// The byte offset of a character index, or the end of the text when it is past that.
+fn char_to_byte(text: &str, index: usize) -> usize {
+    text.char_indices()
+        .nth(index)
+        .map_or(text.len(), |(byte, _)| byte)
+}
+
+/// How far the line starting at `line_start` runs into leading spaces.
+fn leading_spaces(body: &str, line_start: usize) -> usize {
+    let line = &body[line_start..];
+    let end = line.find('\n').unwrap_or(line.len());
+    let line = &line[..end];
+    line.len() - line.trim_start_matches(' ').len()
+}
+
+/// Adds one level of indentation to every line the selection touches, or takes one away when
+/// `dedent` is set. With no selection the indent goes in at the caret and shift+Tab takes a level
+/// off the front of the caret's line. Returns the new text and the character range to select.
+pub fn indent_selection(
+    body: &str,
+    start: usize,
+    end: usize,
+    dedent: bool,
+) -> (String, usize, usize) {
+    let (start, end) = (start.min(end), start.max(end));
+    let start_byte = char_to_byte(body, start);
+    let end_byte = char_to_byte(body, end);
+    let level = INDENT.chars().count();
+
+    // No selection: one indent at the caret, or one level off the front of its line.
+    if start == end {
+        let line_start = body[..start_byte].rfind('\n').map_or(0, |at| at + 1);
+        let line_start_char = body[..line_start].chars().count();
+        if dedent {
+            let take = leading_spaces(body, line_start).min(INDENT.len());
+            let mut out = String::with_capacity(body.len());
+            out.push_str(&body[..line_start]);
+            out.push_str(&body[line_start + take..]);
+            // The caret follows the text it was in, never stepping back past the line's start.
+            let removed_before_caret = take.min(start - line_start_char);
+            let caret = start - removed_before_caret;
+            return (out, caret, caret);
+        }
+        let mut out = String::with_capacity(body.len() + INDENT.len());
+        out.push_str(&body[..start_byte]);
+        out.push_str(INDENT);
+        out.push_str(&body[start_byte..]);
+        let caret = start + level;
+        return (out, caret, caret);
+    }
+
+    let first_line = body[..start_byte].rfind('\n').map_or(0, |at| at + 1);
+    // A selection that stops at the very start of a line does not touch that line.
+    let last_touched = if end_byte > first_line && body[..end_byte].ends_with('\n') {
+        end_byte - 1
+    } else {
+        end_byte
+    };
+    let last_line = body[..last_touched].rfind('\n').map_or(0, |at| at + 1);
+    let mut line_char = body[..first_line].chars().count();
+
+    let mut out = String::with_capacity(body.len() + 8);
+    out.push_str(&body[..first_line]);
+    let mut at = first_line;
+    // How far the start and the end of the selection have to travel. Every indented line
+    // before them moves them on by a level; only the line the caret itself is on can hold it
+    // back, when the caret sits among the spaces being taken away.
+    let mut start_shift: isize = 0;
+    let mut end_shift: isize = 0;
+    let shifted = |delta: isize, room: usize| -> isize {
+        if delta >= 0 {
+            delta
+        } else {
+            -((-delta).min(room as isize))
+        }
+    };
+    while at <= last_line && at < body.len() {
+        let line_end = body[at..].find('\n').map_or(body.len(), |i| at + i + 1);
+        let line = &body[at..line_end];
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        let newline = &line[content.len()..];
+        let delta: isize = if dedent {
+            let take = (content.len() - content.trim_start_matches(' ').len()).min(INDENT.len());
+            out.push_str(&content[take..]);
+            -(take as isize)
+        } else if content.is_empty() {
+            // An empty line has nothing to step in, and indenting it would only leave trailing
+            // spaces behind.
+            out.push_str(content);
+            0
+        } else {
+            out.push_str(INDENT);
+            out.push_str(content);
+            level as isize
+        };
+        if delta != 0 {
+            if at <= start_byte {
+                start_shift = shifted(delta, start - line_char);
+            }
+            if at < end_byte {
+                end_shift += shifted(delta, end - line_char);
+            }
+        }
+        out.push_str(newline);
+        line_char += line.chars().count();
+        at = line_end;
+    }
+    out.push_str(&body[at..]);
+
+    let new_start = (start as isize + start_shift).max(0) as usize;
+    let new_end = (end as isize + end_shift).max(new_start as isize) as usize;
+    (out, new_start, new_end)
+}
+
+/// The live selection in the editor's own state as `(start, end, forward)`, or `fallback` when
+/// the field has not stored a caret yet.
+fn caret_range(state: &egui::text_edit::TextEditState, fallback: usize) -> (usize, usize, bool) {
+    state
+        .cursor
+        .char_range()
+        .map(|range| {
+            let (a, b) = (range.primary.index, range.secondary.index);
+            (a.min(b), a.max(b), a <= b)
+        })
+        .unwrap_or((fallback, fallback, true))
+}
+
+/// The parts of a list item: its indentation, its marker (a bullet with any task box, or a
+/// number and its punctuation, each with the space after it) and the text that follows. `None`
+/// when the line is not a list item.
+fn list_item(line: &str) -> Option<(&str, &str, &str)> {
+    let indent_len = line.len() - line.trim_start_matches([' ', '\t']).len();
+    let (indent, rest) = line.split_at(indent_len);
+
+    for bullet in ["- ", "* ", "+ "] {
+        if let Some(after) = rest.strip_prefix(bullet) {
+            for task_box in ["[ ] ", "[x] ", "[X] "] {
+                if let Some(content) = after.strip_prefix(task_box) {
+                    let marker = bullet.len() + task_box.len();
+                    return Some((indent, &rest[..marker], content));
+                }
+            }
+            return Some((indent, &rest[..bullet.len()], after));
+        }
+    }
+
+    let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits > 0 {
+        let after_digits = &rest[digits..];
+        let separator = after_digits
+            .chars()
+            .next()
+            .filter(|c| *c == '.' || *c == ')');
+        if let Some(separator) = separator {
+            if let Some(content) = after_digits[separator.len_utf8()..].strip_prefix(' ') {
+                let marker = digits + separator.len_utf8() + 1;
+                return Some((indent, &rest[..marker], content));
+            }
+        }
+    }
+    None
+}
+
+/// The first `>` marker of a line — with up to three spaces before it and the space after it —
+/// and what follows. One marker only: nesting is `> > `, and each later level is read as the
+/// line is taken apart, so it can be kept or dropped on its own.
+fn block_quote(line: &str) -> Option<(&str, &str)> {
+    let bytes = line.as_bytes();
+    let mut probe = 0;
+    let mut spaces = 0;
+    while probe < bytes.len() && bytes[probe] == b' ' && spaces < 3 {
+        probe += 1;
+        spaces += 1;
+    }
+    if probe >= bytes.len() || bytes[probe] != b'>' {
+        return None;
+    }
+    probe += 1;
+    if probe < bytes.len() && bytes[probe] == b' ' {
+        probe += 1;
+    }
+    Some(line.split_at(probe))
+}
+
+/// The marker a list item hands to the line under it: the same bullet, a task back to unchecked,
+/// and a number counted on.
+fn next_marker(marker: &str) -> String {
+    if marker.contains("[x]") || marker.contains("[X]") {
+        marker.replace("[x]", "[ ]").replace("[X]", "[ ]")
+    } else if marker.starts_with(|c: char| c.is_ascii_digit()) {
+        let digits: String = marker.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let next = digits.parse::<u64>().unwrap_or(1).saturating_add(1);
+        format!("{next}{}", &marker[digits.len()..])
+    } else {
+        marker.to_string()
+    }
+}
+
+/// One leading piece of a line: a block quote's marker, or a list item's indentation and marker.
+/// A line nests them, so `- > - item` starts with a bullet, then a quote, then another bullet.
+#[derive(Debug, Clone, Copy)]
+enum Piece<'a> {
+    Quote(&'a str),
+    Marker { indent: &'a str, marker: &'a str },
+}
+
+impl Piece<'_> {
+    /// The piece exactly as it was written.
+    fn text(self) -> String {
+        match self {
+            Self::Quote(quote) => quote.to_string(),
+            Self::Marker { indent, marker } => format!("{indent}{marker}"),
+        }
+    }
+
+    /// The same piece on the line underneath: a quote stays as it is, and a list item hands the
+    /// next line its following marker.
+    fn continued(self) -> String {
+        match self {
+            Self::Quote(quote) => quote.to_string(),
+            Self::Marker { indent, marker } => format!("{indent}{}", next_marker(marker)),
+        }
+    }
+}
+
+/// Parts a line into the markers it starts with, however deeply they are nested, and the text
+/// after them.
+fn prefix_pieces(line: &str) -> (Vec<Piece<'_>>, &str) {
+    let mut pieces = Vec::new();
+    let mut rest = line;
+    loop {
+        if let Some((quote, after)) = block_quote(rest) {
+            pieces.push(Piece::Quote(quote));
+            rest = after;
+            continue;
+        }
+        if let Some((indent, marker, content)) = list_item(rest) {
+            pieces.push(Piece::Marker { indent, marker });
+            rest = content;
+            continue;
+        }
+        break;
+    }
+    (pieces, rest)
+}
+
+/// What pressing Enter on a line does to the line the caret is on.
+pub enum LineBreak {
+    /// A new line opens underneath it, starting with this text.
+    Next(String),
+    /// The line itself becomes this text and the caret moves to its end, because the innermost
+    /// empty item or quote in it has been taken away rather than left sitting there.
+    Here(String),
+}
+
+/// Works out the line Enter should leave behind: every quote marker and list marker the line is
+/// nested in carries over, so a list inside a quote inside a list keeps going at every level,
+/// with a done task coming back unchecked. Pressing Enter on an empty item or quote instead takes
+/// away just that one level (`Here`), leaving whatever it was nested in. A line with no markers
+/// gets a plain new line, keeping its indentation.
+pub fn line_break(line: &str) -> LineBreak {
+    let (pieces, content) = prefix_pieces(line);
+    if pieces.is_empty() {
+        let indent_len = line.len() - line.trim_start_matches([' ', '\t']).len();
+        return LineBreak::Next(line[..indent_len].to_string());
+    }
+
+    if content.trim().is_empty() {
+        // One level at a time: the innermost empty item or quote goes, and the caret lands at
+        // the end of what it was nested in.
+        let remaining: String = pieces[..pieces.len() - 1]
+            .iter()
+            .map(|piece| piece.text())
+            .collect();
+        return LineBreak::Here(remaining);
+    }
+
+    let last = pieces.len() - 1;
+    let prefix: String = pieces
+        .iter()
+        .enumerate()
+        .map(|(i, piece)| {
+            if i == last {
+                piece.continued()
+            } else {
+                piece.text()
+            }
+        })
+        .collect();
+    LineBreak::Next(prefix)
+}
+
+/// What a line that stays inside the same block should start with: the markers it is nested in,
+/// with the innermost list marker turned into spaces as wide as it is, so the words line up under
+/// the item's own and the line still belongs to it. A quote at the innermost level is simply
+/// quoted again, and a line with no markers keeps its indentation.
+pub fn continuation_line_prefix(line: &str) -> String {
+    let (pieces, _) = prefix_pieces(line);
+    if pieces.is_empty() {
+        let indent_len = line.len() - line.trim_start_matches([' ', '\t']).len();
+        return line[..indent_len].to_string();
+    }
+
+    let last = pieces.len() - 1;
+    let mut prefix = String::new();
+    for (i, piece) in pieces.iter().enumerate() {
+        match piece {
+            Piece::Quote(quote) => prefix.push_str(quote),
+            Piece::Marker { indent, marker } => {
+                prefix.push_str(indent);
+                if i == last {
+                    prefix.push_str(&" ".repeat(marker.chars().count()));
+                } else {
+                    prefix.push_str(marker);
+                }
+            }
+        }
+    }
+    prefix
+}
+
+/// The byte range of the line `at` sits on, without the newline that ends it.
+fn line_around(body: &str, at: usize) -> (usize, usize) {
+    let line_start = body[..at].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = body[at..].find('\n').map_or(body.len(), |i| at + i);
+    (line_start, line_end)
+}
+
+/// Puts a line break and `prefix` where the selection is, replacing whatever was selected, and
+/// answers where the caret lands.
+fn break_line(
+    body: &str,
+    start: usize,
+    start_byte: usize,
+    end_byte: usize,
+    prefix: &str,
+) -> (String, usize) {
+    let mut out = String::with_capacity(body.len() + prefix.len() + 1);
+    out.push_str(&body[..start_byte]);
+    out.push('\n');
+    out.push_str(prefix);
+    out.push_str(&body[end_byte..]);
+    (out, start + 1 + prefix.chars().count())
+}
+
+/// Splits the text at the caret, putting the line's own layout on the line that opens
+/// underneath, or taking an empty block away from the line itself. Pressing Enter on a list item
+/// with nothing in it ends the list; pressing it inside an empty quote that sits in an item takes
+/// only the quote and leaves the item ready to type in. A selection is always replaced by the
+/// line break, as it would be by a plain Enter. Returns the new text and where the caret lands.
+pub fn newline_with_prefix(body: &str, start: usize, end: usize) -> (String, usize) {
+    let (start, end) = (start.min(end), start.max(end));
+    let start_byte = char_to_byte(body, start);
+    let end_byte = char_to_byte(body, end);
+    let (line_start, line_end) = line_around(body, start_byte);
+
+    let line = &body[line_start..line_end];
+    match line_break(line) {
+        // With a selection the line is only broken: the selected text is what Enter replaces,
+        // so the empty block it is in is kept.
+        LineBreak::Here(text) if start == end => {
+            let mut out = String::with_capacity(body.len() + text.len());
+            out.push_str(&body[..line_start]);
+            out.push_str(&text);
+            out.push_str(&body[line_end..]);
+            (out, line_start + text.chars().count())
+        }
+        LineBreak::Here(_) => break_line(body, start, start_byte, end_byte, ""),
+        LineBreak::Next(prefix) => break_line(body, start, start_byte, end_byte, &prefix),
+    }
+}
+
+/// Shift+Enter keeps the same item going instead of starting a new one: the marker is not
+/// repeated, and the new line is stepped in only as far as the marker is wide, so its words line
+/// up under the item's own words and it still belongs to that item.
+pub fn newline_continuing_item(body: &str, start: usize, end: usize) -> (String, usize) {
+    let (start, end) = (start.min(end), start.max(end));
+    let start_byte = char_to_byte(body, start);
+    let end_byte = char_to_byte(body, end);
+    let (line_start, line_end) = line_around(body, start_byte);
+    let prefix = continuation_line_prefix(&body[line_start..line_end]);
+    break_line(body, start, start_byte, end_byte, &prefix)
+}
+
+/// The next (or previous) match to step to, wrapping around at either end.
+pub fn step_match(current: usize, total: usize, backwards: bool) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    if backwards {
+        (current + total - 1) % total
+    } else {
+        (current + 1) % total
+    }
+}
+
+/// Where `query` occurs in `body`, ignoring case, as byte offsets into `body`. Each character is
+/// compared through its lowercase form, so a match is never reported at an offset that is in the
+/// middle of a character.
+pub fn find_matches(body: &str, query: &str) -> Vec<usize> {
+    let needle: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let hay: Vec<(usize, char)> = body.char_indices().collect();
+    let mut hits = Vec::new();
+    let mut i = 0;
+    while i + needle.len() <= hay.len() {
+        let matched = needle.iter().enumerate().all(|(k, wanted)| {
+            let mut lowered = hay[i + k].1.to_lowercase();
+            lowered.next() == Some(*wanted) && lowered.next().is_none()
+        });
+        if matched {
+            hits.push(hay[i].0);
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    hits
+}
+
+/// Fills the box of one match, character by character, so a match that wraps across a line break
+/// is highlighted on both lines. `start` and `len` count characters, not bytes. Returns the union
+/// of what it painted, which the caller uses to bring the match into view.
+fn paint_find_match(
+    painter: &egui::Painter,
+    galley: &egui::Galley,
+    origin: Pos2,
+    start: usize,
+    len: usize,
+    color: Color32,
+) -> Rect {
+    let mut union = Rect::NOTHING;
+    for index in start..start + len {
+        let from = galley.pos_from_ccursor(CCursor::new(index));
+        let to = galley.pos_from_ccursor(CCursor::new(index + 1));
+        let box_ = if (from.top() - to.top()).abs() < 0.5 {
+            Rect::from_min_max(from.min, to.max)
+        } else {
+            // This character ends the row, so the caret for the next one is already on the row
+            // below: the wash runs to the end of the row it started on.
+            let right = galley
+                .rows
+                .iter()
+                .find(|row| row.rect.y_range().contains(from.center().y))
+                .map(|row| row.rect.right())
+                .unwrap_or(to.right());
+            Rect::from_min_max(from.min, Pos2::new(right, from.max.y))
+        };
+        let rect = box_
+            .translate(origin.to_vec2())
+            .expand2(Vec2::new(0.5, 0.5));
+        painter.rect_filled(rect, 1.0, color);
+        union = union.union(rect);
+    }
+    union
 }
 
 fn render_backlinks_footer(
@@ -8656,6 +9806,962 @@ mod tests {
 
         alice.collab.disconnect();
         bob.collab.disconnect();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The find bar is drawn above the editor and its matches are painted over the text without
+    /// disturbing the note: the smoke test for the parts a headless frame can reach.
+    #[test]
+    fn test_the_find_bar_draws_over_the_open_note() {
+        let dir = std::env::temp_dir().join(format!(
+            "elora-find-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = NoteStorage::new(dir.join("notes")).unwrap();
+        let notes_dir = storage.root_dir().to_path_buf();
+        let ctx = egui::Context::default();
+        install_tabler_icons(&ctx);
+        let mut app = EloraApp::with_context(&ctx, storage);
+
+        let mut note = Note::new("Find me", "hello one, hello two, HELLO three", &notes_dir);
+        note.body = "hello one, hello two, HELLO three\n\nsecond line without it".to_string();
+        app.notes = vec![note];
+        app.selected_id = Some(app.notes[0].id.clone());
+        app.view_mode = EditorViewMode::Split;
+        app.find_open = true;
+        app.find_query = "hello".to_string();
+        app.find_pending_jump = true;
+
+        let p = app.theme.palette();
+        // Two frames: the second already knows the editor's state from the first.
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0))),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.render_editor(ui, &p, 620.0, 0.0);
+                });
+            });
+        }
+
+        assert_eq!(find_matches(&app.notes[0].body, &app.find_query).len(), 3);
+        assert_eq!(app.find_current, 0, "the first match is the one stepped to");
+        assert!(
+            !app.find_pending_jump,
+            "the editor took the jump and moved the caret"
+        );
+        let editor_id = Id::new(("md_editor", app.notes[0].id.clone()));
+        let caret = egui::TextEdit::load_state(&ctx, editor_id)
+            .and_then(|state| state.cursor.char_range())
+            .map(|range| range.primary.index);
+        assert_eq!(
+            caret,
+            Some(0),
+            "the caret sits at the first match, which starts the note"
+        );
+
+        // Stepping on to the third match takes the caret with it.
+        app.find_current = 2;
+        app.find_pending_jump = true;
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.render_editor(ui, &p, 620.0, 0.0);
+            });
+        });
+        let caret = egui::TextEdit::load_state(&ctx, editor_id)
+            .and_then(|state| state.cursor.char_range())
+            .map(|range| range.primary.index);
+        assert_eq!(caret, Some(22), "the third HELLO starts at character 22");
+        assert!(
+            app.notes[0].body.contains("hello one"),
+            "the note itself is untouched by looking in it: {:?}",
+            app.notes[0].body
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The report lists a `[[link]]` that leads nowhere once, with the note it was found in; a
+    /// link to a note in the trash counts as broken, because the link would not open it.
+    #[test]
+    fn test_the_broken_link_report_names_missing_targets_and_their_sources() {
+        let dir = std::env::temp_dir().join(format!(
+            "elora-links-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = NoteStorage::new(dir.join("notes")).unwrap();
+        let notes_dir = storage.root_dir().to_path_buf();
+        let ctx = egui::Context::default();
+        let mut app = EloraApp::with_context(&ctx, storage);
+
+        let mut index = Note::new("Index", "See [[Roadmap]] and [[Home]].", &notes_dir);
+        index.body = "See [[Roadmap]] and [[Home]]. Another [[Roadmap]] link.".to_string();
+        let mut home = Note::new("Home", "the note the link points at", &notes_dir);
+        let planner = Note::new("Planner", "also points at [[Roadmap]]", &notes_dir);
+        let mut old = Note::new("Old", "links to [[Gone]]", &notes_dir);
+        old.trashed = true;
+        app.notes = vec![index, home.clone(), planner, old];
+
+        let broken = app.collect_broken_links();
+        assert_eq!(
+            broken,
+            vec![(
+                "Roadmap".to_string(),
+                vec!["Index".to_string(), "Planner".to_string()]
+            )],
+            "a target is listed once, with every note that links to it"
+        );
+
+        // A note in the trash cannot be opened by its link, so the report says so.
+        home.trashed = true;
+        app.notes[1] = home;
+        let broken = app.collect_broken_links();
+        assert!(
+            broken
+                .iter()
+                .any(|(target, from)| target == "Home" && from == &vec!["Index".to_string()]),
+            "a link into the trash is broken: {broken:?}"
+        );
+        assert!(
+            broken.iter().all(|(target, _)| target != "Gone"),
+            "notes in the trash are not searched for links"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The find field looks for the words in the open note: ignoring case, once per match, and
+    /// with offsets that always land on a character boundary.
+    #[test]
+    fn test_find_matches_ignores_case_and_finds_each_match_once() {
+        assert_eq!(
+            find_matches("One one ONE\nsecond line", "one"),
+            vec![0, 4, 8]
+        );
+        assert!(find_matches("One one ONE", "two").is_empty());
+        assert!(
+            find_matches("One one ONE", "").is_empty(),
+            "an empty query finds nothing"
+        );
+        assert!(
+            find_matches("short", "much longer than the note").is_empty(),
+            "a query longer than the text finds nothing"
+        );
+
+        // A two-byte character keeps every offset on a character start.
+        let body = "héllo there, héllo again";
+        let hits = find_matches(body, "héllo");
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert!(hits.iter().all(|&at| body.is_char_boundary(at)));
+        assert_eq!(&body[hits[0]..hits[0] + "héllo".len()], "héllo");
+    }
+
+    /// Stepping through the matches wraps at both ends, so the arrows never dead-end.
+    #[test]
+    fn test_stepping_through_matches_wraps_around() {
+        assert_eq!(step_match(0, 3, false), 1);
+        assert_eq!(step_match(2, 3, false), 0);
+        assert_eq!(step_match(0, 3, true), 2);
+        assert_eq!(step_match(1, 3, true), 0);
+        assert_eq!(step_match(0, 0, false), 0, "nothing to step through");
+    }
+
+    /// Tab puts one level of spaces in at the caret and Shift+Tab takes a level off the front of
+    /// the caret's line, leaving the caret in the words it was in.
+    #[test]
+    fn test_indenting_a_line_moves_the_caret_with_the_text() {
+        let (text, start, end) = indent_selection("one\ntwo", 4, 4, false);
+        assert_eq!(text, "one\n    two");
+        assert_eq!((start, end), (8, 8), "the caret stays in front of 'two'");
+
+        // A caret in the middle of a line gets the indent where it stands.
+        let (text, start, _) = indent_selection("abcdef", 3, 3, false);
+        assert_eq!(text, "abc    def");
+        assert_eq!(start, 7);
+
+        // Shift+Tab eats the leading spaces only, never the text.
+        let (text, start, end) = indent_selection("one\n    two", 8, 8, true);
+        assert_eq!(text, "one\ntwo");
+        assert_eq!((start, end), (4, 4));
+
+        // A line with no indent is left alone.
+        let (text, start, _) = indent_selection("plain", 2, 2, true);
+        assert_eq!(text, "plain");
+        assert_eq!(start, 2);
+
+        // A caret sitting inside the indentation follows the line to its new start rather than
+        // jumping past it.
+        let (text, start, _) = indent_selection("    two", 2, 2, true);
+        assert_eq!(text, "two");
+        assert_eq!(start, 0);
+    }
+
+    /// A selection moves every line it touches, and a selection that stops at the very start of a
+    /// line leaves that line where it is.
+    #[test]
+    fn test_indenting_a_selection_moves_each_line_and_keeps_the_selection() {
+        let (text, start, end) = indent_selection("one\ntwo\nthree", 0, 7, false);
+        assert_eq!(text, "    one\n    two\nthree");
+        assert_eq!((start, end), (4, 15), "the same words stay selected");
+        let (text, start, end) = indent_selection("one\ntwo\nthree", 0, 8, false);
+        assert_eq!(
+            text, "    one\n    two\nthree",
+            "a selection that stops at the start of a line leaves that line alone"
+        );
+        assert_eq!(start, 4);
+        assert_eq!(end, 16, "the selection ends at the line's new start");
+
+        // The same block comes back off in one step.
+        let (text, start, end) = indent_selection("    one\n    two\nthree", 4, 12, true);
+        assert_eq!(text, "one\ntwo\nthree");
+        assert_eq!((start, end), (0, 4));
+
+        // Empty lines are not given trailing spaces.
+        let (text, _, _) = indent_selection("one\n\ntwo", 0, 8, false);
+        assert_eq!(text, "    one\n\n    two");
+
+        // A two-byte character never lands the selection in the middle of it.
+        let (text, start, end) = indent_selection("héllo\nwörld", 0, 11, false);
+        assert_eq!(text, "    héllo\n    wörld");
+        assert!(text.is_char_boundary(char_to_byte(&text, start)));
+        assert!(text.is_char_boundary(char_to_byte(&text, end)));
+    }
+
+    /// Pressing Tab with the caret in the note indents it there instead of leaving the field,
+    /// and Shift+Tab takes the level straight back out.
+    #[test]
+    fn test_pressing_tab_in_the_editor_indents_and_keeps_the_focus() {
+        let dir = std::env::temp_dir().join(format!(
+            "elora-tab-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = NoteStorage::new(dir.join("notes")).unwrap();
+        let notes_dir = storage.root_dir().to_path_buf();
+        let ctx = egui::Context::default();
+        install_tabler_icons(&ctx);
+        let mut app = EloraApp::with_context(&ctx, storage);
+
+        let mut note = Note::new("Tab", "one\ntwo", &notes_dir);
+        note.body = "one\ntwo".to_string();
+        app.notes = vec![note];
+        app.selected_id = Some(app.notes[0].id.clone());
+        app.view_mode = EditorViewMode::Edit;
+        let editor_id = Id::new(("md_editor", app.notes[0].id.clone()));
+        let p = app.theme.palette();
+
+        let press = |app: &mut EloraApp, modifiers: egui::Modifiers| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0))),
+                focused: true,
+                events: vec![egui::Event::Key {
+                    key: Key::Tab,
+                    physical_key: Some(Key::Tab),
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }],
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.render_editor(ui, &p, 620.0, 0.0);
+                });
+            });
+        };
+
+        // The first frame puts the caret in the field; the note is drawn with it focused so the
+        // key press lands where a person's would.
+        let mut state = egui::TextEdit::load_state(&ctx, editor_id).unwrap_or_default();
+        state
+            .cursor
+            .set_char_range(Some(CCursorRange::one(CCursor::new(4))));
+        state.store(&ctx, editor_id);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0))),
+            focused: true,
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.render_editor(ui, &p, 620.0, 0.0);
+                ui.memory_mut(|m| m.request_focus(editor_id));
+            });
+        });
+        assert!(
+            ctx.memory(|m| m.has_focus(editor_id)),
+            "the note has the caret"
+        );
+        // One settled frame: egui keeps Tab for the field from the frame after it gains focus.
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0))),
+            focused: true,
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.render_editor(ui, &p, 620.0, 0.0);
+            });
+        });
+
+        press(&mut app, egui::Modifiers::NONE);
+        assert_eq!(
+            app.notes[0].body, "one\n    two",
+            "the line stepped in by one level"
+        );
+        assert!(
+            ctx.memory(|m| m.has_focus(editor_id)),
+            "Tab keeps the focus in the note"
+        );
+        let caret = egui::TextEdit::load_state(&ctx, editor_id)
+            .and_then(|state| state.cursor.char_range())
+            .map(|range| range.primary.index);
+        assert_eq!(caret, Some(8), "the caret moved with 'two'");
+
+        press(&mut app, egui::Modifiers::SHIFT);
+        assert_eq!(
+            app.notes[0].body, "one\ntwo",
+            "Shift+Tab took the level back out"
+        );
+        let caret = egui::TextEdit::load_state(&ctx, editor_id)
+            .and_then(|state| state.cursor.char_range())
+            .map(|range| range.primary.index);
+        assert_eq!(caret, Some(4));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Enter opens the next line at the same depth, and a list keeps its marker: a bullet stays
+    /// a bullet, a task comes back unchecked, and a number counts on.
+    #[test]
+    fn test_enter_carries_the_indentation_and_the_list_marker() {
+        let (text, caret) = newline_with_prefix("    foo", 7, 7);
+        assert_eq!(text, "    foo\n    ");
+        assert_eq!(caret, 12, "the caret sits after the new line's indentation");
+
+        let (text, caret) = newline_with_prefix("- milk", 6, 6);
+        assert_eq!(text, "- milk\n- ");
+        assert_eq!(caret, 9);
+
+        let (text, _) = newline_with_prefix("  - [x] done", 12, 12);
+        assert_eq!(
+            text, "  - [x] done\n  - [ ] ",
+            "a done task comes back empty"
+        );
+
+        let (text, _) = newline_with_prefix("1. one", 6, 6);
+        assert_eq!(text, "1. one\n2. ");
+
+        let (text, _) = newline_with_prefix("9) nine", 7, 7);
+        assert_eq!(text, "9) nine\n10) ");
+
+        // An item with nothing in it ends the list: its marker goes and the caret takes the line
+        // it leaves behind, rather than another empty bullet opening underneath.
+        let (text, caret) = newline_with_prefix("- ", 2, 2);
+        assert_eq!(text, "");
+        assert_eq!(caret, 0);
+        let (text, caret) = newline_with_prefix("  - [ ] ", 8, 8);
+        assert_eq!(text, "");
+        assert_eq!(caret, 0);
+        let (text, caret) = newline_with_prefix("abc\n- \nmore", 6, 6);
+        assert_eq!(
+            text, "abc\n\nmore",
+            "the empty item is gone, nothing else moved"
+        );
+        assert_eq!(caret, 4, "the caret is on the blank line the item was on");
+
+        // A selection is still replaced by the break, as a plain Enter would replace it.
+        let (text, caret) = newline_with_prefix("- \nmore", 0, 3);
+        assert_eq!(text, "\nmore");
+        assert_eq!(caret, 1);
+
+        // A line that carries no layout gets a plain line break, and a selection is replaced by
+        // the break the way a plain Enter would replace it.
+        let (text, caret) = newline_with_prefix("plain text", 10, 10);
+        assert_eq!(text, "plain text\n");
+        assert_eq!(caret, 11);
+        let (text, caret) = newline_with_prefix("hello world", 5, 11);
+        assert_eq!(text, "hello\n");
+        assert_eq!(caret, 6);
+
+        // Splitting a list item in the middle keeps the list going on the new line.
+        let (text, caret) = newline_with_prefix("- text", 2, 2);
+        assert_eq!(text, "- \n- text");
+        assert_eq!(
+            caret, 5,
+            "the caret sits in front of the words that moved down"
+        );
+
+        // A quote is not a list: its own marker carries over, untouched.
+        let (text, caret) = newline_with_prefix("> quoted", 8, 8);
+        assert_eq!(text, "> quoted\n> ");
+        assert_eq!(caret, 11);
+    }
+
+    /// Enter inside a blockquote opens the next line still quoted, however deeply it is nested,
+    /// and a list inside the quote keeps both its markers.
+    #[test]
+    fn test_enter_continues_a_blockquote_with_its_nesting() {
+        let (text, caret) = newline_with_prefix("> > deep", 8, 8);
+        assert_eq!(text, "> > deep\n> > ", "the nesting comes back as it was");
+        assert_eq!(caret, 13, "the caret sits after both markers");
+
+        let (text, _) = newline_with_prefix(">> compact", 10, 10);
+        assert_eq!(text, ">> compact\n>> ");
+
+        let (text, _) = newline_with_prefix("  > indented", 12, 12);
+        assert_eq!(text, "  > indented\n  > ");
+
+        // A list keeps going inside the quote, with its own marker added to the quote's.
+        let (text, caret) = newline_with_prefix("> - item", 8, 8);
+        assert_eq!(text, "> - item\n> - ");
+        assert_eq!(caret, 13);
+        let (text, _) = newline_with_prefix("> 1. one", 8, 8);
+        assert_eq!(
+            text, "> 1. one\n> 2. ",
+            "the number counts on inside the quote"
+        );
+        let (text, _) = newline_with_prefix("> - [x] done", 12, 12);
+        assert_eq!(text, "> - [x] done\n> - [ ] ");
+
+        // An empty item inside the quote goes and leaves the quote behind it; an empty quote
+        // line ends the quote and leaves a blank line in its place.
+        let (text, caret) = newline_with_prefix("> - ", 4, 4);
+        assert_eq!(text, "> ");
+        assert_eq!(caret, 2);
+        let (text, caret) = newline_with_prefix("> ", 2, 2);
+        assert_eq!(text, "");
+        assert_eq!(caret, 0);
+
+        // Shift+Enter stays inside the quote, and inside an item in it as well.
+        let (text, _) = newline_continuing_item("> quoted", 8, 8);
+        assert_eq!(text, "> quoted\n> ");
+        let (text, caret) = newline_continuing_item("> - item", 8, 8);
+        assert_eq!(
+            text, "> - item\n>   ",
+            "no marker, just the quote and the item's depth"
+        );
+        assert_eq!(caret, 13);
+    }
+
+    /// Enter on an empty quote that sits inside a list item drops only the quote: the item stays
+    /// and the caret is in it, ready for text. The quote level around it, if any, stays too.
+    #[test]
+    fn test_enter_on_an_empty_quote_inside_a_list_item_keeps_the_item() {
+        let (text, caret) = newline_with_prefix("- > ", 4, 4);
+        assert_eq!(text, "- ", "the quote goes, the bullet stays");
+        assert_eq!(caret, 2, "the caret is in the item, not on a new line");
+
+        let (text, caret) = newline_with_prefix("  - > ", 6, 6);
+        assert_eq!(text, "  - ");
+        assert_eq!(caret, 4);
+
+        // Only the innermost level goes: a nested quote leaves the quote around it, and a quote
+        // around the item is untouched.
+        let (text, caret) = newline_with_prefix("- > > ", 6, 6);
+        assert_eq!(text, "- > ");
+        assert_eq!(caret, 4);
+        let (text, caret) = newline_with_prefix("> - > ", 6, 6);
+        assert_eq!(text, "> - ");
+        assert_eq!(caret, 4);
+
+        // A quote with words in it keeps going on the next line.
+        let (text, caret) = newline_with_prefix("- > text", 8, 8);
+        assert_eq!(text, "- > text\n- > ");
+        assert_eq!(caret, 13);
+
+        // Shift+Enter inside that quote stays in the quote, as at any other level.
+        let (text, caret) = newline_continuing_item("- > ", 4, 4);
+        assert_eq!(text, "- > \n- > ");
+        assert_eq!(caret, 9);
+    }
+
+    /// A list inside a quote inside a list item keeps going at every level: each quote stays and
+    /// each inner marker carries over, counting on or coming back unchecked as usual.
+    #[test]
+    fn test_enter_continues_a_list_nested_through_a_quote_at_every_level() {
+        let (text, caret) = newline_with_prefix("- > - item", 10, 10);
+        assert_eq!(text, "- > - item\n- > - ", "the inner bullet carries over");
+        assert_eq!(caret, 17);
+
+        let (text, caret) = newline_with_prefix("- > - > deeper", 14, 14);
+        assert_eq!(text, "- > - > deeper\n- > - > ", "both quotes stay");
+        assert_eq!(caret, 23);
+
+        let (text, _) = newline_with_prefix("- - item", 8, 8);
+        assert_eq!(text, "- - item\n- - ");
+
+        let (text, _) = newline_with_prefix("- > 1. one", 10, 10);
+        assert_eq!(text, "- > 1. one\n- > 2. ", "the number counts on in place");
+
+        let (text, _) = newline_with_prefix("- > - [x] done", 14, 14);
+        assert_eq!(text, "- > - [x] done\n- > - [ ] ");
+
+        // Each empty level is taken away on its own, innermost first.
+        let (text, caret) = newline_with_prefix("- > - > ", 8, 8);
+        assert_eq!(text, "- > - ");
+        assert_eq!(caret, 6);
+        let (text, caret) = newline_with_prefix("- > - ", 6, 6);
+        assert_eq!(text, "- > ");
+        assert_eq!(caret, 4);
+
+        // Shift+Enter stays in the innermost block: quotes carry on and the deepest marker
+        // becomes as many spaces as it is wide.
+        let (text, caret) = newline_continuing_item("- > - item", 10, 10);
+        assert_eq!(text, "- > - item\n- >   ");
+        assert_eq!(caret, 17);
+    }
+
+    /// Shift+Enter keeps the item going: the marker is not repeated, the line is only stepped in
+    /// as far as the marker is wide, and nothing is removed.
+    #[test]
+    fn test_shift_enter_continues_the_same_item_without_another_marker() {
+        let (text, caret) = newline_continuing_item("- milk", 6, 6);
+        assert_eq!(
+            text, "- milk\n  ",
+            "no second bullet, just the item's depth"
+        );
+        assert_eq!(caret, 9);
+
+        let (text, _) = newline_continuing_item("  - [ ] note", 12, 12);
+        assert_eq!(text, "  - [ ] note\n        ", "the task box is six wide");
+
+        let (text, _) = newline_continuing_item("12. twelve", 10, 10);
+        assert_eq!(text, "12. twelve\n    ");
+
+        // Even an empty item is only continued, never dropped, and a line that is not a list
+        // keeps its plain indentation.
+        let (text, _) = newline_continuing_item("- ", 2, 2);
+        assert_eq!(text, "- \n  ");
+        let (text, _) = newline_continuing_item("    text", 8, 8);
+        assert_eq!(text, "    text\n    ");
+        let (text, _) = newline_continuing_item("plain", 5, 5);
+        assert_eq!(text, "plain\n");
+
+        // A selection is replaced by the break, as anywhere else.
+        let (text, caret) = newline_continuing_item("- text", 2, 3);
+        assert_eq!(text, "- \n  ext");
+        assert_eq!(caret, 5);
+    }
+
+    /// Pressing Enter in the note writes the indentation and marker through the editor's own
+    /// caret, so the new line is really in the note and really where the caret ends up.
+    #[test]
+    fn test_pressing_enter_in_the_editor_lays_out_the_new_line() {
+        let dir = std::env::temp_dir().join(format!(
+            "elora-enter-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = NoteStorage::new(dir.join("notes")).unwrap();
+        let notes_dir = storage.root_dir().to_path_buf();
+        let ctx = egui::Context::default();
+        install_tabler_icons(&ctx);
+        let mut app = EloraApp::with_context(&ctx, storage);
+
+        let mut note = Note::new("Enter", "  - [x] done", &notes_dir);
+        note.body = "  - [x] done".to_string();
+        app.notes = vec![note];
+        app.selected_id = Some(app.notes[0].id.clone());
+        app.view_mode = EditorViewMode::Edit;
+        let editor_id = Id::new(("md_editor", app.notes[0].id.clone()));
+        let p = app.theme.palette();
+
+        let frame = |app: &mut EloraApp, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0))),
+                focused: true,
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.render_editor(ui, &p, 620.0, 0.0);
+                });
+            });
+        };
+
+        let mut state = egui::TextEdit::load_state(&ctx, editor_id).unwrap_or_default();
+        state
+            .cursor
+            .set_char_range(Some(CCursorRange::one(CCursor::new(12))));
+        state.store(&ctx, editor_id);
+        frame(&mut app, Vec::new());
+        ctx.memory_mut(|m| m.request_focus(editor_id));
+        frame(&mut app, Vec::new());
+        frame(&mut app, Vec::new());
+        assert!(ctx.memory(|m| m.has_focus(editor_id)));
+
+        frame(
+            &mut app,
+            vec![egui::Event::Key {
+                key: Key::Enter,
+                physical_key: Some(Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(app.notes[0].body, "  - [x] done\n  - [ ] ");
+        let caret = egui::TextEdit::load_state(&ctx, editor_id)
+            .and_then(|state| state.cursor.char_range())
+            .map(|range| range.primary.index);
+        assert_eq!(caret, Some(21), "the caret starts the new, unchecked task");
+
+        // Enter on that empty item ends the list instead of leaving an empty one behind.
+        frame(
+            &mut app,
+            vec![egui::Event::Key {
+                key: Key::Enter,
+                physical_key: Some(Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(app.notes[0].body, "  - [x] done\n");
+        let caret = egui::TextEdit::load_state(&ctx, editor_id)
+            .and_then(|state| state.cursor.char_range())
+            .map(|range| range.primary.index);
+        assert_eq!(caret, Some(13), "the caret sits on the line the item left");
+
+        // Shift+Enter under a list item starts a line inside that item instead of a new one.
+        app.notes[0].body = "- milk".to_string();
+        let mut state = egui::TextEdit::load_state(&ctx, editor_id).unwrap_or_default();
+        state
+            .cursor
+            .set_char_range(Some(CCursorRange::one(CCursor::new(6))));
+        state.store(&ctx, editor_id);
+        frame(&mut app, Vec::new());
+        frame(
+            &mut app,
+            vec![egui::Event::Key {
+                key: Key::Enter,
+                physical_key: Some(Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::SHIFT,
+            }],
+        );
+        assert_eq!(app.notes[0].body, "- milk\n  ");
+        let caret = egui::TextEdit::load_state(&ctx, editor_id)
+            .and_then(|state| state.cursor.char_range())
+            .map(|range| range.primary.index);
+        assert_eq!(caret, Some(9), "the caret lines up under the item's words");
+
+        // A blockquote carries on as well.
+        app.notes[0].body = "> note".to_string();
+        let mut state = egui::TextEdit::load_state(&ctx, editor_id).unwrap_or_default();
+        state
+            .cursor
+            .set_char_range(Some(CCursorRange::one(CCursor::new(6))));
+        state.store(&ctx, editor_id);
+        frame(&mut app, Vec::new());
+        frame(
+            &mut app,
+            vec![egui::Event::Key {
+                key: Key::Enter,
+                physical_key: Some(Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(app.notes[0].body, "> note\n> ");
+        let caret = egui::TextEdit::load_state(&ctx, editor_id)
+            .and_then(|state| state.cursor.char_range())
+            .map(|range| range.primary.index);
+        assert_eq!(caret, Some(9), "the caret is inside the new quoted line");
+
+        // An empty quote inside a list item drops just the quote, through the editor as well.
+        app.notes[0].body = "- > ".to_string();
+        let mut state = egui::TextEdit::load_state(&ctx, editor_id).unwrap_or_default();
+        state
+            .cursor
+            .set_char_range(Some(CCursorRange::one(CCursor::new(4))));
+        state.store(&ctx, editor_id);
+        frame(&mut app, Vec::new());
+        frame(
+            &mut app,
+            vec![egui::Event::Key {
+                key: Key::Enter,
+                physical_key: Some(Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(app.notes[0].body, "- ");
+        let caret = egui::TextEdit::load_state(&ctx, editor_id)
+            .and_then(|state| state.cursor.char_range())
+            .map(|range| range.primary.index);
+        assert_eq!(caret, Some(2), "the caret is in the item that is left");
+
+        // A list inside a quote inside an item keeps going at every level.
+        app.notes[0].body = "- > - item".to_string();
+        let mut state = egui::TextEdit::load_state(&ctx, editor_id).unwrap_or_default();
+        state
+            .cursor
+            .set_char_range(Some(CCursorRange::one(CCursor::new(10))));
+        state.store(&ctx, editor_id);
+        frame(&mut app, Vec::new());
+        frame(
+            &mut app,
+            vec![egui::Event::Key {
+                key: Key::Enter,
+                physical_key: Some(Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(app.notes[0].body, "- > - item\n- > - ");
+        let caret = egui::TextEdit::load_state(&ctx, editor_id)
+            .and_then(|state| state.cursor.char_range())
+            .map(|range| range.primary.index);
+        assert_eq!(caret, Some(17), "the inner bullet carries over in the note");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The default list is one line per note, and the taller card is still there for anyone who
+    /// turns it on: the row has to be roughly half its height, or the setting saves nothing.
+    #[test]
+    fn test_the_compact_note_row_takes_about_half_the_height_of_a_card() {
+        let dir = std::env::temp_dir().join(format!(
+            "elora-cards-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut note = Note::new("A note with a title", "the body", &dir);
+        note.explicit_tags = vec!["project".to_string(), "spec".to_string()];
+
+        let ctx = egui::Context::default();
+        install_tabler_icons(&ctx);
+        let p = ThemeMode::Obsidian.palette();
+        let mut row_height = 0.0;
+        let mut card_height = 0.0;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.scope(|ui| {
+                    render_compact_note_row(ui, &note, false, &p, &[]);
+                    row_height = ui.min_rect().height();
+                });
+                ui.scope(|ui| {
+                    render_note_card(ui, &note, false, &p, "", &[], false);
+                    card_height = ui.min_rect().height();
+                });
+            });
+        });
+        assert!(
+            row_height > 0.0 && card_height > 0.0,
+            "both styles have to draw something: {row_height} and {card_height}"
+        );
+        assert!(
+            row_height * 1.6 <= card_height,
+            "the one-line row is {row_height} against the card's {card_height}"
+        );
+        assert!(
+            row_height <= 24.0,
+            "a row taller than 24 points is not a file-list row: {row_height}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Each group in the sidebar follows the chosen order, and a search ignores it: the best
+    /// match first is what somebody searching wants, not the newest note.
+    #[test]
+    fn test_the_sidebar_sort_orders_each_group_and_a_search_keeps_its_matches() {
+        let dir = std::env::temp_dir().join(format!(
+            "elora-sort-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = NoteStorage::new(dir.join("notes")).unwrap();
+        let notes_dir = storage.root_dir().to_path_buf();
+        let ctx = egui::Context::default();
+        let mut app = EloraApp::with_context(&ctx, storage);
+
+        let now = Utc::now();
+        let mut zulu = Note::new("Zulu", "body", &notes_dir);
+        zulu.updated_at = now - chrono::Duration::days(1);
+        zulu.created_at = now - chrono::Duration::days(3);
+        let mut alpha = Note::new("Alpha", "body", &notes_dir);
+        alpha.updated_at = now - chrono::Duration::days(3);
+        alpha.created_at = now - chrono::Duration::days(4);
+        let mut mike = Note::new("Mike", "body", &notes_dir);
+        mike.updated_at = now - chrono::Duration::days(2);
+        mike.created_at = now - chrono::Duration::days(2);
+        app.notes = vec![zulu, alpha, mike];
+
+        let mut group = vec![0, 1, 2];
+        app.sort = NoteSort::Updated;
+        app.sort_group(&mut group);
+        assert_eq!(group, vec![0, 2, 1], "last edited first");
+
+        group = vec![0, 1, 2];
+        app.sort = NoteSort::Created;
+        app.sort_group(&mut group);
+        assert_eq!(group, vec![2, 0, 1], "newest note first");
+
+        group = vec![0, 1, 2];
+        app.sort = NoteSort::Title;
+        app.sort_group(&mut group);
+        assert_eq!(group, vec![1, 2, 0], "A to Z");
+
+        // What the search found stays in the order the search ranked it.
+        app.search_query = "o".to_string();
+        group = vec![2, 0, 1];
+        app.sort_group(&mut group);
+        assert_eq!(group, vec![2, 0, 1], "relevance wins while searching");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The window's place and size are kept with the rest of the settings, so the next launch can
+    /// open the window where the last one was left.
+    #[test]
+    fn test_the_window_is_remembered() {
+        let dir = std::env::temp_dir().join(format!(
+            "elora-window-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = NoteStorage::new(dir.join("notes")).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = EloraApp::with_context(&ctx, storage);
+        assert_eq!(
+            app.window_state, None,
+            "a fresh install has nothing to restore"
+        );
+
+        app.window_state = Some(WindowState {
+            width: 1180.0,
+            height: 760.0,
+            x: 120.0,
+            y: 80.0,
+            maximized: false,
+        });
+        app.persist_settings();
+        let reopened = EloraApp::with_context(&ctx, NoteStorage::new(dir.join("notes")).unwrap());
+        assert_eq!(reopened.window_state, app.window_state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The sidebar has to hold what it draws. A long title in a card's one-line header used to
+    /// widen the card past the panel — its right edge and every card below it cut off at the
+    /// border — and a footer height reserved in advance was a few points short of what the icons
+    /// need, leaving the bottom row hanging past the panel's edge. Both are measured here at
+    /// three window sizes, with titles far longer than the sidebar.
+    #[test]
+    fn test_a_long_title_and_the_footer_both_stay_inside_the_sidebar() {
+        let dir = std::env::temp_dir().join(format!(
+            "elora-sidebar-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = NoteStorage::new(dir.join("notes")).unwrap();
+        for i in 0..12 {
+            let mut note = Note::new(
+                format!("Note number {i} whose title runs on far past the sidebar edge"),
+                "body",
+                storage.root_dir(),
+            );
+            note.explicit_tags = vec!["tag".to_string()];
+            // Every other note sits in a folder whose name is far wider than the sidebar, so
+            // the folder row is held to the same rule as the card titles.
+            if i % 2 == 0 {
+                note.folder = Some(format!(
+                    "A folder name far longer than the sidebar number {i}"
+                ));
+            }
+            std::fs::write(note.file_path.clone(), note.to_markdown()).unwrap();
+        }
+        let ctx = egui::Context::default();
+        let mut app = EloraApp::with_context(&ctx, storage);
+        let p = app.theme.palette_with(&app.colors, app.glow_strength);
+
+        for (w, h) in [(1060.0, 700.0), (900.0, 500.0), (640.0, 420.0)] {
+            let mut used = Rect::NOTHING;
+            let mut clip = Rect::NOTHING;
+            let mut footer = Rect::NOTHING;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h))),
+                ..Default::default()
+            };
+            // Three frames, because the second one already knows what the first drew.
+            for _ in 0..3 {
+                let _ =
+                    ctx.run(input.clone(), |ctx| {
+                        egui::SidePanel::left(format!("probe-{w}-{h}"))
+                            .resizable(false)
+                            .exact_width(SIDEBAR_WIDTH)
+                            .show_separator_line(false)
+                            .frame(Frame::new().inner_margin(Margin::symmetric(
+                                SIDEBAR_MARGIN_X,
+                                SIDEBAR_MARGIN_Y,
+                            )))
+                            .show(ctx, |ui| {
+                                footer = app.render_sidebar(ui, &p);
+                                used = ui.min_rect();
+                                clip = ui.clip_rect();
+                            });
+                    });
+            }
+
+            let inner_right = clip.right() - f32::from(SIDEBAR_MARGIN_X);
+            assert!(
+                used.right() <= inner_right + 0.01,
+                "at {w}x{h} the sidebar drew out to {} with the cards' edge at {inner_right}",
+                used.right()
+            );
+            let inner_bottom = clip.bottom() - f32::from(SIDEBAR_MARGIN_Y);
+            assert!(
+                footer.bottom() <= inner_bottom + 0.01,
+                "at {w}x{h} the footer ends at {} below the panel's edge at {inner_bottom}",
+                footer.bottom()
+            );
+            assert!(
+                footer.top() - clip.top() >= 120.0,
+                "at {w}x{h} the footer took the whole sidebar: it starts at {}",
+                footer.top()
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
