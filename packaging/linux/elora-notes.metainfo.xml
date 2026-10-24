@@ -25,6 +25,34 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.9.22" date="2026-10-23">
+      <description>
+        <p>
+          Renaming a note in the shared library no longer eats the space between two words. The
+          server trimmed every title it was sent, so the space typed at the end of a half-written
+          word came back gone and the next letter joined it to the word before. A title is now
+          kept exactly as it was typed, and the title field is not replaced by a copy that
+          arrives from the server while the caret is in it.
+        </p>
+        <p>
+          A picture dragged to a new size keeps that size. The width used to be written into the
+          note only on the frame the mouse was released, so a release the corner handle did not
+          see snapped the picture back to its old width. The size now reaches the note while the
+          drag is still moving, and the corner can be grabbed a little outside the picture too.
+        </p>
+        <p>
+          The notice in the lower-left corner is no longer squeezed into a narrow column. A long
+          message arriving after a short one — “Connecting…”, then why it failed — was laid out
+          at the width of the message before it; notices are now measured against the window and
+          wrap at a readable width, moving left in a window too narrow to sit beside the sidebar.
+        </p>
+        <p>
+          Note times read on a 12-hour clock (“Today, 3:04 PM”), the field for adding somebody to
+          a note suggests “Goku” and clears its hint while the caret is in it, and the README
+          explains freeing a name on a server that runs as a systemd service.
+        </p>
+      </description>
+    </release>
     <release version="0.9.21" date="2026-10-23">
       <description>
         <p>
