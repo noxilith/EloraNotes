@@ -25,6 +25,17 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.9.23" date="2026-10-23">
+      <description>
+        <p>
+          The colour you are drawn in on the other end of a shared note can now be chosen. In
+          Settings → Shared library, beside your name and key, a swatch sets the colour of your
+          caret and of the name chip that follows it on everybody else's screen — a change they
+          see at once, without anyone reconnecting. An Automatic button beside it goes back to
+          the colour picked from your name, and the choice is remembered, so it is made once.
+        </p>
+      </description>
+    </release>
     <release version="0.9.22" date="2026-10-23">
       <description>
         <p>

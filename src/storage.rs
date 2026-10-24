@@ -102,6 +102,12 @@ pub struct AppSettings {
     /// startup.
     #[serde(default)]
     pub identifier: String,
+    /// The colour this person's name and caret are drawn in on everybody else's screen. `None`
+    /// lets the name pick one, which is what a fresh install and somebody who never opened the
+    /// colour picker have. It only changes what other people see in a shared note.
+    #[serde(default)]
+    pub peer_color: Option<[u8; 3]>,
+
     /// Whether a card in the sidebar shows the first lines of its note. Off unless it is turned
     /// on, which leaves just the title, the date and the tags, so more notes fit in the list.
     ///
@@ -150,6 +156,7 @@ impl Default for AppSettings {
             server: Default::default(),
             display_name: String::new(),
             identifier: String::new(),
+            peer_color: None,
             show_card_previews: default_show_card_previews(),
         }
     }
@@ -1585,5 +1592,29 @@ And a number #123 should be ignored, while #valid_tag is kept.";
         assert!(text.contains("\"note_previews\":true"), "{text}");
         let back: AppSettings = serde_json::from_str(&text).unwrap();
         assert!(back.show_card_previews);
+    }
+
+    /// A colour picked for a person's caret is kept, and a settings file from before colours
+    /// existed opens with none chosen, which is what leaves the pick to the name.
+    #[test]
+    fn test_a_chosen_colour_is_kept_and_no_colour_means_the_name_picks() {
+        let settings = AppSettings::default();
+        assert_eq!(settings.peer_color, None);
+
+        let old = serde_json::json!({
+            "theme_name": "Obsidian",
+            "show_formatting_bar": true,
+            "display_name": "nova",
+        });
+        let settings: AppSettings = serde_json::from_value(old).unwrap();
+        assert_eq!(settings.peer_color, None);
+
+        let chosen = AppSettings {
+            peer_color: Some([12, 34, 56]),
+            ..AppSettings::default()
+        };
+        let text = serde_json::to_string(&chosen).unwrap();
+        let back: AppSettings = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.peer_color, Some([12, 34, 56]));
     }
 }

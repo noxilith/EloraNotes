@@ -2,7 +2,7 @@
 //! `Collab` clients talking TLS to it. These cover the parts that unit tests cannot: the
 //! handshake, the note list, live bodies and presence.
 
-use elora_notes::collab::{Collab, ConnectionState, Incoming, ServerProfile};
+use elora_notes::collab::{default_peer_color, Collab, ConnectionState, Incoming, ServerProfile};
 use elora_notes::net::ServerConfig;
 use elora_notes::people;
 use elora_notes::server::Server;
@@ -829,5 +829,80 @@ fn test_a_title_keeps_the_space_at_the_end_of_a_half_typed_word() {
     assert!(
         saved.contains("title: \"Meeting notes \""),
         "the note on the server lost its title: {saved:?}"
+    );
+}
+
+/// The colour somebody picks in Settings is the one the others draw their caret and name in —
+/// and a colour picked while the note is already open reaches them without a reconnect.
+#[test]
+fn test_a_chosen_colour_is_what_the_other_person_sees() {
+    let _turn = SERVER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let harness = start_server();
+    let note_id = harness.note_id.clone();
+
+    let mut alice = Collab::new();
+    alice.set_color(Some([12, 34, 56]));
+    alice.connect(profile(harness.port), "alice".into(), key("alice"));
+    settle(&mut alice, &mut String::new(), "alice", |c, _| {
+        c.is_connected() && !c.notes().is_empty()
+    });
+    alice.open_note(&note_id, "hello");
+    settle(
+        &mut alice,
+        &mut String::new(),
+        "alice opened the note",
+        |_, body| body == "hello",
+    );
+
+    let mut bob = Collab::new();
+    bob.connect(profile(harness.port), "bob".into(), key("bob"));
+    settle(&mut bob, &mut String::new(), "bob", |c, _| c.is_connected());
+    bob.open_note(&note_id, "hello");
+    settle(
+        &mut bob,
+        &mut String::new(),
+        "bob opened the note",
+        |_, body| body == "hello",
+    );
+
+    let colour_of = |collab: &Collab, name: &str| {
+        collab
+            .peers()
+            .iter()
+            .find(|peer| peer.name == name)
+            .map(|peer| peer.color)
+    };
+
+    settle(&mut bob, &mut String::new(), "bob sees alice", |c, _| {
+        colour_of(c, "alice").is_some()
+    });
+    settle(&mut alice, &mut String::new(), "alice sees bob", |c, _| {
+        colour_of(c, "bob").is_some()
+    });
+    assert_eq!(
+        colour_of(&bob, "alice"),
+        Some([12, 34, 56]),
+        "bob must see the colour alice picked, not the one her name would have picked"
+    );
+    // Bob chose nothing, so his colour still comes from his name: the same one on every screen.
+    assert_eq!(colour_of(&alice, "bob"), Some(default_peer_color("bob")));
+    assert_ne!(default_peer_color("bob"), [12, 34, 56]);
+
+    // Picking a different colour with the note already open reaches the other side as it is.
+    alice.set_color(Some([240, 10, 20]));
+    settle(
+        &mut bob,
+        &mut String::new(),
+        "bob sees the new colour",
+        |c, _| colour_of(c, "alice") == Some([240, 10, 20]),
+    );
+
+    // Back to automatic: the colour the name picks again.
+    alice.set_color(None);
+    settle(
+        &mut bob,
+        &mut String::new(),
+        "bob sees the colour alice's name picks",
+        |c, _| colour_of(c, "alice") == Some(default_peer_color("alice")),
     );
 }

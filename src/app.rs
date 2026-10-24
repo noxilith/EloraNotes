@@ -215,6 +215,9 @@ pub struct EloraApp {
     /// again; no other client is told it, so a name cannot be taken by somebody who simply
     /// knows what it is. The same identifier on another computer is the same person.
     identifier: String,
+    /// The colour this person chose to appear in on everybody else's screen. `None` lets the
+    /// name pick one, as it does when nothing has been chosen.
+    peer_color: Option<[u8; 3]>,
     /// The identifier the open connection was made with, so a pasted one can be noticed and
     /// acted on rather than waiting for the next reconnect.
     sent_identifier: String,
@@ -364,6 +367,7 @@ impl EloraApp {
             let name = app.server_display_name();
             let identifier = app.identifier.clone();
             app.sent_identifier = identifier.clone();
+            app.collab.set_color(app.peer_color);
             app.collab.connect(profile, name, identifier);
         }
         app
@@ -416,6 +420,7 @@ impl EloraApp {
             server_form: settings.server.clone(),
             display_name: settings.display_name.clone(),
             identifier: settings.identifier.clone(),
+            peer_color: settings.peer_color,
             sent_identifier: String::new(),
             remote_ids: BTreeSet::new(),
             remote_bodies: BTreeMap::new(),
@@ -483,6 +488,7 @@ impl EloraApp {
             server: self.server.clone(),
             display_name: self.display_name.clone(),
             identifier: self.identifier.clone(),
+            peer_color: self.peer_color,
         };
         self.storage.save_settings(&settings);
     }
@@ -1001,6 +1007,8 @@ impl EloraApp {
                             self.highlight_rgb = d.highlight_rgb;
                             self.show_formatting_bar = d.show_formatting_bar;
                             self.show_card_previews = d.show_card_previews;
+                            self.peer_color = d.peer_color;
+                            self.collab.set_color(self.peer_color);
                             changed = true;
                         }
                     });
@@ -1190,6 +1198,47 @@ impl EloraApp {
                 self.status_message = Some("Key copied".to_string());
             }
         });
+        // How this person looks in somebody else's note: the colour of their caret and of the
+        // name beside it. Nothing on this screen changes, so the hint says so in words.
+        let mut color_changed = false;
+        ui.horizontal(|ui| {
+            ui.label("Your colour");
+            let automatic = crate::collab::default_peer_color(&self.server_display_name());
+            let mut chosen = self.peer_color.unwrap_or(automatic);
+            if ui
+                .color_edit_button_srgb(&mut chosen)
+                .on_hover_text(
+                    "The colour others see your name and caret in while a note is shared",
+                )
+                .changed()
+            {
+                self.peer_color = Some(chosen);
+                color_changed = true;
+            }
+            if self.peer_color.is_some()
+                && ui
+                    .small_button("Automatic")
+                    .on_hover_text("Go back to the colour picked from your name")
+                    .clicked()
+            {
+                self.peer_color = None;
+                color_changed = true;
+            }
+        });
+        ui.label(
+            RichText::new(
+                "Your colour in a shared note: the name beside your caret and the caret itself, \
+                 as it looks on everybody else's screen. Nothing here changes.",
+            )
+            .size(10.5)
+            .color(p.fg_muted),
+        );
+        if color_changed {
+            // Applies to the people already in a note with you, and is remembered for the next
+            // connection, so it never has to be picked again.
+            self.collab.set_color(self.peer_color);
+            self.persist_settings();
+        }
         if name_changed || identifier_changed {
             self.persist_settings();
         }
@@ -1765,6 +1814,7 @@ impl EloraApp {
         let name = self.server_display_name();
         let identifier = self.identifier.clone();
         self.sent_identifier = identifier.clone();
+        self.collab.set_color(self.peer_color);
         self.collab.connect(self.server.clone(), name, identifier);
         self.status_message = Some(format!("Connecting to {}…", self.server.address()));
     }
@@ -7327,6 +7377,40 @@ mod tests {
         app.persist_settings();
         let reopened = EloraApp::with_context(&ctx, NoteStorage::new(dir.join("notes")).unwrap());
         assert_eq!(reopened.identifier, app.identifier);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The colour picked for the caret is a setting like any other: nothing chosen means the
+    /// name picks one, and a chosen colour survives a restart so it is picked once.
+    #[test]
+    fn test_a_colour_picked_for_the_caret_is_remembered() {
+        let dir = std::env::temp_dir().join(format!(
+            "elora-colour-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = NoteStorage::new(dir.join("notes")).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = EloraApp::with_context(&ctx, storage);
+
+        assert_eq!(app.peer_color, None, "nothing is chosen on a fresh install");
+
+        app.peer_color = Some([240, 10, 20]);
+        app.persist_settings();
+        let reopened = EloraApp::with_context(&ctx, NoteStorage::new(dir.join("notes")).unwrap());
+        assert_eq!(reopened.peer_color, Some([240, 10, 20]));
+
+        // The button beside the picker puts it back to the colour the name picks, and that
+        // cleared state is what is saved: going back to automatic survives a restart too.
+        app.peer_color = None;
+        app.persist_settings();
+        let reopened = EloraApp::with_context(&ctx, NoteStorage::new(dir.join("notes")).unwrap());
+        assert_eq!(reopened.peer_color, None);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

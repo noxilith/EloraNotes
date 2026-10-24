@@ -211,6 +211,9 @@ enum Command {
     },
     /// The name other people see for this connection.
     SetName(String),
+    /// The colour this person's caret is drawn in on everybody else's screen. `None` goes back to
+    /// a colour picked from the name.
+    SetColor(Option<[u8; 3]>),
     Create {
         title: String,
         folder: Option<String>,
@@ -267,6 +270,9 @@ pub struct Collab {
     last_error: Option<String>,
     /// Called by the worker when a message arrives, to redraw the window straight away.
     wake: Option<Waker>,
+    /// The colour this person chose to be drawn in on other people's screens, if they chose one.
+    /// Kept here rather than in the session so a connection made later already knows it.
+    color: Option<[u8; 3]>,
 }
 
 impl Default for Collab {
@@ -292,6 +298,7 @@ impl Collab {
             offline_reported: false,
             last_error: None,
             wake: None,
+            color: None,
         }
     }
 
@@ -369,9 +376,10 @@ impl Collab {
             events: event_tx,
             wake: self.wake.clone(),
         };
+        let color = self.color;
         std::thread::Builder::new()
             .name("elora-collab".to_string())
-            .spawn(move || worker(profile, username, identifier, command_rx, notify))
+            .spawn(move || worker(profile, username, identifier, color, command_rx, notify))
             .ok();
         self.commands = Some(command_tx);
         self.events = event_rx;
@@ -527,6 +535,15 @@ impl Collab {
         self.send(Command::SetName(name.to_string()));
     }
 
+    /// The colour this person is drawn in on everybody else's screen: one they chose, or `None`
+    /// to let the name decide. Remembered for the next connection too.
+    pub fn set_color(&mut self, color: Option<[u8; 3]>) {
+        self.color = color;
+        if self.is_connected() {
+            self.send(Command::SetColor(color));
+        }
+    }
+
     /// Sends a caret position for `note_id`, in bytes.
     pub fn send_cursor(&mut self, note_id: &str, byte_index: usize) {
         if self.is_connected() {
@@ -659,6 +676,7 @@ fn worker(
     profile: ServerProfile,
     name: String,
     identifier: String,
+    mut color: Option<[u8; 3]>,
     commands: Receiver<Command>,
     events: Notify,
 ) {
@@ -670,7 +688,7 @@ fn worker(
         ) {
             return;
         }
-        match Session::start(&profile, &name, &identifier, &events, &commands) {
+        match Session::start(&profile, &name, color, &identifier, &events, &commands) {
             Ok(mut session) => {
                 delay = FIRST_RETRY;
                 let reason = session.run(&commands, &events);
@@ -686,6 +704,9 @@ fn worker(
         while Instant::now() < deadline {
             match commands.recv_timeout(Duration::from_millis(50)) {
                 Ok(Command::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                // A colour picked while the connection is down belongs to the next attempt, not
+                // to the one that already ended.
+                Ok(Command::SetColor(chosen)) => color = chosen,
                 Ok(_) => {}
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
@@ -698,6 +719,7 @@ impl Session {
     fn start(
         profile: &ServerProfile,
         name: &str,
+        color: Option<[u8; 3]>,
         identifier: &str,
         events: &Notify,
         commands: &Receiver<Command>,
@@ -790,7 +812,7 @@ impl Session {
             last_cursor: Instant::now(),
             last_cursor_sent: None,
             name: name.to_string(),
-            color: color_for(name),
+            color: color.unwrap_or_else(|| default_peer_color(name)),
         };
         session.publish_awareness(events, true);
         Ok(session)
@@ -875,6 +897,12 @@ impl Session {
                 self.name = name;
                 // Sent as an ordinary awareness change, so the people in this note see the new
                 // name without the connection being made again.
+                self.publish_awareness(events, false);
+                return Ok(());
+            }
+            Command::SetColor(color) => {
+                // A fresh caret position is not news, so the published state keeps the last one.
+                self.color = color.unwrap_or_else(|| default_peer_color(&self.name));
                 self.publish_awareness(events, false);
                 return Ok(());
             }
@@ -1284,7 +1312,9 @@ fn read_frames(
     }
 }
 
-fn color_for(name: &str) -> [u8; 3] {
+/// The colour a name is drawn in when its person has not chosen one: a stable pick out of the
+/// shared palette, so the same name is the same colour on every screen.
+pub fn default_peer_color(name: &str) -> [u8; 3] {
     let mut hash: u64 = 1469598103934665603;
     for byte in name.as_bytes() {
         hash ^= *byte as u64;
@@ -1451,8 +1481,8 @@ mod tests {
 
     #[test]
     fn test_color_for_is_stable_and_inside_the_palette() {
-        assert_eq!(color_for("nova"), color_for("nova"));
-        assert!(PEER_COLORS.contains(&color_for("nova")));
-        assert!(PEER_COLORS.contains(&color_for("other person")));
+        assert_eq!(default_peer_color("nova"), default_peer_color("nova"));
+        assert!(PEER_COLORS.contains(&default_peer_color("nova")));
+        assert!(PEER_COLORS.contains(&default_peer_color("other person")));
     }
 }
