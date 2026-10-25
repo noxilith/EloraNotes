@@ -183,6 +183,12 @@ pub enum Incoming {
     /// not shared with you. The connection is still up, so this is a message, not an outage.
     Refused(String),
     Offline(String),
+    /// A server with no pinned certificate yet presented this fingerprint. Nothing was sent to
+    /// it, and the worker has stopped: the password and identifier only go to a server whose
+    /// certificate the user has confirmed, so the next step is theirs.
+    Unverified {
+        fingerprint: String,
+    },
 }
 
 /// What the UI wants to happen when a message arrives. The server binary builds without a window
@@ -484,6 +490,13 @@ impl Collab {
                 self.peers.clear();
                 self.presence.clear();
             }
+            Incoming::Unverified { fingerprint } => {
+                self.state = ConnectionState::Offline;
+                self.commands = None;
+                self.last_error =
+                    Some("Confirm the server's certificate code to finish connecting".to_string());
+                self.pending_fingerprint = Some(fingerprint.clone());
+            }
             Incoming::Body { .. }
             | Incoming::Created(_)
             | Incoming::Attachment { .. }
@@ -716,14 +729,26 @@ fn worker(
         ) {
             return;
         }
-        match Session::start(&profile, &name, color, &identifier, &events, &commands) {
-            Ok(mut session) => {
-                delay = FIRST_RETRY;
-                let reason = session.run(&commands, &events);
-                events.send(Incoming::Offline(reason));
+        // Nothing pinned yet: learn the certificate, hand it to the user, and stop. The
+        // handshake below sends the password and identifier, so it waits for a pinned key.
+        if profile.fingerprint.is_none() {
+            match probe_fingerprint(&profile) {
+                Ok(fingerprint) => {
+                    events.send(Incoming::Unverified { fingerprint });
+                    return;
+                }
+                Err(error) => events.send(Incoming::Offline(error)),
             }
-            Err(error) => {
-                events.send(Incoming::Offline(error));
+        } else {
+            match Session::start(&profile, &name, color, &identifier, &events, &commands) {
+                Ok(mut session) => {
+                    delay = FIRST_RETRY;
+                    let reason = session.run(&commands, &events);
+                    events.send(Incoming::Offline(reason));
+                }
+                Err(error) => {
+                    events.send(Incoming::Offline(error));
+                }
             }
         }
 
@@ -741,6 +766,38 @@ fn worker(
         }
         delay = (delay * 2).min(MAX_RETRY);
     }
+}
+
+/// Runs only the TLS handshake with a server and returns the fingerprint of the certificate it
+/// presented. No Elora message is written, so nothing secret reaches a server that has not been
+/// confirmed yet.
+fn probe_fingerprint(profile: &ServerProfile) -> Result<String, String> {
+    let address = profile.address();
+    let mut socket = connect_socket(&address, CONNECT_TIMEOUT)?;
+    socket
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| e.to_string())?;
+    socket
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| e.to_string())?;
+    let (config, seen) = crate::tls::client_config(None);
+    let server_name = rustls::pki_types::ServerName::try_from(profile.host.trim().to_string())
+        .unwrap_or_else(|_| {
+            rustls::pki_types::ServerName::try_from("elora-server").expect("valid name")
+        });
+    let mut connection = rustls::ClientConnection::new(config, server_name)
+        .map_err(|e| format!("could not start TLS: {e}"))?;
+    while connection.is_handshaking() {
+        connection
+            .complete_io(&mut socket)
+            .map_err(|e| format!("could not reach {address} over TLS: {e}"))?;
+    }
+    connection.send_close_notify();
+    let _ = connection.complete_io(&mut socket);
+    seen.lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .ok_or_else(|| "the server presented no certificate".to_string())
 }
 
 impl Session {

@@ -37,6 +37,11 @@ pub struct Registry {
 /// typo or a hand-written key.
 pub const MIN_IDENTIFIER: usize = 16;
 
+/// The most names one key may hold. A person renames themselves now and then, and every old
+/// name stays theirs; without a limit, one key could reconnect under name after name and hold
+/// every name the rest of the server is going to want.
+pub const MAX_NAMES_PER_KEY: usize = 8;
+
 /// The public key behind a client's secret identifier: a one-way digest of it.
 ///
 /// This is the value the world is allowed to see. It goes into the server's name list and into
@@ -90,6 +95,13 @@ impl Registry {
             }
             Some(_) => {}
             None => {
+                if self.names_of(key).len() >= MAX_NAMES_PER_KEY {
+                    return Err(format!(
+                        "you already go by {MAX_NAMES_PER_KEY} names on this server, which is \
+                         the most it keeps for one person. Use one of them in Settings, or ask \
+                         the server's operator to release one."
+                    ));
+                }
                 self.names.insert(name.to_lowercase(), key.to_string());
                 bound = true;
             }
@@ -169,7 +181,8 @@ impl Registry {
         }
         let text = serde_json::to_string_pretty(self)
             .map_err(|e| format!("could not write who is who: {e}"))?;
-        std::fs::write(path, text).map_err(|e| format!("could not write {}: {e}", path.display()))
+        crate::storage::write_atomic(path, text)
+            .map_err(|e| format!("could not write {}: {e}", path.display()))
     }
 
     /// The path this registry is kept at, for the tests.
@@ -194,6 +207,21 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("people.json")
+    }
+
+    /// One key cannot reconnect under name after name and sit on every one of them.
+    #[test]
+    fn test_one_key_holds_a_limited_number_of_names() {
+        let path = temp_path("limit");
+        let mut registry = Registry::load(path).unwrap();
+        let nox = public_key("a-long-secret-of-nox");
+        for n in 0..MAX_NAMES_PER_KEY {
+            registry.claim(&format!("nox{n}"), &nox).unwrap();
+        }
+        assert!(registry.claim("mira", &nox).is_err());
+        assert!(registry.key_of("mira").is_none());
+        // A name it already holds still works.
+        assert!(registry.claim("nox0", &nox).is_ok());
     }
 
     #[test]

@@ -5,6 +5,37 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// Replaces `path` with `contents` so that a crash, power cut or full disk part-way through
+/// leaves either the old file or the new one, never an empty or half-written one. The bytes go
+/// to a hidden sibling first, are flushed to disk, and only then renamed over the original.
+/// The original's permissions carry over, so a file locked to its owner (the server's
+/// `config.json` holds the password) stays locked after a save.
+pub fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
+    use std::io::Write;
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+    let mut temp_name = std::ffi::OsString::from(".");
+    temp_name.push(name);
+    temp_name.push(".tmp");
+    let temp = path.with_file_name(temp_name);
+    let result = (|| {
+        let mut file = fs::File::create(&temp)?;
+        #[cfg(unix)]
+        if let Ok(existing) = fs::metadata(path) {
+            file.set_permissions(existing.permissions())?;
+        }
+        file.write_all(contents.as_ref())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum NoteTemplate {
     Blank,
@@ -282,6 +313,10 @@ pub struct Note {
     pub shared_with: Vec<String>,
     /// The public keys behind those names, which is what actually lets their holders in.
     pub shared_keys: Vec<String>,
+    /// Frontmatter lines this app has no use for (`aliases:`, `date:`, another tool's keys),
+    /// exactly as they were in the file, so saving a note never strips them.
+    #[serde(default)]
+    pub extra_frontmatter: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub file_path: PathBuf,
@@ -308,6 +343,7 @@ impl Note {
             private: false,
             shared_with: Vec::new(),
             shared_keys: Vec::new(),
+            extra_frontmatter: String::new(),
             created_at: now,
             updated_at: now,
             file_path,
@@ -573,7 +609,7 @@ impl Note {
         };
 
         format!(
-            "---\ntitle: \"{}\"\npinned: {}\ntrashed: {}\ntags: {}\n{}{}{}{}{}{}{}created_at: {}\nupdated_at: {}\n---\n{}",
+            "---\ntitle: \"{}\"\npinned: {}\ntrashed: {}\ntags: {}\n{}{}{}{}{}{}{}{}created_at: {}\nupdated_at: {}\n---\n{}",
             escaped_title,
             self.pinned,
             self.trashed,
@@ -588,6 +624,7 @@ impl Note {
             private_line,
             shared_line,
             shared_keys_line,
+            self.extra_frontmatter,
             self.created_at.to_rfc3339(),
             self.updated_at.to_rfc3339(),
             self.body
@@ -616,72 +653,71 @@ impl Note {
             let mut created_at = fallback_time;
             let mut updated_at = fallback_time;
 
-            for line in frontmatter.lines() {
-                let line = line.trim();
-                if let Some((key, val)) = line.split_once(':') {
-                    let key = key.trim();
-                    let val = val.trim();
-                    match key {
-                        "title" => {
-                            title = unquote_yaml_string(val);
-                        }
-                        "pinned" => {
-                            pinned = val.eq_ignore_ascii_case("true");
-                        }
-                        "trashed" => {
-                            trashed = val.eq_ignore_ascii_case("true");
-                        }
-                        "tags" => {
-                            explicit_tags = parse_yaml_tags(val);
-                        }
-                        "folder" => {
-                            folder = normalize_folder(&unquote_yaml_string(val));
-                        }
-                        "owner" => {
-                            let name = crate::net::normalize_identifier(&unquote_yaml_string(val));
-                            owner = (!name.is_empty()).then_some(name);
-                        }
-                        "owner_key" => {
-                            let key = unquote_yaml_string(val);
-                            owner_key = (!key.trim().is_empty()).then(|| key.trim().to_string());
-                        }
-                        "private" => {
-                            private = val.eq_ignore_ascii_case("true");
-                        }
-                        "shared_with" => {
-                            shared_with = parse_yaml_list(val)
-                                .iter()
-                                .map(|name| crate::net::normalize_identifier(name))
-                                .filter(|name| !name.is_empty())
-                                .collect();
-                        }
-                        "shared_keys" => {
-                            shared_keys = parse_yaml_list(val)
-                                .iter()
-                                .map(|key| key.trim().to_string())
-                                .filter(|key| !key.is_empty())
-                                .collect();
-                        }
-                        "icon" => {
-                            let name: String = val
-                                .trim_matches('"')
-                                .chars()
-                                .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-                                .collect();
-                            icon = (!name.is_empty()).then_some(name);
-                        }
-                        "created_at" => {
-                            if let Ok(dt) = DateTime::parse_from_rfc3339(val.trim_matches('"')) {
-                                created_at = dt.with_timezone(&Utc);
-                            }
-                        }
-                        "updated_at" => {
-                            if let Ok(dt) = DateTime::parse_from_rfc3339(val.trim_matches('"')) {
-                                updated_at = dt.with_timezone(&Utc);
-                            }
-                        }
-                        _ => {}
+            let mut extra_frontmatter = String::new();
+            for entry in frontmatter_entries(frontmatter) {
+                let val = entry.value.as_str();
+                match entry.key {
+                    "title" => {
+                        title = unquote_yaml_string(val);
                     }
+                    "pinned" => {
+                        pinned = val.eq_ignore_ascii_case("true");
+                    }
+                    "trashed" => {
+                        trashed = val.eq_ignore_ascii_case("true");
+                    }
+                    "tags" => {
+                        explicit_tags = parse_yaml_tags(val);
+                    }
+                    "folder" => {
+                        folder = normalize_folder(&unquote_yaml_string(val));
+                    }
+                    "owner" => {
+                        let name = crate::net::normalize_identifier(&unquote_yaml_string(val));
+                        owner = (!name.is_empty()).then_some(name);
+                    }
+                    "owner_key" => {
+                        let key = unquote_yaml_string(val);
+                        owner_key = (!key.trim().is_empty()).then(|| key.trim().to_string());
+                    }
+                    "private" => {
+                        private = val.eq_ignore_ascii_case("true");
+                    }
+                    "shared_with" => {
+                        shared_with = parse_yaml_list(val)
+                            .iter()
+                            .map(|name| crate::net::normalize_identifier(name))
+                            .filter(|name| !name.is_empty())
+                            .collect();
+                    }
+                    "shared_keys" => {
+                        shared_keys = parse_yaml_list(val)
+                            .iter()
+                            .map(|key| key.trim().to_string())
+                            .filter(|key| !key.is_empty())
+                            .collect();
+                    }
+                    "icon" => {
+                        let name: String = val
+                            .trim_matches('"')
+                            .chars()
+                            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+                            .collect();
+                        icon = (!name.is_empty()).then_some(name);
+                    }
+                    "created_at" => {
+                        if let Ok(dt) = DateTime::parse_from_rfc3339(val.trim_matches('"')) {
+                            created_at = dt.with_timezone(&Utc);
+                        }
+                    }
+                    "updated_at" => {
+                        if let Ok(dt) = DateTime::parse_from_rfc3339(val.trim_matches('"')) {
+                            updated_at = dt.with_timezone(&Utc);
+                        }
+                    }
+                    // Anything else — `aliases:`, `date:`, another app's settings — is
+                    // kept exactly as written and put back on every save.
+                    _ => extra_frontmatter.push_str(&entry.raw),
                 }
             }
 
@@ -699,6 +735,7 @@ impl Note {
                 private,
                 shared_with,
                 shared_keys,
+                extra_frontmatter,
                 created_at,
                 updated_at,
                 file_path,
@@ -737,6 +774,7 @@ impl Note {
                 private: false,
                 shared_with: Vec::new(),
                 shared_keys: Vec::new(),
+                extra_frontmatter: String::new(),
                 created_at: fallback_time,
                 updated_at: fallback_time,
                 file_path,
@@ -945,17 +983,100 @@ fn split_frontmatter(raw: &str) -> Option<(&str, &str)> {
     let raw = raw
         .strip_prefix("---\n")
         .or_else(|| raw.strip_prefix("---\r\n"))?;
-    if let Some(idx) = raw.find("\n---\n") {
-        let fm = &raw[..idx];
-        let body = &raw[idx + 5..];
-        Some((fm, body))
-    } else if let Some(idx) = raw.find("\r\n---\r\n") {
-        let fm = &raw[..idx];
-        let body = &raw[idx + 7..];
-        Some((fm, body))
+    let (fm, body) = if let Some(idx) = raw.find("\n---\n") {
+        (&raw[..idx], &raw[idx + 5..])
     } else {
-        None
+        let idx = raw.find("\r\n---\r\n")?;
+        (&raw[..idx], &raw[idx + 7..])
+    };
+    // A note that simply opens with a horizontal rule also starts with `---`. What sits between
+    // the two rules is only frontmatter if it reads like YAML, or that text would vanish from
+    // the note on the next save.
+    looks_like_yaml(fm).then_some((fm, body))
+}
+
+/// Whether every top-level line is a `key: value`, with indented and `- item` lines under it.
+fn looks_like_yaml(block: &str) -> bool {
+    block.lines().all(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with('#')
+            || trimmed.starts_with("- ")
+            || trimmed == "-"
+            || line.starts_with([' ', '\t'])
+        {
+            return true;
+        }
+        line.split_once(':').is_some_and(|(key, _)| {
+            let key = key.trim();
+            !key.is_empty()
+                && key.len() <= 64
+                && key
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | ' ' | '.'))
+        })
+    })
+}
+
+/// One top-level `key: value` of a frontmatter block, with the indented and `- item` lines that
+/// belong to it.
+struct FrontmatterEntry<'a> {
+    key: &'a str,
+    /// The value, with a block list (`tags:` then `- a` lines) turned into `[a, b]`.
+    value: String,
+    /// The lines exactly as they were in the file, newline included.
+    raw: String,
+}
+
+fn frontmatter_entries(block: &str) -> Vec<FrontmatterEntry<'_>> {
+    let mut entries: Vec<(FrontmatterEntry, Vec<String>)> = Vec::new();
+    for line in block.lines() {
+        let trimmed = line.trim();
+        let continues = line.starts_with([' ', '\t'])
+            || trimmed.starts_with("- ")
+            || trimmed == "-"
+            || trimmed.is_empty()
+            || trimmed.starts_with('#');
+        let starts_entry = !continues && line.contains(':');
+        if starts_entry {
+            let (key, value) = line.split_once(':').expect("checked above");
+            entries.push((
+                FrontmatterEntry {
+                    key: key.trim(),
+                    value: value.trim().to_string(),
+                    raw: String::new(),
+                },
+                Vec::new(),
+            ));
+        } else if entries.is_empty() {
+            // A comment or stray line before the first key: kept, under no key at all.
+            entries.push((
+                FrontmatterEntry {
+                    key: "",
+                    value: String::new(),
+                    raw: String::new(),
+                },
+                Vec::new(),
+            ));
+        }
+        let (entry, items) = entries.last_mut().expect("just pushed");
+        entry.raw.push_str(line);
+        entry.raw.push('\n');
+        if !starts_entry {
+            if let Some(item) = trimmed.strip_prefix("- ") {
+                items.push(item.trim().to_string());
+            }
+        }
     }
+    entries
+        .into_iter()
+        .map(|(mut entry, items)| {
+            if entry.value.is_empty() && !items.is_empty() {
+                entry.value = format!("[{}]", items.join(", "));
+            }
+            entry
+        })
+        .collect()
 }
 
 fn unquote_yaml_string(val: &str) -> String {
@@ -1097,12 +1218,76 @@ fn default_notes_dir_for(documents: Option<PathBuf>, home: Option<PathBuf>) -> P
 
 pub struct NoteStorage {
     root_dir: PathBuf,
+    /// When each note file was last read or written by this app. A file whose time has moved
+    /// since was changed by something else — another editor, a sync tool — and a save must not
+    /// silently write over that.
+    seen: std::sync::Mutex<std::collections::HashMap<PathBuf, std::time::SystemTime>>,
+    /// Copies made of outside edits since the app last asked, for it to show.
+    kept_copies: std::sync::Mutex<Vec<Note>>,
+}
+
+fn modified(path: &Path) -> Option<std::time::SystemTime> {
+    fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
 impl NoteStorage {
     pub fn new(root_dir: PathBuf) -> io::Result<Self> {
         fs::create_dir_all(&root_dir)?;
-        Ok(Self { root_dir })
+        Ok(Self {
+            root_dir,
+            seen: Default::default(),
+            kept_copies: Default::default(),
+        })
+    }
+
+    fn remember(&self, path: &Path) {
+        if let (Some(time), Ok(mut seen)) = (modified(path), self.seen.lock()) {
+            seen.insert(path.to_path_buf(), time);
+        }
+    }
+
+    /// The notes made from outside edits that a save would otherwise have written over. Each
+    /// is already on disk; the app adds them to its list and says what happened.
+    pub fn take_kept_copies(&self) -> Vec<Note> {
+        self.kept_copies
+            .lock()
+            .map(|mut kept| std::mem::take(&mut *kept))
+            .unwrap_or_default()
+    }
+
+    /// If the file was changed outside the app since it was last read or written here, keeps
+    /// that version as a note of its own before it is replaced.
+    fn keep_outside_edit(&self, path: &Path) -> io::Result<()> {
+        let last_seen = self
+            .seen
+            .lock()
+            .ok()
+            .and_then(|seen| seen.get(path).copied());
+        let (Some(last_seen), Some(now)) = (last_seen, modified(path)) else {
+            return Ok(());
+        };
+        if now == last_seen {
+            return Ok(());
+        }
+        let raw = fs::read_to_string(path)?;
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("note")
+            .to_string();
+        let mut copy = Note::from_markdown(stem, &raw, path.to_path_buf());
+        let title = format!("{} (edited outside EloraNotes)", copy.display_title());
+        let fresh = Note::new(title.clone(), "", &self.root_dir);
+        copy.id = fresh.id;
+        copy.file_path = fresh.file_path;
+        copy.title = title;
+        copy.pinned = false;
+        write_atomic(&copy.file_path, copy.to_markdown())?;
+        self.remember(&copy.file_path);
+        if let Ok(mut kept) = self.kept_copies.lock() {
+            kept.push(copy);
+        }
+        Ok(())
     }
 
     pub fn default_notes_dir() -> PathBuf {
@@ -1132,7 +1317,7 @@ impl NoteStorage {
 
     pub fn save_settings(&self, settings: &AppSettings) {
         if let Ok(json) = serde_json::to_string_pretty(settings) {
-            let _ = fs::write(self.settings_path(), json);
+            let _ = write_atomic(&self.settings_path(), json);
         }
     }
 
@@ -1152,6 +1337,7 @@ impl NoteStorage {
                     .unwrap_or("note")
                     .to_string();
                 if let Ok(raw) = fs::read_to_string(&path) {
+                    self.remember(&path);
                     let note = Note::from_markdown(id, &raw, path);
                     notes.push(note);
                 }
@@ -1168,12 +1354,16 @@ impl NoteStorage {
 
     pub fn save_note(&self, note: &Note) -> io::Result<()> {
         fs::create_dir_all(&self.root_dir)?;
-        let content = note.to_markdown();
-        fs::write(&note.file_path, content)
+        self.keep_outside_edit(&note.file_path)?;
+        write_atomic(&note.file_path, note.to_markdown())?;
+        self.remember(&note.file_path);
+        Ok(())
     }
 
     /// Copies every `.md` file directly inside `src` into the notes folder as a new note, keeping
     /// its frontmatter and body. Files get fresh IDs so existing notes are never overwritten.
+    /// Each file that made it in is then moved into `src/Imported`, so pressing Import again
+    /// does not bring the same notes in twice.
     pub fn import_markdown_dir(&self, src: &Path) -> io::Result<usize> {
         let mut imported = 0;
         for entry in fs::read_dir(src)? {
@@ -1191,8 +1381,23 @@ impl NoteStorage {
             let fresh = Note::new(stem, "", &self.root_dir);
             note.id = fresh.id;
             note.file_path = fresh.file_path;
+            // Something imported is wanted: a note that was in another vault's trash arrives
+            // as a live note, not straight into this one's trash.
+            note.trashed = false;
             self.save_note(&note)?;
             imported += 1;
+
+            let done = src.join("Imported");
+            fs::create_dir_all(&done)?;
+            let mut target = done.join(path.file_name().unwrap_or_default());
+            if target.exists() {
+                let stamp = Utc::now().format("%Y%m%d-%H%M%S");
+                target = done.join(format!(
+                    "{}-{stamp}.md",
+                    path.file_stem().and_then(|s| s.to_str()).unwrap_or("note")
+                ));
+            }
+            fs::rename(&path, target)?;
         }
         Ok(imported)
     }
@@ -1207,18 +1412,21 @@ impl NoteStorage {
     fn seed_starter_notes(&self) -> io::Result<Vec<Note>> {
         let mut welcome = Note::new(
             "Welcome to EloraNotes",
-            "Elora is a calm, minimalistic workspace for your thoughts — now enhanced with **Tabler Icons**, **Wiki-links**, and a **Command Palette**.\n\n\
-             ## What's New\n\
-             - **Command Palette (`Ctrl+K`)**: Jump to any note, create from templates, switch themes, or run actions without leaving the keyboard.\n\
-             - **Bi-Directional `[[Wiki Links]]`**: Reference other notes like [[Reading & Project Ideas]] or [[Daily Scratchpad]]. Click any link in Preview/Split mode to jump right to it, or create it on the fly.\n\
-             - **Editor Views**: Switch between **Edit**, **Split View** (`Ctrl+Shift+E`), and **Preview** (`Ctrl+E`).\n\
-             - **Interactive Checklists**: Click tasks directly in Preview or Split mode to check them off.\n\
-             - **Daily Note (`Ctrl+D`)**: Open or create today's dated journal note in one keystroke.\n\n\
-             ## Quick Checklist\n\
-             - [x] Store notes as clean `.md` files on disk\n\
-             - [x] Integrate crisp Tabler Icons across the interface\n\
-             - [ ] Press `Ctrl+K` to try the Command Palette\n\n\
-             Write freely — your notes auto-save as you type. #welcome #guide",
+            "Every note is a plain `.md` file in your notes folder, and it saves as you type.\n\n\
+             ## Getting around\n\
+             - `Ctrl+N` starts a new note, and `Ctrl+D` opens today's daily note.\n\
+             - `Ctrl+K` opens the command palette: jump to a note, use a template or switch themes.\n\
+             - `Ctrl+E` shows the rendered page, and `Ctrl+Shift+E` puts it beside the Markdown.\n\
+             - `Ctrl+F` finds a word in this note; `Ctrl+Shift+F` searches all of them.\n\
+             - `Ctrl+\\` hides everything but the page.\n\n\
+             ## Linking notes\n\
+             Write a note's title in double brackets, like [[Reading & Project Ideas]], to link to it. \
+             A link to a note that does not exist yet creates it when you click it.\n\n\
+             ## Try it\n\
+             - [ ] Tick this box in the rendered page\n\
+             - [ ] Press `Ctrl+K` and type a few letters of a note's title\n\
+             - [ ] Add a #tag and filter the sidebar by it\n\n\
+             #welcome #guide",
             &self.root_dir,
         );
         welcome.pinned = true;
@@ -1242,10 +1450,11 @@ impl NoteStorage {
 
         let mut journal = Note::new(
             "Daily Scratchpad",
-            "## Today's Priorities\n\
-             - [x] Design a quiet, distraction-free workspace\n\
-             - [x] Add Tabler Icons and 4 minimalist color palettes\n\
-             - [ ] Link notes together with [[Welcome to EloraNotes]]\n\n\
+            "## Today\n\
+             - [ ] Write down the three things that matter most\n\
+             - [ ] Link a note to [[Welcome to EloraNotes]]\n\n\
+             ## Notes\n\
+             - \n\n\
              #journal #daily",
             &self.root_dir,
         );
@@ -1423,6 +1632,102 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// A note changed by another program after it was loaded is kept as a copy, not written
+    /// over; a note nobody else touched is just saved.
+    #[test]
+    fn test_an_outside_edit_is_kept_not_overwritten() {
+        let dir = temp_test_dir("outside");
+        let storage = NoteStorage::new(dir.clone()).unwrap();
+        let mut note = Note::new("Plan", "mine", &dir);
+        storage.save_note(&note).unwrap();
+        note.body = "mine, edited".into();
+        storage.save_note(&note).unwrap();
+        assert!(storage.take_kept_copies().is_empty());
+
+        // Another editor writes the file; make sure its time differs from ours.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let theirs = note.to_markdown().replace("mine, edited", "theirs");
+        fs::write(&note.file_path, theirs).unwrap();
+        let file = fs::File::options()
+            .write(true)
+            .open(&note.file_path)
+            .unwrap();
+        file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        drop(file);
+
+        note.body = "mine, again".into();
+        storage.save_note(&note).unwrap();
+        let kept = storage.take_kept_copies();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].body, "theirs");
+        assert!(kept[0].title.contains("edited outside"));
+        assert!(kept[0].file_path.is_file());
+        assert!(fs::read_to_string(&note.file_path)
+            .unwrap()
+            .contains("mine, again"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Frontmatter from other tools survives a save, block lists are read, and a note that just
+    /// opens with a horizontal rule keeps its first paragraph.
+    #[test]
+    fn test_frontmatter_this_app_does_not_know_survives_a_save() {
+        let raw = "---\ntitle: \"Trip\"\naliases:\n  - Holiday\n  - Away\ndate: 2026-07-01\n\
+                   tags:\n  - travel\n  - Summer\ncreated_at: 2026-01-01T00:00:00+00:00\n\
+                   updated_at: 2026-01-01T00:00:00+00:00\n---\nPacking list";
+        let note = Note::from_markdown("trip".into(), raw, PathBuf::from("/nonexistent/trip.md"));
+        assert_eq!(note.title, "Trip");
+        assert_eq!(note.explicit_tags, ["travel", "summer"]);
+        assert_eq!(note.body, "Packing list");
+        let saved = note.to_markdown();
+        assert!(
+            saved.contains("aliases:\n  - Holiday\n  - Away\n"),
+            "{saved}"
+        );
+        assert!(saved.contains("date: 2026-07-01\n"), "{saved}");
+        // And it reads back the same.
+        let again =
+            Note::from_markdown("trip".into(), &saved, PathBuf::from("/nonexistent/trip.md"));
+        assert_eq!(again.extra_frontmatter, note.extra_frontmatter);
+        assert_eq!(again.to_markdown(), saved);
+
+        let ruled = "---\nA first paragraph, set off by rules.\n---\nThe rest.";
+        let note = Note::from_markdown("ruled".into(), ruled, PathBuf::from("/nonexistent/r.md"));
+        assert!(note.body.contains("A first paragraph"), "{:?}", note.body);
+        let again = Note::from_markdown(
+            "ruled".into(),
+            &note.to_markdown(),
+            PathBuf::from("/nonexistent/r.md"),
+        );
+        assert_eq!(again.body, note.body);
+    }
+
+    /// A save replaces the file whole, leaves no temporary file behind, and keeps the
+    /// original's permissions.
+    #[test]
+    fn test_write_atomic_replaces_the_file_and_keeps_its_permissions() {
+        let dir = temp_test_dir("atomic");
+        let path = dir.join("note.md");
+        write_atomic(&path, "first").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        write_atomic(&path, "second").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "second");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let leftovers: Vec<_> = fs::read_dir(&dir).unwrap().collect();
+        assert_eq!(leftovers.len(), 1);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1603,7 +1908,7 @@ And a number #123 should be ignored, while #valid_tag is kept.";
         let storage = NoteStorage::new(root.clone()).unwrap();
         fs::write(
             src.join("Ideas.md"),
-            "---\ntitle: Ideas\ntags: [work]\n---\nBody with [[Other]]",
+            "---\ntitle: Ideas\ntags: [work]\ntrashed: true\n---\nBody with [[Other]]",
         )
         .unwrap();
         fs::write(src.join("notes.txt"), "ignored").unwrap();
@@ -1612,11 +1917,19 @@ And a number #123 should be ignored, while #valid_tag is kept.";
         let notes = storage.load_all().unwrap();
         let imported = notes.iter().find(|n| n.title == "Ideas").unwrap();
         assert!(imported.body.contains("Body with [[Other]]"));
+        assert!(!imported.trashed, "an imported note arrives live");
+        assert!(src.join("Imported/Ideas.md").is_file());
+        assert!(!src.join("Ideas.md").exists());
 
-        // Importing again adds a second copy instead of overwriting the first.
+        // Pressing Import again finds nothing new, so nothing is doubled.
+        assert_eq!(storage.import_markdown_dir(&src).unwrap(), 0);
+
+        // The same file dropped in again is a new note, beside the first.
+        fs::write(src.join("Ideas.md"), "---\ntitle: Ideas\n---\nAgain").unwrap();
         assert_eq!(storage.import_markdown_dir(&src).unwrap(), 1);
         let again = storage.load_all().unwrap();
         assert_eq!(again.iter().filter(|n| n.title == "Ideas").count(), 2);
+        assert_eq!(fs::read_dir(src.join("Imported")).unwrap().count(), 2);
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&src);

@@ -15,6 +15,8 @@ struct Harness {
     port: u16,
     note_id: String,
     notes_dir: std::path::PathBuf,
+    /// The test server's certificate, pinned the way a client is after the user trusts it.
+    fingerprint: String,
 }
 
 impl Drop for Harness {
@@ -75,7 +77,8 @@ fn start_server_with(extra: &[(String, String)]) -> Harness {
         notes_dir: notes_dir.clone(),
         bind: "127.0.0.1".into(),
     };
-    let server = Arc::new(Server::new(config).expect("server"));
+    let server = Arc::new(Server::new(config.clone()).expect("server"));
+    let fingerprint = elora_notes::tls::read_fingerprint(&config).expect("fingerprint");
     std::thread::spawn(move || {
         let _ = server.run();
     });
@@ -94,15 +97,19 @@ fn start_server_with(extra: &[(String, String)]) -> Harness {
         port,
         note_id,
         notes_dir,
+        fingerprint,
     }
 }
 
-fn profile(port: u16) -> ServerProfile {
-    ServerProfile {
-        host: "127.0.0.1".into(),
-        port,
-        password: "letmein".into(),
-        fingerprint: None,
+impl Harness {
+    /// A client profile for this server with its certificate already trusted.
+    fn profile(&self) -> ServerProfile {
+        ServerProfile {
+            host: "127.0.0.1".into(),
+            port: self.port,
+            password: "letmein".into(),
+            fingerprint: Some(self.fingerprint.clone()),
+        }
     }
 }
 
@@ -144,6 +151,37 @@ fn key(name: &str) -> String {
     format!("{name}-0123456789abcdef0123456789abcdef")
 }
 
+/// A server nobody has trusted yet gets a TLS handshake and nothing else: the client reports the
+/// certificate and stops before the password or identifier leave the machine.
+#[test]
+fn test_an_untrusted_server_never_sees_the_password_or_identifier() {
+    let _turn = SERVER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let harness = start_server();
+    let mut carol = Collab::new();
+    let mut unpinned = harness.profile();
+    unpinned.fingerprint = None;
+    carol.connect(unpinned, "carol".into(), key("carol"));
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut seen = None;
+    while Instant::now() < deadline && seen.is_none() {
+        for event in carol.poll() {
+            match event {
+                Incoming::Unverified { fingerprint } => seen = Some(fingerprint),
+                Incoming::Online { .. } => panic!("an untrusted server must not be logged into"),
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(seen.as_deref(), Some(harness.fingerprint.as_str()));
+    assert!(!carol.is_connected());
+    // The server binds a name to a key at the first Hello, so an empty slot means none came.
+    let registry =
+        people::Registry::load(ServerConfig::data_dir().join("people.json")).expect("registry");
+    assert!(registry.key_of("carol").is_none());
+}
+
 #[test]
 fn test_two_clients_edit_the_same_note() {
     let _turn = SERVER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -151,7 +189,7 @@ fn test_two_clients_edit_the_same_note() {
     let note_id = harness.note_id.clone();
 
     let mut alice = Collab::new();
-    alice.connect(profile(harness.port), "alice".into(), key("alice"));
+    alice.connect(harness.profile(), "alice".into(), key("alice"));
     settle(&mut alice, &mut String::new(), "alice", |c, _| {
         c.is_connected() && !c.notes().is_empty()
     });
@@ -179,7 +217,7 @@ fn test_two_clients_edit_the_same_note() {
     bob.set_waker(Arc::new(move || {
         woken.fetch_add(1, Ordering::SeqCst);
     }));
-    bob.connect(profile(harness.port), "bob".into(), key("bob"));
+    bob.connect(harness.profile(), "bob".into(), key("bob"));
     let mut bob_body = String::new();
     settle(&mut bob, &mut bob_body, "bob", |c, _| c.is_connected());
     bob.open_note(&note_id, "hello");
@@ -250,7 +288,7 @@ fn test_two_clients_edit_the_same_note() {
     // Two machines with the same account name: one leaving must not take the other's presence
     // away with it. Bob is the one looking, since Alice does not show herself.
     let mut twin = Collab::new();
-    twin.connect(profile(harness.port), "alice".into(), key("alice"));
+    twin.connect(harness.profile(), "alice".into(), key("alice"));
     settle(&mut twin, &mut String::new(), "twin", |c, _| {
         c.is_connected()
     });
@@ -271,7 +309,7 @@ fn test_two_clients_edit_the_same_note() {
 
     // A third client is the neutral observer of the merged result.
     let mut viewer = Collab::new();
-    viewer.connect(profile(harness.port), "viewer".into(), key("viewer"));
+    viewer.connect(harness.profile(), "viewer".into(), key("viewer"));
     let mut viewer_body = String::new();
     settle(&mut viewer, &mut viewer_body, "viewer", |c, _| {
         c.is_connected()
@@ -484,7 +522,7 @@ fn test_a_name_cannot_be_taken_by_another_key() {
     let harness = start_server();
 
     let mut alice = Collab::new();
-    alice.connect(profile(harness.port), "alice".into(), key("alice"));
+    alice.connect(harness.profile(), "alice".into(), key("alice"));
     settle(&mut alice, &mut String::new(), "alice", |c, _| {
         c.is_connected()
     });
@@ -492,7 +530,7 @@ fn test_a_name_cannot_be_taken_by_another_key() {
     // Somebody who knows the name but not the key is turned away — and told why, rather than
     // being let in as the person a note might be shared with.
     let mut impostor = Collab::new();
-    impostor.connect(profile(harness.port), "alice".into(), key("mallory"));
+    impostor.connect(harness.profile(), "alice".into(), key("mallory"));
     wait_until(&mut impostor, "the impostor", |c| {
         c.last_error()
             .is_some_and(|error| error.contains("belongs to somebody else"))
@@ -509,7 +547,7 @@ fn test_a_name_cannot_be_taken_by_another_key() {
     // A key too short to be a secret is refused before it can own anything, so a typo in
     // Settings cannot quietly turn a private note into a guessable one.
     let mut vague = Collab::new();
-    vague.connect(profile(harness.port), "bob".into(), "short".into());
+    vague.connect(harness.profile(), "bob".into(), "short".into());
     wait_until(&mut vague, "the short key", |c| {
         c.last_error()
             .is_some_and(|error| error.contains("too short"))
@@ -518,7 +556,7 @@ fn test_a_name_cannot_be_taken_by_another_key() {
 
     // Alice's second computer carries the same key, so it is Alice, with her notes.
     let mut laptop = Collab::new();
-    laptop.connect(profile(harness.port), "alice".into(), key("alice"));
+    laptop.connect(harness.profile(), "alice".into(), key("alice"));
     settle(&mut laptop, &mut String::new(), "alice's laptop", |c, _| {
         c.is_connected()
     });
@@ -538,7 +576,7 @@ fn test_sharing_with_a_name_goes_through_the_servers_own_list() {
     let note_id = harness.note_id.clone();
 
     let mut alice = Collab::new();
-    alice.connect(profile(harness.port), "alice".into(), key("alice"));
+    alice.connect(harness.profile(), "alice".into(), key("alice"));
     let mut alice_body = String::new();
     settle(&mut alice, &mut alice_body, "alice", |c, _| {
         c.is_connected() && !c.notes().is_empty()
@@ -566,7 +604,7 @@ fn test_sharing_with_a_name_goes_through_the_servers_own_list() {
     // Bob arrives with a name of his own, and alice adds that name: the note comes back only
     // for him, because the server knows which key the name is.
     let mut bob = Collab::new();
-    bob.connect(profile(harness.port), "bob".into(), key("bob"));
+    bob.connect(harness.profile(), "bob".into(), key("bob"));
     settle(&mut bob, &mut String::new(), "bob", |c, _| {
         c.is_connected() && c.notes().iter().any(|note| note.id == note_id)
     });
@@ -592,13 +630,21 @@ fn test_sharing_with_a_name_goes_through_the_servers_own_list() {
 #[test]
 fn test_a_shared_notes_picture_outlives_the_computer_that_added_it() {
     let _turn = SERVER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let harness = start_server();
+    // The library hands a picture only to somebody with a note that shows it, so the note
+    // naming these two is there from the start, open to everybody.
+    let harness = start_server_with(&[(
+        "album-0001".to_string(),
+        "---\ntitle: \"Album\"\npinned: false\ntrashed: false\ntags: []\n\
+         created_at: 2026-01-01T00:00:00+00:00\nupdated_at: 2026-01-01T00:00:00+00:00\n---\n\
+         ![a](attachments/holiday-1a2b3c4d.png)\n![b](attachments/later-9f8e7d6c.png)"
+            .to_string(),
+    )]);
     let file = "holiday-1a2b3c4d.png";
     // Not a real PNG: the shared library moves bytes and never decodes them.
     let picture: Vec<u8> = b"\x89PNG fake picture bytes".to_vec();
 
     let mut alice = Collab::new();
-    alice.connect(profile(harness.port), "alice".into(), key("alice"));
+    alice.connect(harness.profile(), "alice".into(), key("alice"));
     settle(&mut alice, &mut String::new(), "alice", |c, _| {
         c.is_connected()
     });
@@ -614,7 +660,7 @@ fn test_a_shared_notes_picture_outlives_the_computer_that_added_it() {
 
     // Bob has never had the file; he asks the library for what the note names.
     let mut bob = Collab::new();
-    bob.connect(profile(harness.port), "bob".into(), key("bob"));
+    bob.connect(harness.profile(), "bob".into(), key("bob"));
     settle(&mut bob, &mut String::new(), "bob", |c, _| c.is_connected());
     bob.fetch_attachment(file);
     assert_eq!(
@@ -655,6 +701,54 @@ fn test_a_shared_notes_picture_outlives_the_computer_that_added_it() {
         wait_for_picture(&mut bob, file).as_deref(),
         Some(&picture[..]),
         "the picture should still be there after its owner left"
+    );
+}
+
+/// A picture in a private note is not there for anybody the note is closed to, and nobody can
+/// replace a picture that is already in the library.
+#[test]
+fn test_a_private_notes_picture_stays_private_and_cannot_be_replaced() {
+    let _turn = SERVER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let alice_key = people::public_key(&key("alice"));
+    let harness = start_server_with(&[(
+        "diary-0001".to_string(),
+        format!(
+            "---\ntitle: \"Diary\"\npinned: false\ntrashed: false\ntags: []\n\
+             owner: \"alice\"\nowner_key: \"{alice_key}\"\nprivate: true\n\
+             created_at: 2026-01-01T00:00:00+00:00\nupdated_at: 2026-01-01T00:00:00+00:00\n---\n\
+             ![me](attachments/secret-11112222.png)"
+        ),
+    )]);
+    let secret = "secret-11112222.png";
+    let original: Vec<u8> = b"\x89PNG alice's own".to_vec();
+
+    let mut alice = Collab::new();
+    alice.connect(harness.profile(), "alice".into(), key("alice"));
+    settle(&mut alice, &mut String::new(), "alice", |c, _| {
+        c.is_connected()
+    });
+    alice.upload_attachment(secret, original.clone());
+    assert!(wait_for_stored(&mut alice, secret));
+
+    let mut bob = Collab::new();
+    bob.connect(harness.profile(), "bob".into(), key("bob"));
+    settle(&mut bob, &mut String::new(), "bob", |c, _| c.is_connected());
+    bob.fetch_attachment(secret);
+    assert!(
+        wait_for_missing(&mut bob, secret),
+        "a picture only a closed note shows must not reach somebody it is closed to"
+    );
+
+    // Sending the same name again is accepted, but the first copy is the one kept.
+    bob.upload_attachment(secret, b"\x89PNG something else".to_vec());
+    assert!(wait_for_stored(&mut bob, secret));
+    let kept = std::fs::read(harness.notes_dir.join("attachments").join(secret)).unwrap();
+    assert_eq!(kept, original);
+
+    alice.fetch_attachment(secret);
+    assert_eq!(
+        wait_for_picture(&mut alice, secret).as_deref(),
+        Some(&original[..])
     );
 }
 
@@ -749,7 +843,7 @@ fn test_taking_somebodys_name_does_not_open_their_note() {
     // "skorp" has never connected to this server, so the name is free and this client is allowed
     // to use it. Being allowed to use the word is all it gets.
     let mut impostor = Collab::new();
-    impostor.connect(profile(harness.port), "skorp".into(), key("nox"));
+    impostor.connect(harness.profile(), "skorp".into(), key("nox"));
     settle(&mut impostor, &mut String::new(), "the impostor", |c, _| {
         c.is_connected()
     });
@@ -783,7 +877,7 @@ fn test_taking_somebodys_name_does_not_open_their_note() {
     // The owner, under a name they have never used — the impostor took the word — still has it:
     // the key is what the note knows.
     let mut skorp = Collab::new();
-    skorp.connect(profile(harness.port), "skorp-two".into(), key("skorp"));
+    skorp.connect(harness.profile(), "skorp-two".into(), key("skorp"));
     settle(&mut skorp, &mut String::new(), "the owner", |c, _| {
         c.is_connected()
     });
@@ -810,7 +904,7 @@ fn test_a_title_keeps_the_space_at_the_end_of_a_half_typed_word() {
     let note_id = harness.note_id.clone();
 
     let mut alice = Collab::new();
-    alice.connect(profile(harness.port), "alice".into(), key("alice"));
+    alice.connect(harness.profile(), "alice".into(), key("alice"));
     settle(&mut alice, &mut String::new(), "alice", |c, _| {
         c.is_connected() && !c.notes().is_empty()
     });
@@ -842,7 +936,7 @@ fn test_a_keystroke_from_a_window_a_frame_behind_keeps_the_other_words() {
     let note_id = harness.note_id.clone();
 
     let mut alice = Collab::new();
-    alice.connect(profile(harness.port), "alice".into(), key("alice"));
+    alice.connect(harness.profile(), "alice".into(), key("alice"));
     let mut alice_body = String::new();
     settle(&mut alice, &mut alice_body, "alice", |c, _| {
         c.is_connected()
@@ -853,7 +947,7 @@ fn test_a_keystroke_from_a_window_a_frame_behind_keeps_the_other_words() {
     });
 
     let mut bob = Collab::new();
-    bob.connect(profile(harness.port), "bob".into(), key("bob"));
+    bob.connect(harness.profile(), "bob".into(), key("bob"));
     let mut bob_body = String::new();
     settle(&mut bob, &mut bob_body, "bob", |c, _| c.is_connected());
     bob.open_note(&note_id, "hello");
@@ -890,7 +984,7 @@ fn test_a_caret_moved_twice_in_a_moment_still_arrives() {
     let note_id = harness.note_id.clone();
 
     let mut alice = Collab::new();
-    alice.connect(profile(harness.port), "alice".into(), key("alice"));
+    alice.connect(harness.profile(), "alice".into(), key("alice"));
     settle(&mut alice, &mut String::new(), "alice", |c, _| {
         c.is_connected()
     });
@@ -900,7 +994,7 @@ fn test_a_caret_moved_twice_in_a_moment_still_arrives() {
     });
 
     let mut bob = Collab::new();
-    bob.connect(profile(harness.port), "bob".into(), key("bob"));
+    bob.connect(harness.profile(), "bob".into(), key("bob"));
     settle(&mut bob, &mut String::new(), "bob", |c, _| c.is_connected());
     bob.open_note(&note_id, "hello");
     settle(&mut bob, &mut String::new(), "bob", |_, body| {
@@ -934,7 +1028,7 @@ fn test_a_chosen_colour_is_what_the_other_person_sees() {
 
     let mut alice = Collab::new();
     alice.set_color(Some([12, 34, 56]));
-    alice.connect(profile(harness.port), "alice".into(), key("alice"));
+    alice.connect(harness.profile(), "alice".into(), key("alice"));
     settle(&mut alice, &mut String::new(), "alice", |c, _| {
         c.is_connected() && !c.notes().is_empty()
     });
@@ -947,7 +1041,7 @@ fn test_a_chosen_colour_is_what_the_other_person_sees() {
     );
 
     let mut bob = Collab::new();
-    bob.connect(profile(harness.port), "bob".into(), key("bob"));
+    bob.connect(harness.profile(), "bob".into(), key("bob"));
     settle(&mut bob, &mut String::new(), "bob", |c, _| c.is_connected());
     bob.open_note(&note_id, "hello");
     settle(
@@ -1010,7 +1104,7 @@ fn test_a_word_that_is_typed_and_then_deleted_goes_away_for_everybody() {
     let note_id = harness.note_id.clone();
 
     let mut alice = Collab::new();
-    alice.connect(profile(harness.port), "alice".into(), key("alice"));
+    alice.connect(harness.profile(), "alice".into(), key("alice"));
     let mut alice_body = String::new();
     settle(&mut alice, &mut alice_body, "alice", |c, _| {
         c.is_connected()
@@ -1021,7 +1115,7 @@ fn test_a_word_that_is_typed_and_then_deleted_goes_away_for_everybody() {
     });
 
     let mut bob = Collab::new();
-    bob.connect(profile(harness.port), "bob".into(), key("bob"));
+    bob.connect(harness.profile(), "bob".into(), key("bob"));
     let mut bob_body = String::new();
     settle(&mut bob, &mut bob_body, "bob", |c, _| c.is_connected());
     bob.open_note(&note_id, "hello");

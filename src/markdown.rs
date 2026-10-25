@@ -21,7 +21,9 @@ pub fn rgb_to_hex(rgb: [u8; 3]) -> String {
 /// Parses a `#RRGGBB` or `RRGGBB` hex string into `Color32`.
 pub fn parse_hex_color(hex: &str) -> Option<Color32> {
     let h = hex.trim().trim_start_matches('#');
-    if h.len() != 6 {
+    // Checking the bytes, not just the length, keeps the slices below on character boundaries:
+    // six bytes can be three characters, and `h[0..2]` would then split one and panic.
+    if h.len() != 6 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let r = u8::from_str_radix(&h[0..2], 16).ok()?;
@@ -2175,6 +2177,20 @@ fn body_to_html(lines: &[&str], targets: &ExportTargets<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A colour code that is six bytes long but not six hex digits is plain text, not a crash.
+    #[test]
+    fn test_non_ascii_colour_codes_do_not_panic() {
+        assert_eq!(parse_hex_color("aéé1"), None);
+        assert_eq!(parse_hex_color("+f0000"), None);
+        assert_eq!(
+            parse_hex_color("#4ECDFF"),
+            Some(Color32::from_rgb(0x4E, 0xCD, 0xFF))
+        );
+        for line in ["{color:#aéé1}x{/color}", "=={#aéé1}x==", "=={#ééé}x=="] {
+            let _ = parse_inline_spans(line);
+        }
+    }
 
     #[test]
     fn test_parse_inline_spans_bold_italic_highlight_and_links() {

@@ -450,7 +450,8 @@ impl ServerConfig {
             .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
         let path = Self::config_path();
         let text = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(&path, text).map_err(|e| format!("could not write {}: {e}", path.display()))
+        crate::storage::write_atomic(&path, text)
+            .map_err(|e| format!("could not write {}: {e}", path.display()))
     }
 
     /// Cert and key live beside the config so a re-install keeps the fingerprint clients pinned.
@@ -463,11 +464,13 @@ impl ServerConfig {
     }
 }
 
-/// A short, human-checkable form of the certificate fingerprint (first four bytes).
+/// A human-checkable form of the certificate fingerprint: its first sixteen bytes, in groups of
+/// four digits. Sixteen bytes is what makes checking it by eye worth anything; a certificate
+/// that matches only a few bytes can be made by trial in minutes.
 pub fn short_fingerprint(fingerprint: &str) -> String {
     fingerprint
         .chars()
-        .take(8)
+        .take(32)
         .collect::<Vec<_>>()
         .chunks(4)
         .map(|chunk| chunk.iter().collect::<String>())
@@ -552,8 +555,13 @@ mod tests {
 
     #[test]
     fn test_short_fingerprint_groups_bytes() {
-        assert_eq!(short_fingerprint("a1b2c3d4e5f6"), "A1B2-C3D4");
+        assert_eq!(short_fingerprint("a1b2c3d4e5f6"), "A1B2-C3D4-E5F6");
         assert_eq!(short_fingerprint("ab"), "AB");
+        let full = "0123456789abcdef".repeat(4);
+        assert_eq!(
+            short_fingerprint(&full),
+            "0123-4567-89AB-CDEF-0123-4567-89AB-CDEF"
+        );
     }
 
     #[test]

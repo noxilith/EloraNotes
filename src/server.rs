@@ -14,11 +14,11 @@ use crate::net::{
     FRAME_JSON, FRAME_SYNC, MAX_ATTACHMENT, PROTOCOL_VERSION,
 };
 use crate::people::{self, Registry};
-use crate::storage::Note;
+use crate::storage::{self, Note};
 use chrono::{DateTime, TimeZone, Utc};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -51,11 +51,60 @@ pub struct Server {
     /// caret move carry no such news, so they must not turn into a full list per person.
     presence: Mutex<PresenceBroadcast>,
     next_id: AtomicU64,
+    /// How many connections each address has open, and its recent wrong passwords.
+    gate: Mutex<Gate>,
+}
+
+/// Connections open at once, across everybody. Each one is a thread and a buffer, so without a
+/// ceiling anybody who can reach the port can run the machine out of memory.
+const MAX_CONNECTIONS: usize = 256;
+/// Connections open at once from one address. Enough for a household or an office behind one
+/// router, well short of the whole server.
+const MAX_CONNECTIONS_PER_ADDRESS: usize = 32;
+/// How long a new connection has to finish TLS and say hello.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+/// The most a connection may send before it has logged in. A hello is a few hundred bytes; the
+/// 16 MB a frame may otherwise be is only for people who have the password.
+const MAX_HANDSHAKE_BYTES: usize = 64 * 1024;
+/// Wrong passwords allowed from one address before it has to wait out [`FAILURE_WINDOW`].
+const MAX_PASSWORD_FAILURES: u32 = 5;
+const FAILURE_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+#[derive(Default)]
+struct Gate {
+    total: usize,
+    open: HashMap<IpAddr, usize>,
+    /// Wrong passwords per address, and when the first of the current run was.
+    failures: HashMap<IpAddr, (u32, Instant)>,
+}
+
+/// One admitted connection. Dropping it gives the place back.
+struct Admission {
+    server: Arc<Server>,
+    address: Option<IpAddr>,
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        if let Ok(mut gate) = self.server.gate.lock() {
+            gate.total = gate.total.saturating_sub(1);
+            if let Some(address) = self.address {
+                if let Some(count) = gate.open.get_mut(&address) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        gate.open.remove(&address);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Everything the connection thread needs to hand work to other connections.
 struct Client {
     id: u64,
+    /// Where the connection came from, for the per-address limits.
+    address: Option<IpAddr>,
     name: Mutex<String>,
     /// This connection's public key: the digest of the identifier it sent at the handshake. It
     /// is what every note is decided by — the name beside it is only a label — and it is safe
@@ -123,7 +172,55 @@ impl Server {
             clients: Mutex::new(HashMap::new()),
             presence: Mutex::new(PresenceBroadcast::default()),
             next_id: AtomicU64::new(1),
+            gate: Mutex::new(Gate::default()),
         })
+    }
+
+    /// Lets a new connection in if there is room for it, overall and for its address.
+    fn admit(self: &Arc<Self>, address: Option<IpAddr>) -> Option<Admission> {
+        let mut gate = self.gate.lock().ok()?;
+        if gate.total >= MAX_CONNECTIONS {
+            return None;
+        }
+        if let Some(address) = address {
+            let count = gate.open.entry(address).or_default();
+            if *count >= MAX_CONNECTIONS_PER_ADDRESS {
+                return None;
+            }
+            *count += 1;
+        }
+        gate.total += 1;
+        Some(Admission {
+            server: Arc::clone(self),
+            address,
+        })
+    }
+
+    /// Whether this address has used up its wrong passwords for now.
+    fn locked_out(&self, address: Option<IpAddr>) -> bool {
+        let (Some(address), Ok(mut gate)) = (address, self.gate.lock()) else {
+            return false;
+        };
+        match gate.failures.get(&address) {
+            Some((_, since)) if since.elapsed() > FAILURE_WINDOW => {
+                gate.failures.remove(&address);
+                false
+            }
+            Some((count, _)) => *count >= MAX_PASSWORD_FAILURES,
+            None => false,
+        }
+    }
+
+    fn record_password(&self, address: Option<IpAddr>, correct: bool) {
+        let (Some(address), Ok(mut gate)) = (address, self.gate.lock()) else {
+            return;
+        };
+        if correct {
+            gate.failures.remove(&address);
+        } else {
+            let entry = gate.failures.entry(address).or_insert((0, Instant::now()));
+            entry.0 += 1;
+        }
     }
 
     pub fn config(&self) -> &ServerConfig {
@@ -144,9 +241,16 @@ impl Server {
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
+                    let address = stream.peer_addr().ok().map(|peer| peer.ip());
+                    // Over the limit, the socket is simply closed: answering would mean a TLS
+                    // handshake, which is the very work being refused.
+                    let Some(admission) = self.admit(address) else {
+                        continue;
+                    };
                     let server = Arc::clone(&self);
                     std::thread::spawn(move || {
-                        if let Err(error) = server.serve(stream) {
+                        let _admission = admission;
+                        if let Err(error) = server.serve(stream, address) {
                             eprintln!("connection ended: {error}");
                         }
                     });
@@ -157,7 +261,7 @@ impl Server {
         Ok(())
     }
 
-    fn serve(self: Arc<Self>, stream: TcpStream) -> Result<(), String> {
+    fn serve(self: Arc<Self>, stream: TcpStream, address: Option<IpAddr>) -> Result<(), String> {
         stream
             .set_read_timeout(Some(READ_TIMEOUT))
             .map_err(|e| e.to_string())?;
@@ -169,6 +273,7 @@ impl Server {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let client = Arc::new(Client {
             id,
+            address,
             name: Mutex::new(String::new()),
             key: Mutex::new(String::new()),
             room: Mutex::new(None),
@@ -198,8 +303,19 @@ impl Server {
         let mut chunk = [0u8; 16 * 1024];
         let mut last_contact = Instant::now();
         let mut last_flush = Instant::now();
+        let started = Instant::now();
 
         loop {
+            // Before the hello, a connection is a stranger: it gets a little time and a little
+            // memory, not the two minutes and 16 MB a logged-in client may use.
+            if !client.authed.load(Ordering::Relaxed) {
+                if started.elapsed() > HANDSHAKE_TIMEOUT {
+                    return Err("the handshake took too long".to_string());
+                }
+                if buffer.len() > MAX_HANDSHAKE_BYTES {
+                    return Err("the handshake was too large".to_string());
+                }
+            }
             // Hand over anything other connections queued for us.
             self.drain_outbox(client, tls)?;
 
@@ -306,7 +422,23 @@ impl Server {
             );
             return Ok(false);
         }
-        if !constant_time_eq(password.as_bytes(), self.config.password.as_bytes()) {
+        // Checked before the password itself, so guessing cannot go on at any speed: a few
+        // tries, then the address waits.
+        if self.locked_out(client.address) {
+            self.push(
+                client,
+                FRAME_JSON,
+                json(&ServerMsg::Error {
+                    message: "too many wrong passwords from this address; wait a few minutes \
+                              and try again"
+                        .to_string(),
+                }),
+            );
+            return Ok(false);
+        }
+        let correct = constant_time_eq(password.as_bytes(), self.config.password.as_bytes());
+        self.record_password(client.address, correct);
+        if !correct {
             self.push(
                 client,
                 FRAME_JSON,
@@ -452,11 +584,14 @@ impl Server {
                 Ok(())
             }
             ClientMsg::Delete { id, permanent } => {
-                {
+                let deleted = {
                     let mut library = self.library.lock().map_err(|_| "library poisoned")?;
-                    library.delete(&id, &key, permanent)?;
-                }
+                    library.delete(&id, &key, permanent)
+                };
+                // A refused delete still sends the list: the client took the note out of its
+                // sidebar straight away, and this puts it back.
                 self.broadcast_library();
+                deleted?;
                 Ok(())
             }
         }
@@ -672,6 +807,7 @@ impl Server {
             return;
         }
 
+        let key = self.key_of(client);
         match op {
             ATTACHMENT_SEND => {
                 if bytes.is_empty() || bytes.len() > MAX_ATTACHMENT {
@@ -686,7 +822,16 @@ impl Server {
                     .library
                     .lock()
                     .map_err(|_| "library poisoned".to_string())
-                    .and_then(|library| library.write_attachment(name, bytes));
+                    .and_then(|library| {
+                        // Names carry a random part, so one that is taken already is the same
+                        // picture sent again. Keeping the first copy means nobody can swap a
+                        // picture in somebody else's note for another one.
+                        if library.has_attachment(name) {
+                            Ok(())
+                        } else {
+                            library.write_attachment(name, bytes)
+                        }
+                    });
                 match stored {
                     // An empty answer with the name is the acknowledgement: the picture is in
                     // the library now, so this client can tell the user it was shared.
@@ -696,11 +841,12 @@ impl Server {
                             FRAME_ATTACHMENT,
                             net::encode_attachment(ATTACHMENT_DATA, name, b""),
                         );
-                        // Everybody else who has the note open can now see the picture, and a
-                        // client that asked for it a moment too early asks again.
-                        self.broadcast_except(
-                            0,
-                            FRAME_JSON,
+                        // Everybody else with a note that shows the picture can now see it, and
+                        // a client that asked for it a moment too early asks again. Nobody else
+                        // hears of it: even a name says something about a private note.
+                        self.announce_picture(
+                            client.id,
+                            name,
                             json(&ServerMsg::Attachment {
                                 name: name.to_string(),
                             }),
@@ -717,11 +863,14 @@ impl Server {
                 }
             }
             ATTACHMENT_ASK => {
-                let bytes = self
-                    .library
-                    .lock()
-                    .ok()
-                    .and_then(|library| library.read_attachment(name));
+                // Only a picture that one of this person's notes shows is handed out; to anybody
+                // else, a picture in a private note is simply not there.
+                let bytes = self.library.lock().ok().and_then(|library| {
+                    library
+                        .picture_visible_to(name, &key)
+                        .then(|| library.read_attachment(name))
+                        .flatten()
+                });
                 let (op, bytes) = match bytes {
                     Some(bytes) => (ATTACHMENT_DATA, bytes),
                     None => (ATTACHMENT_MISSING, Vec::new()),
@@ -907,20 +1056,21 @@ impl Server {
         }
     }
 
-    fn broadcast_except(&self, skip: u64, kind: u8, payload: Vec<u8>) {
-        let recipients: Vec<Arc<Client>> = self
-            .clients
-            .lock()
-            .map(|clients| {
-                clients
-                    .values()
-                    .filter(|c| c.id != skip && c.authed.load(Ordering::Relaxed))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
+    /// Tells every other connection that has a note showing picture `name` that it arrived.
+    fn announce_picture(&self, sender: u64, name: &str, payload: Vec<u8>) {
+        let clients = self.connected();
+        let recipients: Vec<Arc<Client>> = {
+            let Ok(library) = self.library.lock() else {
+                return;
+            };
+            clients
+                .into_iter()
+                .filter(|client| client.id != sender)
+                .filter(|client| library.picture_visible_to(name, &self.key_of(client)))
+                .collect()
+        };
         for client in recipients {
-            self.push(&client, kind, payload.clone());
+            self.push(&client, FRAME_JSON, payload.clone());
         }
     }
 
@@ -1148,7 +1298,7 @@ impl Library {
         // open it starts from this body.
         let note = note_from_meta(&meta, body.to_string());
         let path = self.dir.join(format!("{id}.md"));
-        std::fs::write(&path, note.to_markdown())
+        storage::write_atomic(&path, note.to_markdown())
             .map_err(|e| format!("could not write {}: {e}", path.display()))?;
         self.created.insert(id.clone(), now);
         self.notes.insert(id, meta.clone());
@@ -1218,12 +1368,35 @@ impl Library {
             return Err(format!("the note {id} is not shared with you"));
         }
         if permanent {
+            // Anybody who can see a note may put it in the trash, where anybody can take it
+            // back out. Only the owner may make that final; a note from before notes carried
+            // keys has no owner to ask, so it goes to whoever can see it.
+            if !meta.trashed {
+                return Err("move the note to the trash before deleting it".to_string());
+            }
+            if let Some(owner_key) = meta.owner_key.as_deref() {
+                if !owner_key.eq_ignore_ascii_case(key) {
+                    let owner = meta.owner.as_deref().unwrap_or("its owner");
+                    return Err(format!(
+                        "only {owner} can delete this note for good; it stays in the trash"
+                    ));
+                }
+            }
+            // The file is kept in a folder beside the notes rather than removed, so the
+            // server's operator can still bring back a note that was deleted by mistake.
+            let path = self.dir.join(format!("{id}.md"));
+            if path.exists() {
+                let deleted = self.dir.join(".deleted");
+                std::fs::create_dir_all(&deleted)
+                    .map_err(|e| format!("could not create {}: {e}", deleted.display()))?;
+                let stamp = Utc::now().format("%Y%m%d-%H%M%S");
+                std::fs::rename(&path, deleted.join(format!("{id}-{stamp}.md")))
+                    .map_err(|e| format!("could not delete {id}: {e}"))?;
+            }
             self.notes.remove(id);
             self.rooms.remove(id);
             self.dirty.remove(id);
             self.created.remove(id);
-            let path = self.dir.join(format!("{id}.md"));
-            let _ = std::fs::remove_file(path);
             Ok(())
         } else {
             self.update(
@@ -1306,7 +1479,9 @@ impl Library {
             return Ok(());
         }
         let path = self.dir.join(format!("{id}.md"));
-        let raw = std::fs::read_to_string(&path).unwrap_or_default();
+        // Only a missing file is an empty note. Any other failure has to stop here: a room
+        // started empty would be saved back over the real file at the first keystroke.
+        let raw = read_note_file(&path)?;
         let note = Note::from_markdown(id.to_string(), &raw, path);
         let body = note.body.clone();
         let doc = Doc::new();
@@ -1346,7 +1521,30 @@ impl Library {
         };
         std::fs::create_dir_all(self.attachments_dir())
             .map_err(|e| format!("could not create the pictures folder: {e}"))?;
-        std::fs::write(&path, bytes).map_err(|e| format!("could not save {name}: {e}"))
+        storage::write_atomic(&path, bytes).map_err(|e| format!("could not save {name}: {e}"))
+    }
+
+    fn has_attachment(&self, name: &str) -> bool {
+        self.attachment_path(name)
+            .is_some_and(|path| path.is_file())
+    }
+
+    /// Whether a note `key` may see names this picture. Open rooms are checked first, since
+    /// the note somebody is looking at is almost always the one asking, and they need no disk.
+    fn picture_visible_to(&self, name: &str, key: &str) -> bool {
+        let reference = format!("attachments/{name}");
+        let visible: Vec<&str> = self
+            .notes
+            .values()
+            .filter(|meta| net::visible_to(meta, key))
+            .map(|meta| meta.id.as_str())
+            .collect();
+        let (open, closed): (Vec<&str>, Vec<&str>) = visible
+            .into_iter()
+            .partition(|id| self.rooms.contains_key(*id));
+        open.into_iter()
+            .chain(closed)
+            .any(|id| self.body(id).is_ok_and(|body| body.contains(&reference)))
     }
 
     fn read_attachment(&self, name: &str) -> Option<Vec<u8>> {
@@ -1358,18 +1556,16 @@ impl Library {
         std::fs::read(path).ok()
     }
 
-    fn body(&self, id: &str) -> String {
+    fn body(&self, id: &str) -> Result<String, String> {
         match self.rooms.get(id) {
             Some(room) => {
                 let txn = room.doc.transact();
-                room.text.get_string(&txn)
+                Ok(room.text.get_string(&txn))
             }
             None => {
                 let path = self.dir.join(format!("{id}.md"));
-                std::fs::read_to_string(path)
-                    .ok()
-                    .map(|raw| Note::from_markdown(id.to_string(), &raw, PathBuf::new()).body)
-                    .unwrap_or_default()
+                let raw = read_note_file(&path)?;
+                Ok(Note::from_markdown(id.to_string(), &raw, PathBuf::new()).body)
             }
         }
     }
@@ -1378,13 +1574,13 @@ impl Library {
         let Some(meta) = self.notes.get(id).cloned() else {
             return Ok(());
         };
-        let body = self.body(id);
+        let body = self.body(id)?;
         let path = self.dir.join(format!("{id}.md"));
         // Keep the original creation time: a save is an edit of the note, not a new one.
         let created_at = *self.created.entry(id.to_string()).or_insert_with(Utc::now);
         let mut note = note_from_meta(&meta, body);
         note.created_at = created_at;
-        std::fs::write(&path, note.to_markdown())
+        storage::write_atomic(&path, note.to_markdown())
             .map_err(|e| format!("could not write {}: {e}", path.display()))?;
         self.dirty.remove(id);
         Ok(())
@@ -1451,6 +1647,16 @@ fn meta_from_note(note: &Note) -> NoteMeta {
     }
 }
 
+/// Reads a note's file, where a file that is not there yet is an empty note but every other
+/// failure is an error.
+fn read_note_file(path: &Path) -> Result<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => Ok(raw),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(format!("could not read {}: {e}", path.display())),
+    }
+}
+
 fn note_from_meta(meta: &NoteMeta, body: String) -> Note {
     let updated = Utc
         .timestamp_opt(meta.updated_at, 0)
@@ -1470,6 +1676,7 @@ fn note_from_meta(meta: &NoteMeta, body: String) -> Note {
         private: meta.private,
         shared_with: meta.shared_with.clone(),
         shared_keys: meta.shared_keys.clone(),
+        extra_frontmatter: String::new(),
         created_at: updated,
         updated_at: updated,
         file_path: PathBuf::new(),
@@ -1657,6 +1864,67 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Anybody may put a note in the trash, but only its owner can delete it for good, and
+    /// even then the file is moved aside rather than destroyed.
+    #[test]
+    fn test_only_the_owner_deletes_a_note_for_good() {
+        let dir = temp_dir("delete");
+        let mut library = Library::load(&dir).unwrap();
+        let meta = library
+            .create(
+                "Plan",
+                None,
+                Vec::new(),
+                "body",
+                false,
+                None,
+                "nox",
+                &key_of("nox"),
+            )
+            .unwrap();
+        let id = meta.id.clone();
+
+        // Straight past the trash is refused, even for the owner.
+        assert!(library.delete(&id, &key_of("nox"), true).is_err());
+        // A guest may trash it, but not delete it for good.
+        library.delete(&id, &key_of("mira"), false).unwrap();
+        assert!(library.notes[&id].trashed);
+        let refused = library.delete(&id, &key_of("mira"), true);
+        assert!(
+            matches!(&refused, Err(e) if e.contains("only nox")),
+            "{refused:?}"
+        );
+        assert!(library.notes.contains_key(&id));
+
+        library.delete(&id, &key_of("nox"), true).unwrap();
+        assert!(!library.notes.contains_key(&id));
+        assert!(!dir.join(format!("{id}.md")).exists());
+        let kept: Vec<_> = std::fs::read_dir(dir.join(".deleted")).unwrap().collect();
+        assert_eq!(
+            kept.len(),
+            1,
+            "the deleted note is kept aside for the operator"
+        );
+        // And a reload does not bring it back.
+        assert!(!Library::load(&dir).unwrap().notes.contains_key(&id));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A note file that is there but cannot be read must not open as an empty room, or the
+    /// first keystroke saves that empty body over the real note.
+    #[test]
+    fn test_an_unreadable_note_does_not_open_empty() {
+        let dir = temp_dir("unreadable");
+        let mut library = Library::load(&dir).unwrap();
+        // A folder where the file should be reads as an error that is not "not found".
+        std::fs::create_dir_all(dir.join("broken-0001.md")).unwrap();
+        assert!(library.open("broken-0001").is_err());
+        assert!(!library.rooms.contains_key("broken-0001"));
+        // A note with no file yet is still simply empty.
+        assert!(library.open("fresh-0001").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1898,6 +2166,49 @@ mod tests {
     /// Opening a note hands its text around, and a client with nothing to add still answers the
     /// server's state request. That answer is not an edit: it must not restamp the note, which
     /// is what sorted the sidebar by it and pushed a note to the top on a mere click.
+    /// One address cannot take every connection, and it gets a handful of wrong passwords
+    /// before it has to wait.
+    #[test]
+    fn test_the_gate_limits_connections_and_password_guesses() {
+        let _guard = crate::tls::server_dir_lock();
+        let dir = temp_dir("gate");
+        // SAFETY: the guard keeps the other tests that read this variable out of the way.
+        unsafe { std::env::set_var("ELORA_SERVER_DIR", dir.join("server")) };
+        let config = ServerConfig {
+            name: "Gate".into(),
+            port: 0,
+            password: "letmein".into(),
+            notes_dir: dir.join("notes"),
+            bind: "127.0.0.1".into(),
+        };
+        let server = Arc::new(Server::new(config).expect("server"));
+        let busy: IpAddr = "203.0.113.7".parse().unwrap();
+        let other: IpAddr = "203.0.113.8".parse().unwrap();
+
+        let held: Vec<Admission> = (0..MAX_CONNECTIONS_PER_ADDRESS)
+            .map(|_| server.admit(Some(busy)).expect("room for it"))
+            .collect();
+        assert!(server.admit(Some(busy)).is_none());
+        assert!(
+            server.admit(Some(other)).is_some(),
+            "other addresses still get in"
+        );
+        drop(held);
+        assert!(
+            server.admit(Some(busy)).is_some(),
+            "closing gives the places back"
+        );
+        assert_eq!(server.gate.lock().unwrap().total, 0);
+
+        for _ in 0..MAX_PASSWORD_FAILURES {
+            assert!(!server.locked_out(Some(busy)));
+            server.record_password(Some(busy), false);
+        }
+        assert!(server.locked_out(Some(busy)));
+        assert!(!server.locked_out(Some(other)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_an_update_that_adds_nothing_is_not_an_edit() {
         let _guard = crate::tls::server_dir_lock();
@@ -2315,6 +2626,7 @@ mod tests {
         let client = |identity: &str| {
             Arc::new(Client {
                 id: 1,
+                address: None,
                 name: Mutex::new(identity.to_string()),
                 key: Mutex::new(format!("key-{identity}")),
                 room: Mutex::new(None),

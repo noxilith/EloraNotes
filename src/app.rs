@@ -1712,7 +1712,20 @@ impl EloraApp {
     fn persist_note(&mut self, note_idx: usize) -> Result<(), String> {
         let note = self.notes[note_idx].clone();
         if !self.is_remote(&note.id) {
-            return self.storage.save_note(&note).map_err(|e| e.to_string());
+            let saved = self.storage.save_note(&note).map_err(|e| e.to_string());
+            // Something else changed the file since it was read here; that version is now a
+            // note of its own rather than lost under this save.
+            let kept = self.storage.take_kept_copies();
+            if let Some(first) = kept.first() {
+                self.status_message = Some(format!(
+                    "“{}” was changed by another program; that version is kept as “{}”",
+                    note.display_title(),
+                    first.display_title()
+                ));
+                // Appended, not re-sorted: callers still hold `note_idx` and indices before it.
+                self.notes.extend(kept);
+            }
+            return saved;
         }
         // Only the fields that live in the frontmatter; the body has its own live channel, and
         // sending the metadata on every keystroke would spam every connection.
@@ -2204,6 +2217,16 @@ impl EloraApp {
         self.remote_ids.retain(|id| live.contains(id));
 
         for meta in metas {
+            // An id goes into file names (an export writes `<id>.html`), so one that is not a
+            // plain word is dropped. So is one a note on this computer already uses: taking it
+            // over would stop that note being saved to disk and show the server's in its place.
+            let local_clash = self
+                .notes
+                .iter()
+                .any(|n| n.id == meta.id && !self.remote_ids.contains(&n.id));
+            if !is_safe_note_id(&meta.id) || local_clash {
+                continue;
+            }
             let updated = chrono::TimeZone::timestamp_opt(&Utc, meta.updated_at, 0)
                 .single()
                 .unwrap_or_else(Utc::now);
@@ -2247,6 +2270,7 @@ impl EloraApp {
                         private: meta.private,
                         shared_with: meta.shared_with,
                         shared_keys: meta.shared_keys,
+                        extra_frontmatter: String::new(),
                         created_at: updated,
                         updated_at: updated,
                         file_path: PathBuf::new(),
@@ -2313,6 +2337,7 @@ impl EloraApp {
                             private: note.private,
                             shared_with: note.shared_with.clone(),
                             shared_keys: note.shared_keys.clone(),
+                            extra_frontmatter: String::new(),
                             created_at: updated,
                             updated_at: updated,
                             file_path: PathBuf::new(),
@@ -2362,6 +2387,9 @@ impl EloraApp {
                     }
                     library_changed = true;
                 }
+                // The fingerprint itself is picked up below with `take_fingerprint`, which
+                // opens the prompt; the connection resumes once the user trusts it.
+                Incoming::Unverified { .. } => {}
                 Incoming::Offline(reason) => {
                     if self.collab.is_active() {
                         self.status_message = Some(format!("Server: {reason}"));
@@ -2486,13 +2514,34 @@ impl EloraApp {
             .is_some_and(|(pending, since)| pending == id && since.elapsed() < ROOM_BODY_WAIT)
     }
 
+    /// Pins the certificate the user just confirmed and connects for real. Only now does the
+    /// client send its password and identifier: the first attempt stopped after reading the
+    /// certificate.
+    fn trust_server(&mut self, fingerprint: String) {
+        self.server.fingerprint = Some(fingerprint);
+        self.server_form.fingerprint = self.server.fingerprint.clone();
+        self.persist_settings();
+        self.trust_prompt = None;
+        self.status_message = Some("Server trusted".to_string());
+        self.connect_server();
+    }
+
     /// Asks the user to confirm a server's certificate the first time they connect to it.
     fn trust_prompt_window(&mut self, ctx: &egui::Context) {
         let Some((fingerprint, address)) = self.trust_prompt.clone() else {
             return;
         };
         let p = self.theme.palette_with(&self.colors, self.glow_strength);
-        let short = crate::net::short_fingerprint(&fingerprint);
+        // Eight groups of four, on two lines so the code stays large enough to compare.
+        let groups: Vec<String> = crate::net::short_fingerprint(&fingerprint)
+            .split('-')
+            .map(str::to_string)
+            .collect();
+        let short = if groups.len() > 4 {
+            format!("{}\n{}", groups[..4].join("-"), groups[4..].join("-"))
+        } else {
+            groups.join("-")
+        };
         let mut open = true;
         let mut accept = false;
         let mut reject = false;
@@ -2526,7 +2575,7 @@ impl EloraApp {
                 );
                 ui.add_space(6.0);
                 ui.label(
-                    RichText::new("EloraNotes remembers it, so nobody can pretend to be this server later.")
+                    RichText::new("Nothing has been sent to the server yet. EloraNotes remembers this code, so nobody can pretend to be this server later.")
                         .size(11.0)
                         .color(p.fg_muted),
                 );
@@ -2542,11 +2591,7 @@ impl EloraApp {
             });
 
         if accept {
-            self.server.fingerprint = Some(fingerprint);
-            self.server_form.fingerprint = self.server.fingerprint.clone();
-            self.persist_settings();
-            self.trust_prompt = None;
-            self.status_message = Some("Server trusted".to_string());
+            self.trust_server(fingerprint);
         } else if reject || !open {
             self.trust_prompt = None;
             self.disconnect_server();
@@ -7022,7 +7067,10 @@ fn plan_pictures(
                 Some(ImageRef::Remote(url)) => {
                     plan.mapped.insert(src, url);
                 }
-                Some(ImageRef::File(path)) if path.is_file() => {
+                // Only real pictures are copied. A note can point anywhere on this disk, and a
+                // shared one was written by somebody else: `![](~/.ssh/id_ed25519)` must not
+                // put that key in a folder that is about to be published.
+                Some(ImageRef::File(path)) if is_picture_file(&path) => {
                     let Some(name) = path.file_name() else {
                         continue;
                     };
@@ -7130,6 +7178,37 @@ fn export_picture_name(name: &str) -> String {
         safe = "picture".to_string();
     }
     safe
+}
+
+/// Whether a note id from the server can stand in a file name as it is: letters, digits, `-`
+/// and `_`, and not too long.
+fn is_safe_note_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.chars().count() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
+}
+
+/// A file with a picture's extension that also starts like a PNG, JPEG or GIF.
+fn is_picture_file(path: &Path) -> bool {
+    use std::io::Read;
+    let named_like_one = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(is_picture_extension);
+    if !named_like_one || !path.is_file() {
+        return false;
+    }
+    let mut header = [0u8; 8];
+    let Ok(read) = std::fs::File::open(path).and_then(|mut f| f.read(&mut header)) else {
+        return false;
+    };
+    let header = &header[..read];
+    header.starts_with(b"\x89PNG\r\n\x1a\n")
+        || header.starts_with(&[0xFF, 0xD8, 0xFF])
+        || header.starts_with(b"GIF87a")
+        || header.starts_with(b"GIF89a")
 }
 
 fn is_picture_extension(extension: &str) -> bool {
@@ -9225,6 +9304,7 @@ mod tests {
             private: false,
             shared_with: Vec::new(),
             shared_keys: Vec::new(),
+            extra_frontmatter: String::new(),
             created_at: now,
             updated_at: now,
             file_path: PathBuf::new(),
@@ -9384,6 +9464,7 @@ mod tests {
             private: false,
             shared_with: Vec::new(),
             shared_keys: Vec::new(),
+            extra_frontmatter: String::new(),
             created_at: now,
             updated_at: now,
             file_path: PathBuf::new(),
@@ -10389,12 +10470,23 @@ mod tests {
         ));
         let vault = dir.join("vault");
         std::fs::create_dir_all(vault.join("attachments")).unwrap();
-        std::fs::write(vault.join("attachments/cat-photo.png"), [9u8, 8, 7]).unwrap();
+        std::fs::write(vault.join("attachments/cat-photo.png"), png_bytes()).unwrap();
         // A name written with a `%20` finds a file with a space in it, whose name cannot stand in
         // a link as it is.
-        std::fs::write(vault.join("my pic.png"), [1u8, 2]).unwrap();
+        std::fs::write(vault.join("my pic.png"), png_bytes()).unwrap();
+        // Files that are not pictures are never copied, whatever the note calls them.
+        std::fs::write(
+            vault.join("id_ed25519"),
+            b"-----BEGIN OPENSSH PRIVATE KEY-----",
+        )
+        .unwrap();
+        std::fs::write(
+            vault.join("fake.png"),
+            b"-----BEGIN OPENSSH PRIVATE KEY-----",
+        )
+        .unwrap();
 
-        let body = "One\n![a cat](attachments/cat-photo.png)\n![web](https://example.com/x.png)\n![gone](attachments/none.png)\n![again](attachments/cat-photo.png)\n![odd name](my%20pic.png)";
+        let body = "One\n![a cat](attachments/cat-photo.png)\n![web](https://example.com/x.png)\n![gone](attachments/none.png)\n![again](attachments/cat-photo.png)\n![odd name](my%20pic.png)\n![key](id_ed25519)\n![key](fake.png)";
         let mut number = 0usize;
         let plan = plan_pictures("note-1", body, Some(&vault), &mut number);
 
@@ -10422,6 +10514,11 @@ mod tests {
         assert!(
             !plan.mapped.contains_key("attachments/none.png"),
             "the picture that is not there is left out: {:?}",
+            plan.mapped
+        );
+        assert!(
+            !plan.mapped.contains_key("id_ed25519") && !plan.mapped.contains_key("fake.png"),
+            "a file that is not a picture is never copied: {:?}",
             plan.mapped
         );
         assert_eq!(
@@ -10453,7 +10550,7 @@ mod tests {
         let storage = NoteStorage::new(dir.join("notes")).unwrap();
         let root = storage.root_dir().to_path_buf();
         std::fs::create_dir_all(root.join("attachments")).unwrap();
-        std::fs::write(root.join("attachments/pic.png"), [7u8, 7, 7]).unwrap();
+        std::fs::write(root.join("attachments/pic.png"), png_bytes()).unwrap();
 
         let ctx = egui::Context::default();
         let mut app = EloraApp::with_context(&ctx, storage);
@@ -10524,6 +10621,7 @@ mod tests {
             private: false,
             shared_with: Vec::new(),
             shared_keys: Vec::new(),
+            extra_frontmatter: String::new(),
             created_at: now,
             updated_at: now,
             file_path: PathBuf::new(),
@@ -11190,6 +11288,11 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(8);
         while Instant::now() < deadline {
             app.poll_collab(ctx);
+            // A first connection stops at the certificate; the person at the keyboard
+            // confirms it, and only then does the real handshake run.
+            if let Some((fingerprint, _)) = app.trust_prompt.clone() {
+                app.trust_server(fingerprint);
+            }
             app.sync_open_note();
             if done(app) {
                 return;
@@ -11503,6 +11606,18 @@ mod tests {
         // Somebody who was let in is told whose note it is, and cannot claim it as theirs.
         let (_, text) = share_look(true, &nobody, "Nox", false, Some("Home"));
         assert_eq!(text, "Nox shared this note with you");
+    }
+
+    /// Only ids that can stand in a file name are taken from a server.
+    #[test]
+    fn test_a_server_note_id_must_be_a_plain_word() {
+        assert!(is_safe_note_id("meeting-notes-1a2b"));
+        assert!(is_safe_note_id("café-ab12"));
+        assert!(!is_safe_note_id(""));
+        assert!(!is_safe_note_id("../escape"));
+        assert!(!is_safe_note_id("a/b"));
+        assert!(!is_safe_note_id("a\\b"));
+        assert!(!is_safe_note_id(&"x".repeat(200)));
     }
 
     #[test]

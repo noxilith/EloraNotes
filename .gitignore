@@ -30,3 +30,6 @@ config.local.toml
 
 # Release artifacts
 /dist/
+
+# Screenshots taken while working on the UI; the one the README shows lives in assets/
+/screenshots/

@@ -35,7 +35,13 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct Asset {
     pub name: String,
     pub url: String,
+    /// The SHA-256 GitHub computed for the file when it was uploaded, in hex, when it says.
+    pub digest: Option<String>,
 }
+
+/// The file the release workflow publishes with a SHA-256 for every other asset, in the
+/// format `sha256sum` writes.
+const CHECKSUMS_ASSET: &str = "SHA256SUMS";
 
 /// A newer release together with the asset that fits this installation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +49,62 @@ pub struct Release {
     /// Version without the tag's leading `v`, e.g. `0.7.0`.
     pub version: String,
     pub asset: Asset,
+    /// Where the release's `SHA256SUMS` is, if it has one.
+    pub checksums_url: Option<String>,
+}
+
+fn checksums_url(assets: &[Asset]) -> Option<String> {
+    assets
+        .iter()
+        .find(|asset| asset.name == CHECKSUMS_ASSET)
+        .map(|asset| asset.url.clone())
+}
+
+/// The hash `sha256sum` output gives for `name`, lowercased.
+fn checksum_for(sums: &str, name: &str) -> Option<String> {
+    sums.lines().find_map(|line| {
+        let (hash, file) = line.trim().split_once(char::is_whitespace)?;
+        // `sha256sum -b` marks binary mode with a `*` in front of the name.
+        let file = file.trim_start().trim_start_matches('*');
+        (file == name && hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| hash.to_ascii_lowercase())
+    })
+}
+
+/// Refuses a download that does not match the checksum published with its release. TLS
+/// covers the trip from GitHub; this covers a file that was corrupted or swapped on the way,
+/// and a release that cannot vouch for its own files is not installed at all.
+fn verify_download(release: &Release, data: &[u8]) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    let expected = match &release.checksums_url {
+        Some(url) => {
+            let sums = download(url)?;
+            let sums = String::from_utf8_lossy(&sums);
+            checksum_for(&sums, &release.asset.name).ok_or_else(|| {
+                format!(
+                    "The release's checksums do not list {}.",
+                    release.asset.name
+                )
+            })?
+        }
+        None => release.asset.digest.clone().ok_or_else(|| {
+            "This release publishes no checksum, so the update was not installed. Download it \
+             from the releases page instead."
+                .to_string()
+        })?,
+    };
+    let actual: String = Sha256::digest(data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if !actual.eq_ignore_ascii_case(&expected) {
+        return Err(
+            "The downloaded update does not match its published checksum, so it was not \
+             installed."
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// What the launch-time check turned up.
@@ -275,6 +337,10 @@ fn parse_release_info(json: &str) -> Result<Option<(String, Vec<Asset>)>, String
                     Some(Asset {
                         name: asset["name"].as_str()?.to_string(),
                         url: asset["browser_download_url"].as_str()?.to_string(),
+                        digest: asset["digest"]
+                            .as_str()
+                            .and_then(|digest| digest.strip_prefix("sha256:"))
+                            .map(str::to_ascii_lowercase),
                     })
                 })
                 .collect()
@@ -297,6 +363,7 @@ fn release_for(json: &str, kind: &InstallKind) -> Result<Option<Release>, String
     Ok(select_asset(&assets, platform, kind).map(|asset| Release {
         version,
         asset: asset.clone(),
+        checksums_url: checksums_url(&assets),
     }))
 }
 
@@ -355,6 +422,7 @@ pub fn check_for_update() -> Result<Option<UpdateOffer>, String> {
         UpdateOffer::SelfUpdate(Release {
             version,
             asset: asset.clone(),
+            checksums_url: checksums_url(&assets),
         })
     }))
 }
@@ -460,6 +528,8 @@ pub fn stage_download(release: &Release) -> Result<PathBuf, String> {
     remove_staged(&staged);
 
     let data = download(&release.asset.url)?;
+    // Before anything is written, unpacked or run.
+    verify_download(release, &data)?;
     match &kind {
         InstallKind::AppImage(_) => {
             fs::write(&staged, &data)
@@ -877,6 +947,48 @@ mod tests {
         );
         // The macOS 0.6.0 tarball is not a bundle, and 0.7.0 has no tarball for it to grab.
         assert!(select_asset(&assets, "macos-arm64", &InstallKind::Portable).is_none());
+    }
+
+    /// A download is installed only when it matches the checksum its release published.
+    #[test]
+    fn test_a_download_must_match_its_published_checksum() {
+        let sums = "  e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  a.tar.gz\n\
+                    AB01AB01AB01AB01AB01AB01AB01AB01AB01AB01AB01AB01AB01AB01AB01AB01 *b.exe\n\
+                    not-a-hash  c.zip";
+        assert_eq!(
+            checksum_for(sums, "a.tar.gz").as_deref(),
+            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        );
+        assert_eq!(
+            checksum_for(sums, "b.exe").as_deref(),
+            Some("ab01ab01ab01ab01ab01ab01ab01ab01ab01ab01ab01ab01ab01ab01ab01ab01")
+        );
+        assert_eq!(checksum_for(sums, "c.zip"), None);
+        assert_eq!(checksum_for(sums, "missing"), None);
+
+        // The digest GitHub reports for the asset is used when there is no SHA256SUMS.
+        let hello_sha = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        let json = r#"{"tag_name":"v9.0.0","assets":[{"name":"x.tar.gz",
+            "browser_download_url":"https://x/x","digest":"sha256:2CF24DBA5FB0A30E26E83B2AC5B9E29E1B161E5C1FA7425E73043362938B9824"}]}"#;
+        let (_, assets) = parse_release_info(json).unwrap().unwrap();
+        assert_eq!(assets[0].digest.as_deref(), Some(hello_sha));
+        let release = Release {
+            version: "9.0.0".into(),
+            asset: assets[0].clone(),
+            checksums_url: checksums_url(&assets),
+        };
+        assert!(verify_download(&release, b"hello").is_ok());
+        assert!(verify_download(&release, b"tampered").is_err());
+
+        // Nothing to check against means nothing is installed.
+        let unchecked = Release {
+            asset: Asset {
+                digest: None,
+                ..release.asset.clone()
+            },
+            ..release
+        };
+        assert!(verify_download(&unchecked, b"hello").is_err());
     }
 
     #[test]

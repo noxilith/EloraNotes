@@ -204,6 +204,14 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # The app's updater refuses a download that does not match this list.
+      - name: Write checksums
+        run: |
+          cd dist
+          rm -f SHA256SUMS
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+
       - name: Attach binaries to release
         env:
           GH_TOKEN: ${{ github.token }}
