@@ -1152,3 +1152,73 @@ fn test_a_word_that_is_typed_and_then_deleted_goes_away_for_everybody() {
     alice.disconnect();
     bob.disconnect();
 }
+
+/// Copies bytes both ways between a client and `upstream`, holding each chunk back for `delay`,
+/// so the connection behaves like one to a server a long way off.
+fn slow_proxy(upstream: u16, delay: Duration) -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for client in listener.incoming().flatten() {
+            let Ok(server) = std::net::TcpStream::connect(("127.0.0.1", upstream)) else {
+                continue;
+            };
+            for (mut from, mut to) in [
+                (client.try_clone().unwrap(), server.try_clone().unwrap()),
+                (server, client),
+            ] {
+                std::thread::spawn(move || {
+                    use std::io::{Read, Write};
+                    let mut chunk = [0u8; 16 * 1024];
+                    while let Ok(n) = from.read(&mut chunk) {
+                        if n == 0 {
+                            break;
+                        }
+                        std::thread::sleep(delay);
+                        if to.write_all(&chunk[..n]).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = to.shutdown(std::net::Shutdown::Both);
+                });
+            }
+        }
+    });
+    port
+}
+
+/// A server across the internet takes tens of milliseconds to answer. The connection used to
+/// wait only a few milliseconds for the encrypted handshake, so it failed with "could not send
+/// the handshake" for any server further away than the local network.
+#[test]
+fn test_a_distant_server_can_be_connected_to() {
+    let _turn = SERVER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let harness = start_server();
+    let mut profile = harness.profile();
+    profile.port = slow_proxy(harness.port, Duration::from_millis(25));
+
+    let mut far = Collab::new();
+    far.connect(profile, "alice".into(), key("alice"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut online = false;
+    let mut last = String::new();
+    while Instant::now() < deadline && !online {
+        for event in far.poll() {
+            match event {
+                Incoming::Online { .. } => online = true,
+                Incoming::Offline(reason) => last = reason,
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        online,
+        "never got online through a slow link; last reason: {last:?}"
+    );
+
+    // And a note can still be opened and read over that link.
+    far.open_note(&harness.note_id, "");
+    let mut body = String::new();
+    settle(&mut far, &mut body, "far client", |_, body| body == "hello");
+}

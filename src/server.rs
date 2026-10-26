@@ -1677,6 +1677,7 @@ fn note_from_meta(meta: &NoteMeta, body: String) -> Note {
         shared_with: meta.shared_with.clone(),
         shared_keys: meta.shared_keys.clone(),
         extra_frontmatter: String::new(),
+        ai: Default::default(),
         created_at: updated,
         updated_at: updated,
         file_path: PathBuf::new(),

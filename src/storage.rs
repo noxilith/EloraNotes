@@ -235,6 +235,11 @@ pub struct AppSettings {
     /// no opinion, does the same.
     #[serde(default)]
     pub graph_motion: GraphMotion,
+    /// Shared-library notes that AI assistants may read but not change. A note kept on this
+    /// computer records the same thing in its own frontmatter; a shared note has none of its
+    /// own to write to, so the choice is kept here.
+    #[serde(default)]
+    pub mcp_read_only_ids: Vec<String>,
 }
 
 fn default_highlight_rgb() -> [u8; 3] {
@@ -281,7 +286,28 @@ impl Default for AppSettings {
             export_dir: None,
             show_card_previews: default_show_card_previews(),
             graph_motion: GraphMotion::default(),
+            mcp_read_only_ids: Vec::new(),
         }
+    }
+}
+
+/// A note's relationship with AI assistants that reach it through `elora --mcp`. Kept in the
+/// frontmatter (`author: ai`, `edited_by: ai`, `mcp_read_only: true`) so it travels with the
+/// file and shows in any other editor.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AiMarks {
+    /// An assistant made this note.
+    pub created: bool,
+    /// An assistant wrote to it last; cleared the next time a person changes the text.
+    pub edited: bool,
+    /// Assistants may read this note but not change, rename, trash or delete it.
+    pub read_only: bool,
+}
+
+impl AiMarks {
+    /// True if an assistant made the note or last wrote to it.
+    pub fn touched(&self) -> bool {
+        self.created || self.edited
     }
 }
 
@@ -317,12 +343,77 @@ pub struct Note {
     /// exactly as they were in the file, so saving a note never strips them.
     #[serde(default)]
     pub extra_frontmatter: String,
+    /// What an AI assistant has to do with this note: who made it, who last changed it, and
+    /// whether assistants may change it at all.
+    #[serde(default)]
+    pub ai: AiMarks,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub file_path: PathBuf,
 }
 
+/// What the sidebar asks of a note on every frame and that needs a read of its whole text: the
+/// tags and the task count. Working them out afresh for every card on every frame was most of
+/// what a redraw cost once a library had a few hundred notes.
+struct Derived {
+    tags: Vec<String>,
+    tasks: (usize, usize),
+}
+
+/// How many notes' results are kept before the table is emptied and refilled, so notes that
+/// were deleted or replaced cannot pile up.
+const DERIVED_LIMIT: usize = 4096;
+
+thread_local! {
+    /// Keyed by note id; each entry remembers which text it was worked out from, so a note that
+    /// changed in any way — typed in, replaced by a synced copy, reloaded from disk — is read again.
+    static DERIVED: std::cell::RefCell<std::collections::HashMap<String, (u64, std::rc::Rc<Derived>)>> =
+        Default::default();
+}
+
+/// A quick, non-cryptographic hash of some text, eight bytes at a time. It only has to notice
+/// that a note's text is no longer the text a cached result was made from.
+fn text_stamp(seed: u64, text: &str) -> u64 {
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+    let mut bytes = text.as_bytes();
+    let mut hash = (seed ^ bytes.len() as u64).wrapping_mul(K);
+    while bytes.len() >= 8 {
+        let (head, rest) = bytes.split_at(8);
+        let word = u64::from_le_bytes(head.try_into().expect("eight bytes"));
+        hash = (hash.rotate_left(5) ^ word).wrapping_mul(K);
+        bytes = rest;
+    }
+    for &byte in bytes {
+        hash = (hash.rotate_left(5) ^ u64::from(byte)).wrapping_mul(K);
+    }
+    hash
+}
+
 impl Note {
+    fn derived(&self) -> std::rc::Rc<Derived> {
+        let mut stamp = text_stamp(1, &self.body);
+        for tag in &self.explicit_tags {
+            stamp = text_stamp(stamp, tag);
+        }
+        DERIVED.with(|table| {
+            let mut table = table.borrow_mut();
+            if let Some((seen, found)) = table.get(&self.id) {
+                if *seen == stamp {
+                    return found.clone();
+                }
+            }
+            if table.len() >= DERIVED_LIMIT {
+                table.clear();
+            }
+            let made = std::rc::Rc::new(Derived {
+                tags: self.compute_tags(),
+                tasks: self.compute_tasks(),
+            });
+            table.insert(self.id.clone(), (stamp, made.clone()));
+            made
+        })
+    }
+
     pub fn new(title: impl Into<String>, body: impl Into<String>, dir: &Path) -> Self {
         let now = Utc::now();
         let title_str = title.into();
@@ -344,6 +435,7 @@ impl Note {
             shared_with: Vec::new(),
             shared_keys: Vec::new(),
             extra_frontmatter: String::new(),
+            ai: Default::default(),
             created_at: now,
             updated_at: now,
             file_path,
@@ -352,6 +444,10 @@ impl Note {
 
     /// Returns a sorted, deduplicated list of all tags (both frontmatter tags and `#inline` tags).
     pub fn all_tags(&self) -> Vec<String> {
+        self.derived().tags.clone()
+    }
+
+    fn compute_tags(&self) -> Vec<String> {
         let mut set = BTreeSet::new();
         for t in &self.explicit_tags {
             let cleaned = normalize_tag(t);
@@ -463,6 +559,10 @@ impl Note {
 
     /// Returns `(completed_tasks, total_tasks)` for Markdown `- [ ]` and `- [x]` items.
     pub fn task_progress(&self) -> (usize, usize) {
+        self.derived().tasks
+    }
+
+    fn compute_tasks(&self) -> (usize, usize) {
         let mut done = 0;
         let mut total = 0;
         let mut in_code = false;
@@ -608,8 +708,23 @@ impl Note {
             format!("shared_keys: [{}]\n", keys.join(", "))
         };
 
+        let ai_lines = format!(
+            "{}{}{}",
+            if self.ai.created { "author: ai\n" } else { "" },
+            if self.ai.edited {
+                "edited_by: ai\n"
+            } else {
+                ""
+            },
+            if self.ai.read_only {
+                "mcp_read_only: true\n"
+            } else {
+                ""
+            },
+        );
+
         format!(
-            "---\ntitle: \"{}\"\npinned: {}\ntrashed: {}\ntags: {}\n{}{}{}{}{}{}{}{}created_at: {}\nupdated_at: {}\n---\n{}",
+            "---\ntitle: \"{}\"\npinned: {}\ntrashed: {}\ntags: {}\n{}{}{}{}{}{}{}{}{}created_at: {}\nupdated_at: {}\n---\n{}",
             escaped_title,
             self.pinned,
             self.trashed,
@@ -624,6 +739,7 @@ impl Note {
             private_line,
             shared_line,
             shared_keys_line,
+            ai_lines,
             self.extra_frontmatter,
             self.created_at.to_rfc3339(),
             self.updated_at.to_rfc3339(),
@@ -650,6 +766,7 @@ impl Note {
             let mut private = false;
             let mut shared_with = Vec::new();
             let mut shared_keys = Vec::new();
+            let mut ai = AiMarks::default();
             let mut created_at = fallback_time;
             let mut updated_at = fallback_time;
 
@@ -697,6 +814,15 @@ impl Note {
                             .filter(|key| !key.is_empty())
                             .collect();
                     }
+                    "author" => {
+                        ai.created = val.trim_matches('"').eq_ignore_ascii_case("ai");
+                    }
+                    "edited_by" => {
+                        ai.edited = val.trim_matches('"').eq_ignore_ascii_case("ai");
+                    }
+                    "mcp_read_only" => {
+                        ai.read_only = val.eq_ignore_ascii_case("true");
+                    }
                     "icon" => {
                         let name: String = val
                             .trim_matches('"')
@@ -736,6 +862,7 @@ impl Note {
                 shared_with,
                 shared_keys,
                 extra_frontmatter,
+                ai,
                 created_at,
                 updated_at,
                 file_path,
@@ -775,6 +902,7 @@ impl Note {
                 shared_with: Vec::new(),
                 shared_keys: Vec::new(),
                 extra_frontmatter: String::new(),
+                ai: Default::default(),
                 created_at: fallback_time,
                 updated_at: fallback_time,
                 file_path,
@@ -784,6 +912,10 @@ impl Note {
 
     /// Matches note against a search query (supports free text and `#tag` tokens) and an optional active tag filter.
     pub fn matches_filter(&self, query: &str, active_tag: Option<&str>) -> bool {
+        // With nothing to match against, every note matches; the tags need not be read at all.
+        if active_tag.is_none() && query.trim().is_empty() {
+            return true;
+        }
         let tags = self.all_tags();
 
         if let Some(required_tag) = active_tag {
@@ -1226,6 +1358,27 @@ pub struct NoteStorage {
     kept_copies: std::sync::Mutex<Vec<Note>>,
 }
 
+/// Where the earlier copies of notes are kept, inside the notes folder.
+const HISTORY_DIR: &str = ".history";
+/// How many earlier copies are kept of each note.
+const HISTORY_KEEP: usize = 20;
+/// How a copy's file name records when it was taken: sorts as time and needs no extra file.
+const VERSION_STAMP: &str = "%Y%m%dT%H%M%S%.6f";
+
+/// One earlier copy of a note: see [`NoteStorage::snapshot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteVersion {
+    pub taken: DateTime<Utc>,
+    pub path: PathBuf,
+}
+
+/// What another program did to the notes folder: see [`NoteStorage::take_disk_changes`].
+#[derive(Debug, Default)]
+pub struct DiskChanges {
+    pub changed: Vec<Note>,
+    pub removed: Vec<PathBuf>,
+}
+
 fn modified(path: &Path) -> Option<std::time::SystemTime> {
     fs::metadata(path).and_then(|m| m.modified()).ok()
 }
@@ -1288,6 +1441,110 @@ impl NoteStorage {
             kept.push(copy);
         }
         Ok(())
+    }
+
+    /// Folder holding the earlier versions of one note. It starts with a dot and sits inside the
+    /// notes folder, so the note list never mistakes it for notes.
+    fn history_dir(&self, id: &str) -> PathBuf {
+        self.root_dir.join(HISTORY_DIR).join(id)
+    }
+
+    /// Keeps a copy of what is on disk for `note` before something overwrites or deletes it,
+    /// so a bad edit can be undone. Returns whether a copy was made: nothing is kept if the
+    /// file is missing or is identical to the newest copy. Only the newest [`HISTORY_KEEP`]
+    /// copies of a note are kept.
+    pub fn snapshot(&self, note: &Note) -> io::Result<bool> {
+        let Ok(current) = fs::read_to_string(&note.file_path) else {
+            return Ok(false);
+        };
+        let dir = self.history_dir(&note.id);
+        let versions = self.versions(&note.id);
+        if let Some(newest) = versions.first() {
+            if fs::read_to_string(&newest.path).is_ok_and(|kept| kept == current) {
+                return Ok(false);
+            }
+        }
+        fs::create_dir_all(&dir)?;
+        let name = format!("{}.md", Utc::now().format(VERSION_STAMP));
+        write_atomic(&dir.join(name), current)?;
+        for old in self.versions(&note.id).into_iter().skip(HISTORY_KEEP) {
+            let _ = fs::remove_file(old.path);
+        }
+        Ok(true)
+    }
+
+    /// The earlier copies kept of a note, newest first.
+    pub fn versions(&self, id: &str) -> Vec<NoteVersion> {
+        let Ok(entries) = fs::read_dir(self.history_dir(id)) else {
+            return Vec::new();
+        };
+        let mut found: Vec<NoteVersion> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                let stem = path.file_name()?.to_str()?.strip_suffix(".md")?.to_string();
+                let taken = chrono::NaiveDateTime::parse_from_str(&stem, VERSION_STAMP)
+                    .ok()?
+                    .and_utc();
+                Some(NoteVersion { taken, path })
+            })
+            .collect();
+        found.sort_by_key(|version| std::cmp::Reverse(version.taken));
+        found
+    }
+
+    /// Reads an earlier copy as a note, with the identity and file of `of` so it can replace it.
+    pub fn read_version(&self, version: &NoteVersion, of: &Note) -> io::Result<Note> {
+        let raw = fs::read_to_string(&version.path)?;
+        let mut note = Note::from_markdown(of.id.clone(), &raw, of.file_path.clone());
+        note.id = of.id.clone();
+        Ok(note)
+    }
+
+    /// The notes whose files were added or changed by another program since they were last read
+    /// or written here, and the files that are gone. Everything returned is marked as seen, so
+    /// the next call only reports what happened after this one.
+    pub fn take_disk_changes(&self) -> DiskChanges {
+        let mut changes = DiskChanges::default();
+        let Ok(entries) = fs::read_dir(&self.root_dir) else {
+            return changes;
+        };
+        let mut present = std::collections::HashSet::new();
+        for path in entries.flatten().map(|e| e.path()) {
+            if !(path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md")) {
+                continue;
+            }
+            present.insert(path.clone());
+            let known = self
+                .seen
+                .lock()
+                .ok()
+                .and_then(|seen| seen.get(&path).copied());
+            if known.is_some() && known == modified(&path) {
+                continue;
+            }
+            let id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("note")
+                .to_string();
+            if let Ok(raw) = fs::read_to_string(&path) {
+                self.remember(&path);
+                changes.changed.push(Note::from_markdown(id, &raw, path));
+            }
+        }
+        if let Ok(mut seen) = self.seen.lock() {
+            let gone: Vec<PathBuf> = seen
+                .keys()
+                .filter(|p| p.parent() == Some(self.root_dir.as_path()) && !present.contains(*p))
+                .cloned()
+                .collect();
+            for path in gone {
+                seen.remove(&path);
+                changes.removed.push(path);
+            }
+        }
+        changes
     }
 
     pub fn default_notes_dir() -> PathBuf {
@@ -1544,6 +1801,134 @@ mod tests {
             !older.contains(':') && older.contains(", 20"),
             "an older note shows its date: {older}"
         );
+    }
+
+    #[test]
+    fn test_disk_changes_report_outside_edits_and_not_our_own() {
+        let dir = std::env::temp_dir().join(format!(
+            "elora-disk-changes-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let ours = NoteStorage::new(dir.clone()).unwrap();
+        let theirs = NoteStorage::new(dir.clone()).unwrap();
+        let mine = Note::new("Mine", "text", &dir);
+        ours.save_note(&mine).unwrap();
+        ours.load_all().unwrap();
+        assert!(ours.take_disk_changes().changed.is_empty());
+
+        // Another program adds a note, then edits it, then removes it.
+        let other = Note::new("Other", "first", &dir);
+        theirs.save_note(&other).unwrap();
+        let changes = ours.take_disk_changes();
+        assert_eq!(changes.changed.len(), 1);
+        assert_eq!(changes.changed[0].title, "Other");
+        assert!(ours.take_disk_changes().changed.is_empty());
+
+        let mut edited = other.clone();
+        edited.body = "second".to_string();
+        theirs.save_note(&edited).unwrap();
+        let file = fs::File::options()
+            .write(true)
+            .open(&edited.file_path)
+            .unwrap();
+        file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        let changes = ours.take_disk_changes();
+        assert_eq!(changes.changed.len(), 1);
+        assert_eq!(changes.changed[0].body, "second");
+
+        fs::remove_file(&edited.file_path).unwrap();
+        let changes = ours.take_disk_changes();
+        assert_eq!(changes.removed, vec![edited.file_path.clone()]);
+        assert!(ours.take_disk_changes().removed.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cached_tags_and_tasks_follow_every_kind_of_edit() {
+        let dir = std::env::temp_dir();
+        let mut note = Note::new("Cache", "#one\n- [ ] a", &dir);
+        assert_eq!(note.all_tags(), vec!["one"]);
+        assert_eq!(note.task_progress(), (0, 1));
+        // Same length, different text: a stale cache would keep saying `one`.
+        note.body = "#two\n- [x] a".to_string();
+        assert_eq!(note.all_tags(), vec!["two"]);
+        assert_eq!(note.task_progress(), (1, 1));
+        note.explicit_tags = vec!["extra".to_string()];
+        assert_eq!(note.all_tags(), vec!["extra", "two"]);
+        // A clone made before the edit is read for what it holds, not what its id once held.
+        let before = note.clone();
+        note.body = "plain".to_string();
+        assert_eq!(before.all_tags(), vec!["extra", "two"]);
+        assert_eq!(note.all_tags(), vec!["extra"]);
+        // Nothing to match against: no tags are read, and everything matches.
+        assert!(note.matches_filter("  ", None));
+        assert!(!note.matches_filter("", Some("missing")));
+    }
+
+    #[test]
+    fn test_text_stamp_notices_a_single_changed_character() {
+        let a = "x".repeat(37);
+        let mut b = a.clone();
+        b.replace_range(20..21, "y");
+        assert_ne!(text_stamp(1, &a), text_stamp(1, &b));
+        assert_eq!(text_stamp(1, &a), text_stamp(1, &a.clone()));
+        assert_ne!(text_stamp(1, ""), text_stamp(2, ""));
+    }
+
+    #[test]
+    fn test_ai_marks_round_trip_and_stay_out_of_plain_notes() {
+        let dir = std::env::temp_dir();
+        let mut note = Note::new("Marked", "body", &dir);
+        assert!(!note.to_markdown().contains("author:"));
+        assert!(!note.to_markdown().contains("mcp_read_only"));
+        note.ai = AiMarks {
+            created: true,
+            edited: true,
+            read_only: true,
+        };
+        let md = note.to_markdown();
+        assert!(md.contains("\nauthor: ai\n"));
+        assert!(md.contains("\nedited_by: ai\n"));
+        assert!(md.contains("\nmcp_read_only: true\n"));
+        let parsed = Note::from_markdown("marked".into(), &md, note.file_path.clone());
+        assert_eq!(parsed.ai, note.ai);
+        assert!(parsed.ai.touched());
+        // The marks are ours: they are not left behind as unknown frontmatter.
+        assert!(!parsed.extra_frontmatter.contains("author"));
+    }
+
+    #[test]
+    fn test_history_keeps_earlier_copies_and_prunes_old_ones() {
+        let dir = std::env::temp_dir().join(format!(
+            "elora-history-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let storage = NoteStorage::new(dir.clone()).unwrap();
+        let mut note = Note::new("Versioned", "first", &dir);
+        // Nothing on disk yet: nothing to keep.
+        assert!(!storage.snapshot(&note).unwrap());
+        storage.save_note(&note).unwrap();
+        assert!(storage.snapshot(&note).unwrap());
+        // The same text again is not a new version.
+        assert!(!storage.snapshot(&note).unwrap());
+        for i in 0..(HISTORY_KEEP + 5) {
+            note.body = format!("edit {i}");
+            storage.snapshot(&note).unwrap();
+            storage.save_note(&note).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let versions = storage.versions(&note.id);
+        assert_eq!(versions.len(), HISTORY_KEEP);
+        assert!(versions[0].taken > versions[1].taken);
+        let newest = storage.read_version(&versions[0], &note).unwrap();
+        assert_eq!(newest.body, format!("edit {}", HISTORY_KEEP + 3));
+        // The history folder is not mistaken for notes.
+        let listed = storage.load_all().unwrap();
+        assert_eq!(listed.len(), 1);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

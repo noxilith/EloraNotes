@@ -141,6 +141,7 @@ fn test_shared_library_notes_are_grouped_by_their_folder() {
         shared_with: Vec::new(),
         shared_keys: Vec::new(),
         extra_frontmatter: String::new(),
+        ai: Default::default(),
         created_at: now,
         updated_at: now,
         file_path: PathBuf::new(),
@@ -298,6 +299,7 @@ fn test_hiding_the_preview_line_makes_note_cards_shorter() {
         shared_with: Vec::new(),
         shared_keys: Vec::new(),
         extra_frontmatter: String::new(),
+        ai: Default::default(),
         created_at: now,
         updated_at: now,
         file_path: PathBuf::new(),
@@ -1441,6 +1443,7 @@ fn test_exporting_one_note_follows_its_links_both_ways() {
         shared_with: Vec::new(),
         shared_keys: Vec::new(),
         extra_frontmatter: String::new(),
+        ai: Default::default(),
         created_at: now,
         updated_at: now,
         file_path: PathBuf::new(),
@@ -3798,4 +3801,334 @@ fn test_a_graph_label_is_cut_to_fit_beside_its_dot() {
     assert_eq!(long.chars().count(), 25);
     assert!(long.ends_with('…'));
     assert_eq!(graph_label("Short note"), "Short note");
+}
+
+/// A note another program writes into the folder appears without a restart, an edit to an open
+/// note replaces what the window shows, and a deleted file leaves the list.
+#[test]
+fn test_notes_changed_by_another_program_show_up_live() {
+    let (mut app, dir, root) = app_with_note("First line");
+    let id = app.notes[0].id.clone();
+    let mut mine = app.notes[0].clone();
+    mine.body = "First line".to_string();
+    app.storage.save_note(&mine).unwrap();
+
+    let outside = NoteStorage::new(root.clone()).unwrap();
+    let theirs = Note::new("From an assistant", "hello", &root);
+    outside.save_note(&theirs).unwrap();
+    app.disk_watch.flag_change();
+    app.poll_disk();
+    assert!(app.notes.iter().any(|n| n.title == "From an assistant"));
+
+    let mut edited = mine.clone();
+    edited.body = "Edited elsewhere".to_string();
+    outside.save_note(&edited).unwrap();
+    let file = std::fs::File::options()
+        .write(true)
+        .open(&edited.file_path)
+        .unwrap();
+    file.set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
+        .unwrap();
+    app.disk_watch.flag_change();
+    app.poll_disk();
+    let shown = app.notes.iter().find(|n| n.id == id).unwrap();
+    assert_eq!(shown.body, "Edited elsewhere");
+
+    std::fs::remove_file(&theirs.file_path).unwrap();
+    app.disk_watch.flag_change();
+    app.poll_disk();
+    assert!(!app.notes.iter().any(|n| n.title == "From an assistant"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The sidebar can list just the notes an assistant made or last changed, and a person's own
+/// edit takes the "changed by an assistant" mark off.
+#[test]
+fn test_the_assistant_section_lists_only_notes_an_assistant_touched() {
+    let (mut app, dir, root) = app_with_note("Mine");
+    let mut made = Note::new("Made by AI", "x", &root);
+    made.ai.created = true;
+    let mut changed = Note::new("Changed by AI", "y", &root);
+    changed.ai.edited = true;
+    let mut trashed = Note::new("Old AI note", "z", &root);
+    trashed.ai.created = true;
+    trashed.trashed = true;
+    app.notes.extend([made, changed, trashed]);
+    app.sidebar_section = SidebarSection::Assistant;
+    let titles: Vec<String> = app
+        .filtered_indices()
+        .into_iter()
+        .map(|i| app.notes[i].title.clone())
+        .collect();
+    assert_eq!(titles.len(), 2);
+    assert!(titles.contains(&"Made by AI".to_string()));
+    assert!(titles.contains(&"Changed by AI".to_string()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// "Assistants can read, not change" is written into a note's own file, and into the settings
+/// for a shared note, which has no file here.
+#[test]
+fn test_marking_a_note_read_only_for_assistants_is_remembered() {
+    let (mut app, dir, root) = app_with_note("Guard me");
+    let idx = app.notes.len() - 1;
+    app.set_mcp_read_only(idx, true);
+    assert!(app.notes[idx].ai.read_only);
+    let raw = std::fs::read_to_string(&app.notes[idx].file_path).unwrap();
+    assert!(raw.contains("mcp_read_only: true"), "{raw}");
+    app.set_mcp_read_only(idx, false);
+    let raw = std::fs::read_to_string(&app.notes[idx].file_path).unwrap();
+    assert!(!raw.contains("mcp_read_only"), "{raw}");
+
+    // A shared note keeps the choice in the settings file.
+    let mut shared = Note::new("Shared one", "s", &root);
+    shared.file_path = PathBuf::new();
+    let shared_id = shared.id.clone();
+    app.remote_ids.insert(shared_id.clone());
+    app.notes.push(shared);
+    let shared_idx = app.notes.len() - 1;
+    app.set_mcp_read_only(shared_idx, true);
+    assert!(app
+        .storage
+        .load_settings()
+        .mcp_read_only_ids
+        .contains(&shared_id));
+    app.set_mcp_read_only(shared_idx, false);
+    assert!(!app
+        .storage
+        .load_settings()
+        .mcp_read_only_ids
+        .contains(&shared_id));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Restoring an earlier version brings its text back, keeps where the note lives and who may
+/// edit it, and keeps what was there before so the restore can itself be undone.
+#[test]
+fn test_restoring_an_earlier_version_keeps_the_note_where_it_is() {
+    let (mut app, dir, root) = app_with_note("original text");
+    let idx = app.notes.len() - 1;
+    app.notes[idx].folder = Some("Work".into());
+    app.notes[idx].ai.read_only = true;
+    app.persist_note(idx).unwrap();
+    let id = app.notes[idx].id.clone();
+
+    // An assistant overwrites it; the old text goes to the history first.
+    let before = app.notes[idx].clone();
+    app.storage.snapshot(&before).unwrap();
+    app.notes[idx].body = "assistant rewrote this".into();
+    app.persist_note(idx).unwrap();
+
+    app.open_history(idx);
+    let earlier = app.storage.versions(&id);
+    assert_eq!(earlier.len(), 1);
+    let older = app
+        .storage
+        .read_version(&earlier[0], &app.notes[idx])
+        .unwrap();
+    app.notes[idx].folder = Some("Moved".into());
+    app.restore_version(&id, &older);
+
+    let now = app.notes.iter().find(|n| n.id == id).unwrap();
+    assert_eq!(now.body, "original text");
+    assert_eq!(
+        now.folder.as_deref(),
+        Some("Moved"),
+        "the note stays where it is now"
+    );
+    assert!(
+        now.ai.read_only,
+        "the protection is not lifted by a restore"
+    );
+    // The text that was replaced is in the history now.
+    let kept = app.storage.versions(&id);
+    assert!(kept.len() >= 2);
+    let _ = root;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The command Settings hands out carries the limits that were chosen.
+#[test]
+fn test_the_assistant_command_carries_the_chosen_limits() {
+    let none = McpOptions::default();
+    let (_, args) = settings::mcp_launch_command(Path::new("/notes"), &none);
+    assert_eq!(args, vec!["--mcp", "--dir", "/notes"]);
+    let limited = McpOptions {
+        read_only: true,
+        folder: " AI ".into(),
+        no_shared: true,
+    };
+    let (_, args) = settings::mcp_launch_command(Path::new("/notes"), &limited);
+    assert_eq!(
+        args,
+        vec![
+            "--mcp",
+            "--dir",
+            "/notes",
+            "--read-only",
+            "--no-shared",
+            "--folder",
+            "AI"
+        ]
+    );
+}
+
+/// An assistant's edit shows up in the open window with a notice saying who made it.
+#[test]
+fn test_an_assistants_change_arrives_with_a_notice() {
+    let (mut app, dir, root) = app_with_note("before");
+    let idx = app.notes.len() - 1;
+    app.persist_note(idx).unwrap();
+    let outside = NoteStorage::new(root.clone()).unwrap();
+    let mut edited = app.notes[idx].clone();
+    edited.body = "after".into();
+    edited.ai.edited = true;
+    outside.save_note(&edited).unwrap();
+    let file = std::fs::File::options()
+        .write(true)
+        .open(&edited.file_path)
+        .unwrap();
+    file.set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
+        .unwrap();
+    app.disk_watch.flag_change();
+    app.poll_disk();
+    assert!(app
+        .status_message
+        .as_deref()
+        .is_some_and(|m| m.contains("changed by an assistant")));
+
+    let mut added = Note::new("Fresh from AI", "hi", &root);
+    added.ai.created = true;
+    outside.save_note(&added).unwrap();
+    app.disk_watch.flag_change();
+    app.poll_disk();
+    assert!(app
+        .status_message
+        .as_deref()
+        .is_some_and(|m| m.contains("added “Fresh from AI”")));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A window over a vault of its own, with the app's own context so frames can be drawn.
+fn drawable_app(name: &str) -> (EloraApp, egui::Context, PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "elora-{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let storage = NoteStorage::new(dir.clone()).unwrap();
+    let ctx = egui::Context::default();
+    let app = EloraApp::with_context(&ctx, storage);
+    (app, ctx, dir)
+}
+
+fn draw(ctx: &egui::Context, mut contents: impl FnMut(&egui::Context)) {
+    for _ in 0..3 {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1100.0, 760.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| contents(ctx));
+    }
+}
+
+/// Everything the assistant features add to the window is drawn for each kind of note, so a
+/// layout that panics or a menu that cannot be built shows up here rather than at launch.
+#[test]
+fn test_the_assistant_features_draw_for_every_kind_of_note() {
+    let (mut app, ctx, dir) = drawable_app("draw-assistant");
+    let root = app.storage.root_dir().to_path_buf();
+    let mut made = Note::new("Made by AI", "# Hi\n- [ ] one", &root);
+    made.ai.created = true;
+    made.icon = Some("robot".into());
+    let mut changed = Note::new("Changed by AI", "text", &root);
+    changed.ai.edited = true;
+    let mut guarded = Note::new("Guarded", "text", &root);
+    guarded.ai.read_only = true;
+    let mut shared = Note::new("On the server", "shared", &root);
+    shared.file_path = PathBuf::new();
+    app.remote_ids.insert(shared.id.clone());
+    let ids: Vec<String> = [&made, &changed, &guarded, &shared]
+        .iter()
+        .map(|n| n.id.clone())
+        .collect();
+    app.notes.extend([made, changed, guarded, shared]);
+    let p = app.theme.palette_with(&app.colors, app.glow_strength);
+
+    for id in &ids {
+        app.selected_id = Some(id.clone());
+        draw(&ctx, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.render_sidebar(ui, &p);
+                app.render_editor(ui, &p, 700.0, 0.0);
+            });
+        });
+    }
+
+    // The assistant filter, Settings with its limits and a test result, the history window and
+    // the graph, all open at once.
+    app.sidebar_section = SidebarSection::Assistant;
+    app.show_settings = true;
+    app.mcp_options = McpOptions {
+        read_only: true,
+        folder: "AI".into(),
+        no_shared: true,
+    };
+    app.selected_id = Some(ids[0].clone());
+    let idx = app.notes.iter().position(|n| n.id == ids[0]).unwrap();
+    app.open_history(idx);
+    app.toggle_graph();
+    draw(&ctx, |ctx| {
+        app.settings_window(ctx);
+        app.history_window(ctx);
+        app.graph_window(ctx);
+        egui::CentralPanel::default().show(ctx, |ui| {
+            app.render_sidebar(ui, &p);
+        });
+    });
+    assert!(app.graph.is_some());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The Settings check starts a program the way an assistant would and says what it found.
+#[cfg(unix)]
+#[test]
+fn test_the_connection_check_reads_what_the_server_says() {
+    let script = r#"cat >/dev/null
+echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{},{},{}]}}'
+echo '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{\"notes\":5,\"read_only_server\":true,\"folder_limit\":\"AI\",\"shared_library\":\"connected to X (2 notes)\"}"}]}}'"#;
+    let said = settings::check_mcp_command("sh", &["-c".into(), script.into()]);
+    assert_eq!(
+        said,
+        "Works: 3 tools, 5 notes, read-only, limited to “AI”, shared library connected to X (2 notes)"
+    );
+    assert!(settings::check_mcp_command("/no/such/program", &[]).starts_with("Could not start"));
+    let silent = settings::check_mcp_command("sh", &["-c".into(), "cat >/dev/null".into()]);
+    assert!(
+        silent.starts_with("It started but did not answer the way"),
+        "{silent}"
+    );
+}
+
+/// A command that points into a build folder is flagged, whichever way the path is written.
+#[test]
+fn test_a_build_folder_path_is_recognised_on_every_platform() {
+    assert!(settings::runs_from_build_folder(
+        "/home/me/EloraNotes/target/debug/elora"
+    ));
+    assert!(settings::runs_from_build_folder("/x/target/release/elora"));
+    assert!(settings::runs_from_build_folder(
+        r"C:\src\EloraNotes\target\release\elora.exe"
+    ));
+    assert!(!settings::runs_from_build_folder("/usr/bin/elora"));
+    assert!(!settings::runs_from_build_folder(
+        r"C:\Program Files\EloraNotes\elora.exe"
+    ));
 }

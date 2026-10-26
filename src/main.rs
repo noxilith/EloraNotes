@@ -6,6 +6,23 @@ use std::path::PathBuf;
 
 fn main() -> eframe::Result<()> {
     let cli_dir = parse_cli_dir();
+    // `elora --mcp` serves the notes to an AI assistant over stdin/stdout instead of opening a
+    // window, so it needs no display and no other binary.
+    if std::env::args().skip(1).any(|arg| arg == "--mcp") {
+        let notes_dir = cli_dir.unwrap_or_else(NoteStorage::default_notes_dir);
+        let storage = NoteStorage::new(notes_dir).expect("Failed to open the notes folder");
+        let options = elora_notes::mcp::VaultOptions {
+            read_only: has_flag("--read-only"),
+            folder: flag_value("--folder"),
+            no_shared: has_flag("--no-shared"),
+        };
+        let vault = elora_notes::mcp::Vault::with_options(storage, options);
+        if let Err(e) = elora_notes::mcp::serve(vault) {
+            eprintln!("elora --mcp: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let uses_default_dir = cli_dir.is_none();
     let notes_dir = cli_dir.unwrap_or_else(NoteStorage::default_notes_dir);
     let storage = NoteStorage::new(notes_dir).expect("Failed to initialize EloraNotes directory");
@@ -83,6 +100,22 @@ fn window_icon() -> Option<egui::IconData> {
     None
 }
 
+/// True if the command line has exactly this flag.
+fn has_flag(flag: &str) -> bool {
+    std::env::args().skip(1).any(|arg| arg == flag)
+}
+
+/// The word after `flag` on the command line.
+fn flag_value(flag: &str) -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == flag {
+            return args.next();
+        }
+    }
+    None
+}
+
 fn parse_cli_dir() -> Option<PathBuf> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -92,6 +125,10 @@ fn parse_cli_dir() -> Option<PathBuf> {
                     return Some(PathBuf::from(dir));
                 }
             }
+            // Its value is a folder inside the notes, not the notes folder itself.
+            "--folder" => {
+                args.next();
+            }
             "--help" | "-h" => {
                 println!(
                     "EloraNotes — Minimalistic cross-platform Markdown notes app\n\n\
@@ -99,6 +136,10 @@ fn parse_cli_dir() -> Option<PathBuf> {
                        elora [OPTIONS] [NOTES_DIR]\n\n\
                      OPTIONS:\n  \
                        -d, --dir <PATH>   Directory to store Markdown notes\n  \
+                           --mcp          Serve the notes to an AI assistant over MCP (stdio)\n  \
+                           --read-only    With --mcp: let the assistant read but never change\n  \
+                           --folder <F>   With --mcp: show the assistant only this folder\n  \
+                           --no-shared    With --mcp: leave the shared library out\n  \
                        -h, --help         Show this help message"
                 );
                 std::process::exit(0);

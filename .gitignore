@@ -33,3 +33,6 @@ config.local.toml
 
 # Screenshots taken while working on the UI; the one the README shows lives in assets/
 /screenshots/
+
+# Local assistant settings
+.claude/

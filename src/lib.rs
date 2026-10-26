@@ -14,6 +14,8 @@ pub mod icons;
 pub mod images;
 #[cfg(feature = "gui")]
 pub mod markdown;
+pub mod mcp;
+pub mod mcp_shared;
 pub mod net;
 pub mod people;
 pub mod server;

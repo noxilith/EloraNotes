@@ -21,8 +21,19 @@ use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
 use yrs::{Doc, GetString, ReadTxn, Text, TextRef, Transact};
 
-/// How long a read waits before the worker looks at its command channel again.
+/// How long the encrypted handshake may wait for the server's answer. It needs at least one
+/// round trip, which is tens of milliseconds to a server across the internet; the short polling
+/// interval below used to apply here too and made every such connection fail.
+const HANDSHAKE_READ: Duration = Duration::from_secs(10);
+/// How long a read waits before the worker looks at its command channel again while the
+/// connection is busy.
 const POLL: Duration = Duration::from_millis(8);
+/// The same wait once the connection has been quiet for [`IDLE_AFTER`]. Anything the server
+/// sends wakes a read at once, so only a local change waits for this, and the first one brings
+/// the fast interval back.
+const IDLE_POLL: Duration = Duration::from_millis(60);
+/// How long nothing may happen before the worker slows its polling down.
+const IDLE_AFTER: Duration = Duration::from_secs(1);
 /// First retry delay after a dropped connection; doubles up to [`MAX_RETRY`].
 const FIRST_RETRY: Duration = Duration::from_secs(2);
 const MAX_RETRY: Duration = Duration::from_secs(15);
@@ -813,7 +824,7 @@ impl Session {
         let socket = connect_socket(&address, CONNECT_TIMEOUT)?;
         socket.set_nodelay(true).ok();
         socket
-            .set_read_timeout(Some(POLL))
+            .set_read_timeout(Some(HANDSHAKE_READ))
             .map_err(|e| e.to_string())?;
         socket
             .set_write_timeout(Some(Duration::from_secs(10)))
@@ -841,6 +852,11 @@ impl Session {
         net::write_frame(&mut stream, FRAME_JSON, &payload)
             .and_then(|_| stream.flush())
             .map_err(|e| format!("could not send the handshake: {e}"))?;
+        // The encrypted handshake finished inside that write; from here the worker polls.
+        stream
+            .sock
+            .set_read_timeout(Some(POLL))
+            .map_err(|e| e.to_string())?;
 
         // The server answers with Welcome or Error; anything else means this is not Elora.
         let mut buffer = Vec::new();
@@ -909,6 +925,8 @@ impl Session {
     }
 
     fn run(&mut self, commands: &Receiver<Command>, events: &Notify) -> String {
+        let mut last_activity = Instant::now();
+        let mut polling = POLL;
         loop {
             loop {
                 match commands.try_recv() {
@@ -916,6 +934,7 @@ impl Session {
                         return "disconnected".to_string()
                     }
                     Ok(command) => {
+                        last_activity = Instant::now();
                         if let Err(error) = self.handle(command, events) {
                             return error;
                         }
@@ -928,8 +947,17 @@ impl Session {
                 return error;
             }
 
+            // A quiet connection looks at its commands less often, which is most of the time
+            // the app is open; the fast interval returns with the next change or frame.
+            let wanted = poll_interval(last_activity.elapsed());
+            if wanted != polling {
+                polling = wanted;
+                self.stream.sock.set_read_timeout(Some(polling)).ok();
+            }
+
             match read_frames(&mut self.stream, &mut self.buffer) {
                 Ok(Some(frames)) => {
+                    last_activity = Instant::now();
                     for (kind, payload) in frames {
                         if let Err(error) = self.handle_frame(kind, payload, events) {
                             return error;
@@ -1546,6 +1574,16 @@ pub fn diff(base: &str, new: &str) -> (usize, usize, usize) {
     (prefix, base_rest - suffix, new_rest - suffix)
 }
 
+/// How long the worker waits on the socket before it looks at its commands again, given how
+/// long ago anything last happened on the connection.
+fn poll_interval(quiet_for: Duration) -> Duration {
+    if quiet_for >= IDLE_AFTER {
+        IDLE_POLL
+    } else {
+        POLL
+    }
+}
+
 /// What a connection that has heard nothing should do about it.
 #[derive(Debug, PartialEq)]
 enum KeepAlive {
@@ -1783,6 +1821,17 @@ mod tests {
             KeepAlive::Gone,
             "an unanswered ping means the link is not carrying anything"
         );
+    }
+
+    #[test]
+    fn test_a_quiet_connection_polls_slowly_and_a_busy_one_quickly() {
+        assert_eq!(poll_interval(Duration::ZERO), POLL);
+        assert_eq!(poll_interval(IDLE_AFTER - Duration::from_millis(1)), POLL);
+        assert_eq!(poll_interval(IDLE_AFTER), IDLE_POLL);
+        assert_eq!(poll_interval(Duration::from_secs(3600)), IDLE_POLL);
+        // The slow interval must stay well inside what typing can notice, and the keep-alive
+        // and cursor throttle are both coarser than it.
+        assert!(IDLE_POLL <= CURSOR_INTERVAL);
     }
 
     #[test]

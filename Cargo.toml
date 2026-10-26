@@ -1,6 +1,6 @@
 [package]
 name = "elora-notes"
-version = "0.9.28"
+version = "0.10.0"
 edition = "2021"
 description = "EloraNotes — A calm, minimalistic cross-platform Markdown notes desktop app"
 authors = ["EloraNotes"]
@@ -70,3 +70,9 @@ tar = "0.4"
 
 [target."cfg(windows)".build-dependencies]
 winresource = "0.1.34"
+
+[profile.release]
+# Whole-program optimisation across the crates the app is built from: a smaller, somewhat
+# faster binary, for a slower release build.
+lto = "thin"
+codegen-units = 1

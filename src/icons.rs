@@ -153,4 +153,7 @@ pub mod icon {
     pub const LOCK_OPEN: &str = "\u{eae1}";
     pub const WORLD: &str = "\u{eb54}";
     pub const WIFI_OFF: &str = "\u{ecfa}";
+    pub const GRAPH: &str = "\u{f288}";
+    pub const ROBOT: &str = "\u{f00b}";
+    pub const HISTORY: &str = "\u{ebea}";
 }

@@ -25,6 +25,32 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.10.0" date="2026-10-25">
+      <description>
+        <p>
+          EloraNotes can now be worked in by an AI assistant, with you in charge of what it may
+          touch. Start the app with --mcp and an MCP client such as Claude reads, searches and
+          writes the notes on this computer and in the shared library; Settings → AI assistants
+          has the command to paste and a button that checks it works. Notes an assistant made get
+          a robot icon, show up in the sidebar and the open window as they are written, and have
+          their own filter next to Pinned.
+        </p>
+        <p>
+          Any note can be made read-only for assistants from the robot menu above it, and the
+          server itself can be started read-only, limited to one folder, or without the shared
+          library. Before an assistant overwrites or deletes a note on this computer, the old text
+          is kept, and the same menu lists the earlier versions and restores one.
+        </p>
+        <p>
+          Connecting to a shared library across the internet now works reliably: the encrypted
+          handshake used to be given a few milliseconds, so a server further away than the local
+          network could refuse to connect. A button beside Ko-fi opens the note graph, and the
+          app is lighter: an idle window no longer redraws, the sidebar stays quick with hundreds
+          of notes, large pictures are kept at a sensible size, and a quiet connection polls less
+          often.
+        </p>
+      </description>
+    </release>
     <release version="0.9.28" date="2026-10-24">
       <description>
         <p>

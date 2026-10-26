@@ -17,6 +17,13 @@ use std::time::Duration;
 const MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// Textures kept around after switching notes. Comfortably more than any one note shows.
 const MAX_CACHED: usize = 128;
+/// How much memory the kept textures may take together. When a new picture would go past it the
+/// oldest ones are let go, instead of everything at once.
+const MAX_TEXTURE_BYTES: usize = 96 * 1024 * 1024;
+/// The longest side a picture is kept at. A note's column is far narrower than this even on a
+/// high-density screen, so a larger picture only costs memory; a 12-megapixel photo would
+/// otherwise sit in memory at 48 MB.
+const MAX_SIDE: u32 = 2048;
 /// A picture dragged smaller than this would be a speck, so the handle stops there.
 const MIN_WIDTH: f32 = 48.0;
 /// Side of the square that sits in a picture's bottom-right corner to resize it.
@@ -119,6 +126,8 @@ struct Resizing {
 #[derive(Default)]
 pub struct NoteImages {
     textures: HashMap<String, Option<TextureHandle>>,
+    /// The keys of `textures`, oldest first, for letting the oldest go when memory runs short.
+    order: std::collections::VecDeque<String>,
     downloads: HashMap<String, Receiver<Result<Vec<u8>, String>>>,
     resizing: Option<Resizing>,
     /// Where each picture and its corner handle were drawn, so a test can grab the one it means.
@@ -293,10 +302,25 @@ impl NoteImages {
     }
 
     fn store(&mut self, key: String, texture: Option<TextureHandle>) {
-        if self.textures.len() >= MAX_CACHED {
-            self.textures.clear();
+        if self.textures.insert(key.clone(), texture).is_none() {
+            self.order.push_back(key);
         }
-        self.textures.insert(key, texture);
+        // The newest picture always stays, however large it is.
+        while self.order.len() > 1
+            && (self.textures.len() > MAX_CACHED || self.texture_bytes() > MAX_TEXTURE_BYTES)
+        {
+            if let Some(oldest) = self.order.pop_front() {
+                self.textures.remove(&oldest);
+            }
+        }
+    }
+
+    fn texture_bytes(&self) -> usize {
+        self.textures
+            .values()
+            .flatten()
+            .map(TextureHandle::byte_size)
+            .sum()
     }
 
     /// Moves finished downloads into the texture cache.
@@ -352,7 +376,10 @@ fn fetch(url: &str) -> Result<Vec<u8>, String> {
 
 /// Decodes the common formats a note points at: PNG, JPEG and GIF.
 fn decode(ctx: &Context, key: &str, bytes: &[u8]) -> Option<TextureHandle> {
-    let image = image::load_from_memory(bytes).ok()?;
+    let mut image = image::load_from_memory(bytes).ok()?;
+    if image.width().max(image.height()) > MAX_SIDE {
+        image = image.resize(MAX_SIDE, MAX_SIDE, image::imageops::FilterType::Triangle);
+    }
     let rgba = image.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
     if size[0] == 0 || size[1] == 0 {
@@ -446,6 +473,37 @@ mod tests {
             .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
             .unwrap();
         bytes
+    }
+
+    #[test]
+    fn test_a_huge_picture_is_kept_at_a_sensible_size() {
+        let ctx = Context::default();
+        let texture = decode(&ctx, "huge", &png_of(MAX_SIDE * 2, MAX_SIDE / 2)).unwrap();
+        let [w, h] = texture.size();
+        assert_eq!(w as u32, MAX_SIDE);
+        assert_eq!(h as u32, MAX_SIDE / 4);
+        let small = decode(&ctx, "small", &png_of(40, 30)).unwrap();
+        assert_eq!(small.size(), [40, 30]);
+    }
+
+    #[test]
+    fn test_the_oldest_pictures_go_first_and_the_newest_stays() {
+        let ctx = Context::default();
+        let mut images = NoteImages::default();
+        for i in 0..MAX_CACHED + 5 {
+            let texture = decode(&ctx, &format!("p{i}"), &png_of(2, 2));
+            images.store(format!("p{i}"), texture);
+        }
+        assert_eq!(images.textures.len(), MAX_CACHED);
+        assert!(!images.textures.contains_key("p0"));
+        assert!(images
+            .textures
+            .contains_key(&format!("p{}", MAX_CACHED + 4)));
+        assert_eq!(images.order.len(), images.textures.len());
+        // Storing a key again does not make it count twice.
+        images.store("p10".into(), None);
+        images.store("p10".into(), None);
+        assert_eq!(images.order.len(), images.textures.len());
     }
 
     #[test]

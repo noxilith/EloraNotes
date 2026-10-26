@@ -30,18 +30,23 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 // The app is split by area; each module adds its own `impl EloraApp` block.
+mod disk;
 mod export;
 mod graph;
+mod history;
 mod pictures;
 mod preview;
 mod settings;
 mod sharing;
 mod text;
 mod updates;
+use disk::DiskWatch;
 use export::*;
 use graph::*;
+use history::History;
 use pictures::*;
 use preview::*;
+use settings::{McpCheck, McpOptions};
 use sharing::*;
 use text::*;
 use updates::*;
@@ -104,6 +109,8 @@ pub enum EditorViewMode {
 pub enum SidebarSection {
     AllNotes,
     Pinned,
+    /// Notes an AI assistant made or last changed.
+    Assistant,
     Trash,
 }
 
@@ -177,6 +184,8 @@ pub struct EloraApp {
     graph_angle: f32,
     /// Whether the graph drifts normally, drifts more slowly, or holds still until it is dragged.
     graph_motion: GraphMotion,
+    /// Shared-library notes assistants may read but not change; see `AppSettings`.
+    mcp_read_only_ids: Vec<String>,
     /// Tracks the latest character selection range `(start_char, end_char)` in the active note editor.
     last_editor_selection: Option<(usize, usize)>,
     /// Caret position in the active note editor, in characters, for the presence cursor sent to
@@ -202,6 +211,8 @@ pub struct EloraApp {
     /// window is showing whatever it had for that note from earlier, and sending that would
     /// write a stale copy into the room.
     awaiting_room_body: Option<(String, Instant)>,
+    /// Tells the window when another program changed something in the notes folder.
+    disk_watch: DiskWatch,
     /// A certificate the server presented that has not been pinned yet: `(fingerprint, address)`.
     trust_prompt: Option<(String, String)>,
     /// True while waiting for the server to answer a new-note request, so the title field can be
@@ -275,6 +286,12 @@ pub struct EloraApp {
     picture_pick: Option<PicturePick>,
     /// Ko-fi's mark, painted in the theme's colours beside Settings.
     kofi: Option<KofiMark>,
+    /// The window of a note's earlier versions, while it is open.
+    history: Option<History>,
+    /// What the Settings page last found when it tried the assistant connection.
+    mcp_check: McpCheck,
+    /// The choices that shape the assistant command Settings hands out.
+    mcp_options: McpOptions,
 }
 
 #[derive(Clone)]
@@ -359,6 +376,7 @@ impl EloraApp {
     fn with_context(ctx: &egui::Context, storage: NoteStorage) -> Self {
         install_tabler_icons(ctx);
 
+        let storage_dir = storage.root_dir().to_path_buf();
         let settings = storage.load_settings();
         let theme = ThemeMode::from_name(&settings.theme_name);
         theme.apply(
@@ -407,6 +425,7 @@ impl EloraApp {
             graph: None,
             graph_angle: 0.0,
             graph_motion: settings.graph_motion,
+            mcp_read_only_ids: settings.mcp_read_only_ids.clone(),
             last_editor_selection: None,
             last_editor_caret: None,
             caret_in_view: false,
@@ -422,6 +441,7 @@ impl EloraApp {
             remote_bodies: BTreeMap::new(),
             collab_open: None,
             awaiting_room_body: None,
+            disk_watch: DiskWatch::start(ctx, storage_dir),
             trust_prompt: None,
             pending_new_note_focus: false,
             pending_server_move: None,
@@ -454,6 +474,9 @@ impl EloraApp {
             shared_uploads: BTreeSet::new(),
             picture_pick: None,
             kofi: KofiMark::load(ctx),
+            history: None,
+            mcp_check: McpCheck::default(),
+            mcp_options: McpOptions::default(),
         };
         // Every client needs a name others can see and a secret the server can recognise it by.
         // A fresh install gets both so nothing has to be filled in before the shared library
@@ -483,6 +506,7 @@ impl EloraApp {
                 .map(|dir| dir.display().to_string()),
             show_card_previews: self.show_card_previews,
             graph_motion: self.graph_motion,
+            mcp_read_only_ids: self.mcp_read_only_ids.clone(),
             highlight_rgb: self.highlight_rgb,
             text_color_rgb: self.text_color_rgb,
             font_size: self.font_size,
@@ -712,6 +736,11 @@ impl EloraApp {
                     }
                     SidebarSection::Pinned => {
                         if note.trashed || !note.pinned {
+                            return false;
+                        }
+                    }
+                    SidebarSection::Assistant => {
+                        if note.trashed || !note.ai.touched() {
                             return false;
                         }
                     }
@@ -1680,6 +1709,11 @@ impl EloraApp {
         let active_count = self.notes.iter().filter(|n| !n.trashed).count();
         let pinned_count = self.notes.iter().filter(|n| !n.trashed && n.pinned).count();
         let trash_count = self.notes.iter().filter(|n| n.trashed).count();
+        let assistant_count = self
+            .notes
+            .iter()
+            .filter(|n| !n.trashed && n.ai.touched())
+            .count();
 
         // One row that never wraps: Notes and Pinned keep their counts at the smaller pill
         // size, and the glyph-only trash button sits to the right of Pinned instead of
@@ -1713,6 +1747,22 @@ impl EloraApp {
             .clicked()
             {
                 self.sidebar_section = SidebarSection::Pinned;
+                self.select_first_visible();
+            }
+
+            if (assistant_count > 0 || self.sidebar_section == SidebarSection::Assistant)
+                && nav_icon_pill(
+                    ui,
+                    icon::ROBOT,
+                    self.sidebar_section == SidebarSection::Assistant,
+                    p,
+                )
+                .on_hover_text(format!(
+                    "Notes an assistant made or changed ({assistant_count})"
+                ))
+                .clicked()
+            {
+                self.sidebar_section = SidebarSection::Assistant;
                 self.select_first_visible();
             }
 
@@ -1813,6 +1863,30 @@ impl EloraApp {
                     if let Err(e) = open_in_browser(KOFI_URL) {
                         self.status_message = Some(e);
                     }
+                }
+
+                // The note graph, just left of Ko-fi: the same view as the palette's
+                // "Show Note Graph", one click from the sidebar.
+                let graph_open = self.graph.is_some();
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(icon::GRAPH).size(15.0).color(if graph_open {
+                                p.accent
+                            } else {
+                                p.fg_secondary
+                            }),
+                        )
+                        .frame(false),
+                    )
+                    .on_hover_text(if graph_open {
+                        "Close the note graph"
+                    } else {
+                        "Show the note graph"
+                    })
+                    .clicked()
+                {
+                    self.toggle_graph();
                 }
 
                 if ui
@@ -2485,6 +2559,7 @@ impl EloraApp {
                     }
                     hist.last_change = None;
                     self.notes[note_idx].updated_at = Utc::now();
+                    self.notes[note_idx].ai.edited = false;
                     *needs_save = true;
                 }
             }
@@ -2775,6 +2850,7 @@ impl EloraApp {
 
         if output.response.changed() {
             self.notes[note_idx].updated_at = Utc::now();
+            self.notes[note_idx].ai.edited = false;
             *needs_save = true;
         }
 
@@ -3091,6 +3167,72 @@ impl EloraApp {
                 ui.label(RichText::new("·").color(p.fg_muted));
             }
 
+            // What an assistant may do with this note, and the earlier versions kept of it.
+            let marks = self.notes[note_idx].ai.clone();
+            let read_only = if on_server {
+                self.mcp_read_only_ids.contains(&selected_id)
+            } else {
+                marks.read_only
+            };
+            let mut set_read_only = None;
+            let mut show_history = false;
+            let robot_tint = if read_only || marks.touched() {
+                p.accent
+            } else {
+                p.fg_secondary
+            };
+            ui.menu_button(
+                RichText::new(icon::ROBOT).size(13.0).color(robot_tint),
+                |ui| {
+                    ui.set_min_width(250.0);
+                    if marks.created {
+                        ui.label(
+                            RichText::new("An assistant made this note")
+                                .size(11.5)
+                                .color(p.fg_muted),
+                        );
+                    } else if marks.edited {
+                        ui.label(
+                            RichText::new("An assistant changed this note last")
+                                .size(11.5)
+                                .color(p.fg_muted),
+                        );
+                    }
+                    let mut value = read_only;
+                    if ui
+                        .checkbox(&mut value, "Assistants can read, not change")
+                        .on_hover_text(
+                            "An assistant connected over MCP can still read this note, but cannot \
+                         edit, rename, move, trash or delete it.",
+                        )
+                        .changed()
+                    {
+                        set_read_only = Some(value);
+                    }
+                    if !on_server
+                        && ui
+                            .button(format!("{}  Earlier versions…", icon::HISTORY))
+                            .on_hover_text("Copies kept when an assistant changed or deleted it")
+                            .clicked()
+                    {
+                        show_history = true;
+                        ui.close_menu();
+                    }
+                },
+            )
+            .response
+            .on_hover_text("Assistants and earlier versions");
+            if let Some(value) = set_read_only {
+                self.set_mcp_read_only(note_idx, value);
+            }
+            if show_history {
+                self.open_history(note_idx);
+            }
+
+            if !compact {
+                ui.label(RichText::new("·").color(p.fg_muted));
+            }
+
             // The word count has no room to spare in a narrow window.
             if !compact {
                 let updated_text = self.notes[note_idx].formatted_updated();
@@ -3394,6 +3536,7 @@ impl EloraApp {
         }
         if title_resp.changed() {
             self.notes[note_idx].updated_at = Utc::now();
+            self.notes[note_idx].ai.edited = false;
             needs_save = true;
         }
 
@@ -3894,9 +4037,11 @@ impl eframe::App for EloraApp {
         self.poll_update();
         self.poll_collab(ctx);
         self.poll_picture_pick();
+        self.poll_disk();
         self.sync_open_note();
         self.settings_window(ctx);
         self.graph_window(ctx);
+        self.history_window(ctx);
         self.broken_links_window(ctx);
         self.trust_prompt_window(ctx);
         let p = self.theme.palette_with(&self.colors, self.glow_strength);
