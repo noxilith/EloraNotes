@@ -25,6 +25,7 @@ pub(super) struct McpClients {
     notes: HashMap<Client, (bool, String)>,
     /// A computer other than this one to look at; only the tests set it.
     pub(super) environment: Option<Environment>,
+    sandboxed: Option<bool>,
 }
 
 impl McpClients {
@@ -32,6 +33,13 @@ impl McpClients {
         self.environment
             .clone()
             .unwrap_or_else(Environment::current)
+    }
+
+    fn is_sandboxed(&mut self) -> bool {
+        if self.sandboxed.is_none() {
+            self.sandboxed = Some(self.environment().sandboxed);
+        }
+        self.sandboxed.unwrap_or(false)
     }
 
     pub(super) fn busy(&self) -> bool {
@@ -160,6 +168,50 @@ impl EloraApp {
 
         ui.add_space(4.0);
         ui.label(RichText::new("Add it to your AI app").strong());
+        if self.mcp_clients.is_sandboxed() {
+            let app_id = std::env::var("FLATPAK_ID")
+                .unwrap_or_else(|_| "io.github.noxilith.EloraNotes".to_string());
+            let grant = mcp_clients::flatpak_grant_command(&app_id);
+            egui::Frame::new()
+                .fill(p.bg_elevated)
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(Margin::same(8))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(
+                            "EloraNotes is running in Flatpak's sandbox, which hides your other \
+                             apps' settings from it, so it cannot find or change them yet. Run \
+                             this once in a terminal, then restart EloraNotes:",
+                        )
+                        .size(11.0)
+                        .color(p.fg_secondary),
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&grant)
+                                .monospace()
+                                .size(10.0)
+                                .color(p.fg_muted),
+                        )
+                        .wrap(),
+                    );
+                    if ui
+                        .small_button(format!("{}  Copy command", icon::COPY))
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(grant.clone());
+                        self.status_message = Some("Copied the command".to_string());
+                    }
+                    ui.label(
+                        RichText::new(
+                            "Claude Code and Codex are command-line tools the sandbox cannot run; \
+                             add those under Set it up by hand.",
+                        )
+                        .size(10.5)
+                        .color(p.fg_muted),
+                    );
+                });
+        }
         let busy = self.mcp_clients.busy();
         let found: Vec<Report> = self
             .mcp_clients
@@ -212,7 +264,10 @@ impl EloraApp {
         let mut jobs: Vec<(Client, Task)> = Vec::new();
         for report in &found {
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(report.client.name()).strong().size(12.5));
+                let name = ui.label(RichText::new(report.client.name()).strong().size(12.5));
+                if !report.place.is_empty() {
+                    name.on_hover_text(format!("Settings: {}", report.place));
+                }
                 match &report.state {
                     State::Added => {
                         ui.label(RichText::new(format!("{} added", icon::CHECK)).size(11.5).color(p.accent));

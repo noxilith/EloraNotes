@@ -65,7 +65,7 @@ impl Client {
     /// What to do once the server is added: apps read their MCP list when they start.
     pub fn after_adding(self) -> &'static str {
         match self {
-            Client::ClaudeDesktop => "Quit Claude Desktop completely and open it again; closing the window is not enough.",
+            Client::ClaudeDesktop => "Quit Claude Desktop completely and open it again (closing the window is not enough), then look under Settings → Developer.",
             Client::ClaudeCode => "Start a new Claude Code session to load it.",
             Client::Cursor => "Restart Cursor, or switch the server on under Settings → MCP.",
             Client::VsCode => "Reload the window, then check the Tools button in Copilot Chat.",
@@ -97,6 +97,33 @@ pub struct Environment {
     pub path_dirs: Vec<PathBuf>,
     /// How long a call to an app's own command may take.
     pub cli_timeout: Duration,
+    /// Running inside a Flatpak sandbox, which hides the other apps' settings and commands.
+    pub sandboxed: bool,
+}
+
+/// True inside a Flatpak sandbox.
+pub fn running_in_flatpak() -> bool {
+    std::env::var_os("FLATPAK_ID").is_some() || Path::new("/.flatpak-info").exists()
+}
+
+/// Where other apps keep their settings. A sandboxed app's own `XDG_CONFIG_HOME` is a private
+/// folder, which is not where Claude Desktop and the others look, so the real `~/.config` is
+/// used instead (and only reachable if the sandbox has been given access to it).
+pub fn config_home_for(sandboxed: bool, home: &Path, reported: Option<PathBuf>) -> PathBuf {
+    if sandboxed {
+        home.join(".config")
+    } else {
+        reported.unwrap_or_else(|| home.join(".config"))
+    }
+}
+
+/// The command that lets a Flatpak EloraNotes see the settings of the AI apps. It is run once, in
+/// a terminal, outside the sandbox; a sandboxed app cannot grant itself access.
+pub fn flatpak_grant_command(app_id: &str) -> String {
+    format!(
+        "flatpak override --user --filesystem=~/.config/Claude --filesystem=~/.cursor \\
+         --filesystem=~/.config/Code/User --filesystem=~/.codeium --filesystem=~/.gemini {app_id}"
+    )
 }
 
 impl Environment {
@@ -109,7 +136,8 @@ impl Environment {
             Os::Linux
         };
         let home = dirs::home_dir().unwrap_or_default();
-        let config_home = dirs::config_dir().unwrap_or_else(|| home.join(".config"));
+        let sandboxed = running_in_flatpak();
+        let config_home = config_home_for(sandboxed, &home, dirs::config_dir());
         let mut path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
             .map(|paths| std::env::split_paths(&paths).collect())
             .unwrap_or_default();
@@ -141,6 +169,7 @@ impl Environment {
             local_data: dirs::data_local_dir(),
             path_dirs,
             cli_timeout: Duration::from_secs(20),
+            sandboxed,
         }
     }
 
@@ -189,7 +218,9 @@ pub struct Report {
 /// How to reach an app's list of MCP servers.
 enum Method {
     Json {
-        path: PathBuf,
+        /// Usually one file. Claude Desktop on Windows can have several copies, and which one the
+        /// app loads depends on how it was installed, so every copy that exists is kept in step.
+        paths: Vec<PathBuf>,
         /// `mcpServers` for most apps, `servers` for VS Code.
         key: &'static str,
         /// VS Code wants `"type": "stdio"` on each entry.
@@ -218,7 +249,7 @@ fn plan(env: &Environment, client: Client) -> Plan {
     let json_in = |dir: PathBuf, file: &str, key: &'static str, typed: bool, present: bool| Plan {
         present,
         method: Some(Method::Json {
-            path: dir.join(file),
+            paths: vec![dir.join(file)],
             key,
             typed,
         }),
@@ -226,39 +257,16 @@ fn plan(env: &Environment, client: Client) -> Plan {
     };
     match client {
         Client::ClaudeDesktop => {
-            let mut dir = env.config_home.join("Claude");
-            // The Windows packaged app keeps its settings inside its own package folder.
-            if env.os == Os::Windows {
-                if let Some(local) = &env.local_data {
-                    let packages = local.join("Packages");
-                    if let Ok(entries) = std::fs::read_dir(packages) {
-                        for entry in entries.flatten() {
-                            let name = entry.file_name().to_string_lossy().to_string();
-                            let inner = entry.path().join("LocalCache/Roaming/Claude");
-                            if name.starts_with("Claude_") && inner.is_dir() {
-                                dir = inner;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            let app_installed = match env.os {
-                Os::MacOs => Path::new("/Applications/Claude.app").exists(),
-                Os::Windows => env
-                    .local_data
-                    .as_ref()
-                    .is_some_and(|local| local.join("AnthropicClaude").exists()),
-                Os::Linux => false,
-            };
-            let present = dir.is_dir() || app_installed;
-            json_in(
-                dir,
-                "claude_desktop_config.json",
-                "mcpServers",
-                false,
+            let (paths, present) = claude_desktop_paths(env);
+            Plan {
                 present,
-            )
+                method: Some(Method::Json {
+                    paths,
+                    key: "mcpServers",
+                    typed: false,
+                }),
+                why_not: String::new(),
+            }
         }
         Client::Cursor => {
             let dir = env.home.join(".cursor");
@@ -290,6 +298,76 @@ fn plan(env: &Environment, client: Client) -> Plan {
         Client::ClaudeCode => cli_plan(env, "claude", CliKind::Claude, ".claude"),
         Client::Codex => cli_plan(env, "codex", CliKind::Codex, ".codex"),
     }
+}
+
+/// The sub-folders of a folder whose names start with one of the prefixes.
+fn subfolders_starting_with(parent: &Path, prefixes: &[&str]) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(parent)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    entry.path().is_dir() && prefixes.iter().any(|prefix| name.starts_with(prefix))
+                })
+                .map(|entry| entry.path())
+                .collect()
+        })
+        .unwrap_or_default();
+    found.sort();
+    found
+}
+
+/// Every `claude_desktop_config.json` Claude Desktop might be reading, and whether the app seems
+/// to be installed at all.
+///
+/// On Windows there are several. The classic installer reads `%APPDATA%\Claude`, which is also
+/// what the app's own Edit Config button opens. The packaged (Store / MSIX) app reads a copy
+/// inside its package folder instead, `%LOCALAPPDATA%\Packages\Claude_<id>\LocalCache\Roaming\Claude`,
+/// and ignores the other; a newer build is reported to keep its data in
+/// `%LOCALAPPDATA%\Claude-Data\claude_<id>`. A file written to the wrong one is never loaded,
+/// which looks exactly like the entry having been added and then not being there, so every copy
+/// that exists is returned and all of them are kept in step.
+fn claude_desktop_paths(env: &Environment) -> (Vec<PathBuf>, bool) {
+    const FILE: &str = "claude_desktop_config.json";
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut present = false;
+    if env.os == Os::Windows {
+        if let Some(local) = &env.local_data {
+            for package in subfolders_starting_with(
+                &local.join("Packages"),
+                &["Claude_", "Anthropic.ClaudeDesktop_"],
+            ) {
+                present = true;
+                paths.push(
+                    package
+                        .join("LocalCache")
+                        .join("Roaming")
+                        .join("Claude")
+                        .join(FILE),
+                );
+            }
+            for data in subfolders_starting_with(&local.join("Claude-Data"), &["claude_"]) {
+                present = true;
+                paths.push(data.join(FILE));
+            }
+            if local.join("AnthropicClaude").exists() {
+                present = true;
+            }
+        }
+    }
+    let classic = env.config_home.join("Claude");
+    if classic.is_dir() {
+        present = true;
+    }
+    // The classic folder is used when it exists, and as the only choice when nothing else does.
+    if classic.is_dir() || paths.is_empty() {
+        paths.push(classic.join(FILE));
+    }
+    if env.os == Os::MacOs && Path::new("/Applications/Claude.app").exists() {
+        present = true;
+    }
+    (paths, present)
 }
 
 fn cli_plan(env: &Environment, command: &str, kind: CliKind, settings_dir: &str) -> Plan {
@@ -332,10 +410,19 @@ pub fn report(env: &Environment, client: Client, launch: &Launch) -> Report {
             state: State::Unavailable(plan.why_not),
             place: String::new(),
         },
-        Some(Method::Json { path, key, .. }) => Report {
+        Some(Method::Json { paths, key, .. }) => Report {
             client,
-            state: json_state(path, key, launch),
-            place: path.display().to_string(),
+            state: combine(
+                paths
+                    .iter()
+                    .map(|path| json_state(path, key, launch))
+                    .collect(),
+            ),
+            place: paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join("; "),
         },
         Some(Method::Cli { program, .. }) => Report {
             client,
@@ -377,6 +464,32 @@ fn entry_for(launch: &Launch, typed: bool) -> Value {
     entry.insert("command".into(), json!(launch.program));
     entry.insert("args".into(), json!(launch.args));
     Value::Object(entry)
+}
+
+/// One state for an app that keeps several copies of its settings. A copy that cannot be read
+/// does not hold the others up; it only counts when none can be.
+fn combine(states: Vec<State>) -> State {
+    let readable: Vec<&State> = states
+        .iter()
+        .filter(|state| !matches!(state, State::Unreadable(_)))
+        .collect();
+    if readable.is_empty() {
+        return states
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| State::Unreadable("no settings file".to_string()));
+    }
+    if readable.iter().all(|state| **state == State::Added) {
+        State::Added
+    } else if readable
+        .iter()
+        .any(|state| matches!(state, State::Added | State::Outdated))
+    {
+        // Some copies have it and some do not, or they disagree: adding again puts them right.
+        State::Outdated
+    } else {
+        State::NotAdded
+    }
 }
 
 fn json_state(path: &Path, key: &str, launch: &Launch) -> State {
@@ -583,29 +696,75 @@ fn cli_remove(env: &Environment, program: &Path, kind: CliKind) -> Result<(), St
 
 // --- adding and removing ----------------------------------------------------------------------
 
-/// Adds EloraNotes to an app's list, replacing an entry with the same name. Returns a sentence
-/// to show.
+/// Adds EloraNotes to an app's list, replacing an entry with the same name. The result is read
+/// back from where it was written, and only then is it reported as done: a write that went
+/// somewhere the app does not look (a sandbox's private copy of a folder, say) has to show up as
+/// the failure it is. When the app keeps several copies of its settings, all of them are written.
+/// Returns a sentence to show.
 pub fn add(env: &Environment, client: Client, launch: &Launch) -> Result<String, String> {
     let plan = plan(env, client);
     match plan.method {
         None => Err(plan.why_not),
-        Some(Method::Json { path, key, typed }) => {
-            let entry = entry_for(launch, typed);
-            let changed = edit_json(&path, key, |servers| {
-                if servers.get(SERVER_NAME) == Some(&entry) {
-                    return false;
+        Some(Method::Json { paths, key, typed }) => {
+            let mut done: Vec<&PathBuf> = Vec::new();
+            let mut changed_any = false;
+            let mut problems: Vec<String> = Vec::new();
+            for path in &paths {
+                let entry = entry_for(launch, typed);
+                let result = edit_json(path, key, |servers| {
+                    if servers.get(SERVER_NAME) == Some(&entry) {
+                        return false;
+                    }
+                    servers.insert(SERVER_NAME.to_string(), entry);
+                    true
+                });
+                match result {
+                    Ok(changed) if json_state(path, key, launch) == State::Added => {
+                        changed_any |= changed;
+                        done.push(path);
+                    }
+                    Ok(_) => problems.push(format!(
+                        "{}: wrote it but the entry is not there when read back",
+                        path.display()
+                    )),
+                    Err(why) => problems.push(format!("{}: {why}", path.display())),
                 }
-                servers.insert(SERVER_NAME.to_string(), entry);
-                true
-            })?;
-            Ok(if changed {
-                format!("Added to {}. {}", client.name(), client.after_adding())
+            }
+            if done.is_empty() {
+                return Err(format!("nothing was added. {}", problems.join(" ")));
+            }
+            let places = done
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut said = if changed_any {
+                format!(
+                    "Added to {} in {places}. {}",
+                    client.name(),
+                    client.after_adding()
+                )
             } else {
-                format!("{} already has it.", client.name())
-            })
+                format!("{} already has it ({places}).", client.name())
+            };
+            if done.len() > 1 {
+                said.push_str(
+                    " It keeps more than one copy of this file, and the one its Edit Config button shows can differ from the one it loads, so all were written.",
+                );
+            }
+            if !problems.is_empty() {
+                said.push_str(&format!(" Left alone: {}", problems.join(" ")));
+            }
+            Ok(said)
         }
         Some(Method::Cli { program, kind }) => {
             cli_add(env, &program, kind, launch)?;
+            if cli_state(env, &program, launch) != State::Added {
+                return Err(format!(
+                    "{} accepted the command but does not list the server afterwards, so nothing was added",
+                    client.name()
+                ));
+            }
             Ok(format!(
                 "Added to {}. {}",
                 client.name(),
@@ -620,14 +779,21 @@ pub fn remove(env: &Environment, client: Client) -> Result<String, String> {
     let plan = plan(env, client);
     match plan.method {
         None => Err(plan.why_not),
-        Some(Method::Json { path, key, .. }) => {
-            if !path.exists() {
-                return Ok(format!("{} did not have it.", client.name()));
+        Some(Method::Json { paths, key, .. }) => {
+            let mut removed_any = false;
+            let mut problems: Vec<String> = Vec::new();
+            for path in paths.iter().filter(|path| path.exists()) {
+                match edit_json(path, key, |servers| {
+                    servers.shift_remove(SERVER_NAME).is_some()
+                }) {
+                    Ok(changed) => removed_any |= changed,
+                    Err(why) => problems.push(format!("{}: {why}", path.display())),
+                }
             }
-            let changed = edit_json(&path, key, |servers| {
-                servers.shift_remove(SERVER_NAME).is_some()
-            })?;
-            Ok(if changed {
+            if !problems.is_empty() && !removed_any {
+                return Err(problems.join(" "));
+            }
+            Ok(if removed_any {
                 format!("Removed from {}.", client.name())
             } else {
                 format!("{} did not have it.", client.name())
@@ -665,6 +831,7 @@ mod tests {
             local_data: None,
             path_dirs: vec![bin],
             cli_timeout: Duration::from_secs(5),
+            sandboxed: false,
         };
         (env, root)
     }
@@ -718,6 +885,10 @@ mod tests {
 
         let said = add(&env, Client::ClaudeDesktop, &l).unwrap();
         assert!(said.contains("Quit Claude Desktop completely"), "{said}");
+        assert!(
+            said.contains(&file.display().to_string()),
+            "it says where it wrote: {said}"
+        );
         assert_eq!(state(&env, Client::ClaudeDesktop, &l), State::Added);
         let written: Value = serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
         assert_eq!(
@@ -981,6 +1152,181 @@ esac
             State::Unreadable(_)
         ));
         assert!(started.elapsed() < Duration::from_secs(5));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_sandboxed_app_looks_at_the_real_config_folder_not_its_own() {
+        let home = Path::new("/home/me");
+        let own = Some(PathBuf::from("/home/me/.var/app/some.app/config"));
+        assert_eq!(
+            config_home_for(true, home, own.clone()),
+            PathBuf::from("/home/me/.config")
+        );
+        assert_eq!(
+            config_home_for(false, home, own),
+            PathBuf::from("/home/me/.var/app/some.app/config")
+        );
+        assert_eq!(
+            config_home_for(false, home, None),
+            PathBuf::from("/home/me/.config")
+        );
+        let command = flatpak_grant_command("io.github.example.App");
+        assert!(command.starts_with("flatpak override --user"));
+        assert!(
+            command.contains("--filesystem=~/.config/Claude")
+                && command.ends_with("io.github.example.App")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_add_that_does_not_show_up_afterwards_is_reported_as_a_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        // A command that says yes to everything and remembers nothing.
+        let (env, root) = computer("liar");
+        let bin = env.path_dirs[0].clone();
+        let path = bin.join("claude");
+        fs::write(
+            &path,
+            "#!/bin/sh\ncase \"$2\" in get) exit 1 ;; *) exit 0 ;; esac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let why = add(&env, Client::ClaudeCode, &launch(false)).unwrap_err();
+        assert!(why.contains("nothing was added"), "{why}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A Windows computer in a temporary folder: roaming and local app data, and a home folder.
+    fn windows_computer(name: &str) -> (Environment, PathBuf) {
+        let (mut env, root) = computer(name);
+        env.os = Os::Windows;
+        env.config_home = root.join("AppData/Roaming");
+        env.local_data = Some(root.join("AppData/Local"));
+        fs::create_dir_all(&env.config_home).unwrap();
+        fs::create_dir_all(env.local_data.as_ref().unwrap()).unwrap();
+        (env, root)
+    }
+
+    fn mentions_us(path: &Path) -> bool {
+        fs::read_to_string(path).is_ok_and(|text| text.contains("elora-notes"))
+    }
+
+    #[test]
+    fn claude_desktop_on_windows_is_written_to_every_copy_it_might_read() {
+        let (env, root) = windows_computer("win-all");
+        let local = env.local_data.clone().unwrap();
+        let file = "claude_desktop_config.json";
+        // The packaged app's private copy, the newer data folder, and the classic one that the
+        // Edit Config button opens, each with settings of its own.
+        let package = local.join("Packages/Claude_pzs8sxrjxfjjc/LocalCache/Roaming/Claude");
+        let newer = local.join("Claude-Data/claude_Claude_pzs8sxrjxfjjc");
+        let classic = env.config_home.join("Claude");
+        for (dir, own) in [(&package, "one"), (&newer, "two"), (&classic, "three")] {
+            fs::create_dir_all(dir).unwrap();
+            fs::write(dir.join(file), format!(r#"{{ "{own}": true }}"#)).unwrap();
+        }
+        let l = launch(false);
+        assert_eq!(state(&env, Client::ClaudeDesktop, &l), State::NotAdded);
+
+        let said = add(&env, Client::ClaudeDesktop, &l).unwrap();
+        for dir in [&package, &newer, &classic] {
+            assert!(mentions_us(&dir.join(file)), "{}", dir.display());
+            assert!(
+                said.contains(&dir.join(file).display().to_string()),
+                "the message names {}: {said}",
+                dir.display()
+            );
+        }
+        assert!(said.contains("more than one copy"), "{said}");
+        assert_eq!(state(&env, Client::ClaudeDesktop, &l), State::Added);
+        // Each copy kept what it had.
+        for (dir, own) in [(&package, "one"), (&newer, "two"), (&classic, "three")] {
+            let text = fs::read_to_string(dir.join(file)).unwrap();
+            assert!(text.contains(&format!("\"{own}\": true")), "{text}");
+        }
+
+        // If one copy loses it, the app is out of date, and adding again puts it back everywhere.
+        fs::write(package.join(file), r#"{ "one": true }"#).unwrap();
+        assert_eq!(state(&env, Client::ClaudeDesktop, &l), State::Outdated);
+        add(&env, Client::ClaudeDesktop, &l).unwrap();
+        assert_eq!(state(&env, Client::ClaudeDesktop, &l), State::Added);
+
+        remove(&env, Client::ClaudeDesktop).unwrap();
+        for dir in [&package, &newer, &classic] {
+            assert!(!mentions_us(&dir.join(file)), "{}", dir.display());
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_packaged_claude_desktop_alone_gets_its_private_copy_and_not_a_stray_one() {
+        let (env, root) = windows_computer("win-package");
+        let local = env.local_data.clone().unwrap();
+        fs::create_dir_all(local.join("Packages/Claude_pzs8sxrjxfjjc")).unwrap();
+        // The Store version of another app must not be mistaken for it.
+        fs::create_dir_all(local.join("Packages/ClaudeHelper_abc")).unwrap();
+        let l = launch(false);
+        assert_eq!(state(&env, Client::ClaudeDesktop, &l), State::NotAdded);
+        add(&env, Client::ClaudeDesktop, &l).unwrap();
+        let private = local.join(
+            "Packages/Claude_pzs8sxrjxfjjc/LocalCache/Roaming/Claude/claude_desktop_config.json",
+        );
+        assert!(mentions_us(&private));
+        assert!(
+            !env.config_home.join("Claude").exists(),
+            "no copy is made where the app does not look"
+        );
+        assert!(!local.join("Packages/ClaudeHelper_abc/LocalCache").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_other_package_name_and_the_classic_install_are_found_too() {
+        let (env, root) = windows_computer("win-names");
+        let local = env.local_data.clone().unwrap();
+        fs::create_dir_all(local.join("Packages/Anthropic.ClaudeDesktop_h6f0761")).unwrap();
+        let l = launch(false);
+        add(&env, Client::ClaudeDesktop, &l).unwrap();
+        assert!(mentions_us(&local.join("Packages/Anthropic.ClaudeDesktop_h6f0761/LocalCache/Roaming/Claude/claude_desktop_config.json")));
+        let _ = fs::remove_dir_all(root);
+
+        let (env, root) = windows_computer("win-classic");
+        fs::create_dir_all(env.config_home.join("Claude")).unwrap();
+        add(&env, Client::ClaudeDesktop, &l).unwrap();
+        assert!(mentions_us(
+            &env.config_home.join("Claude/claude_desktop_config.json")
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn one_copy_that_cannot_be_read_does_not_stop_the_others_being_written() {
+        let (env, root) = windows_computer("win-partial");
+        let local = env.local_data.clone().unwrap();
+        let file = "claude_desktop_config.json";
+        let package = local.join("Packages/Claude_pzs8sxrjxfjjc/LocalCache/Roaming/Claude");
+        let classic = env.config_home.join("Claude");
+        fs::create_dir_all(&package).unwrap();
+        fs::create_dir_all(&classic).unwrap();
+        let broken = "{\n  // hand-edited\n  \"mcpServers\": {}\n}\n";
+        fs::write(classic.join(file), broken).unwrap();
+        let l = launch(false);
+        let said = add(&env, Client::ClaudeDesktop, &l).unwrap();
+        assert!(mentions_us(&package.join(file)));
+        assert_eq!(
+            fs::read_to_string(classic.join(file)).unwrap(),
+            broken,
+            "the unreadable copy is untouched"
+        );
+        assert!(said.contains("Left alone"), "{said}");
+        assert_eq!(state(&env, Client::ClaudeDesktop, &l), State::Added);
+
+        // When nothing can be written at all, that is an error and not a success.
+        fs::write(package.join(file), broken).unwrap();
+        let why = add(&env, Client::ClaudeDesktop, &l).unwrap_err();
+        assert!(why.contains("nothing was added"), "{why}");
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -4184,6 +4184,7 @@ fn empty_computer(under: &Path) -> crate::mcp_clients::Environment {
         local_data: None,
         path_dirs: vec![under.join("fake-bin")],
         cli_timeout: Duration::from_secs(5),
+        sandboxed: false,
     }
 }
 
@@ -4282,5 +4283,23 @@ fn test_settings_finds_the_ai_apps_and_adds_the_server_to_them() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Inside a Flatpak sandbox the page explains why nothing is found instead of showing an empty
+/// list, and still draws.
+#[test]
+fn test_settings_explains_the_flatpak_sandbox() {
+    let (mut app, ctx, dir) = drawable_app("sandboxed");
+    let mut environment = empty_computer(&dir);
+    environment.sandboxed = true;
+    app.mcp_clients.environment = Some(environment);
+    app.show_settings = true;
+    settle_ai_apps(&mut app, &ctx);
+    assert!(app
+        .mcp_clients
+        .reports()
+        .iter()
+        .all(|r| r.state == crate::mcp_clients::State::NotFound));
     let _ = std::fs::remove_dir_all(&dir);
 }

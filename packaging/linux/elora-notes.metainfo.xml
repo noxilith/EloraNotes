@@ -25,6 +25,23 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.11.1" date="2026-10-26">
+      <description>
+        <p>
+          Adding EloraNotes to Claude Desktop on Windows could report success and still not show
+          up. The packaged (Store) Claude Desktop reads its own private copy of its config file,
+          and a different one from the file its Edit Config button opens. EloraNotes now writes
+          the entry to every copy it finds, with a backup of each, lists every file it wrote, and
+          shows Update when only some of them have it. A copy that cannot be read as JSON is left
+          alone without stopping the others.
+        </p>
+        <p>
+          Every add is now read back from disk before it is reported as done, and the message
+          names the file. Inside the Flatpak, which cannot see other apps' settings, Settings
+          explains why and gives the one command that lets it, instead of showing nothing.
+        </p>
+      </description>
+    </release>
     <release version="0.11.0" date="2026-10-26">
       <description>
         <p>
