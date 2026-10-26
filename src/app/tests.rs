@@ -4132,3 +4132,42 @@ fn test_a_build_folder_path_is_recognised_on_every_platform() {
         r"C:\Program Files\EloraNotes\elora.exe"
     ));
 }
+
+/// The footer icons stay inside the sidebar however many notes there are. A tab row wider than
+/// the panel used to stretch the rectangle the footer was anchored to, and the settings gear was
+/// pushed off the edge.
+#[test]
+fn test_the_sidebar_footer_stays_inside_the_panel_with_big_counts() {
+    for count in [3usize, 10, 150, 1200] {
+        let (mut app, ctx, dir) = drawable_app("footer-fits");
+        let root = app.storage.root_dir().to_path_buf();
+        for i in 0..count {
+            let mut note = Note::new(format!("Note {i}"), "text", &root);
+            note.pinned = i % 7 == 0;
+            note.trashed = i % 11 == 0;
+            note.ai.created = i % 5 == 0;
+            app.notes.push(note);
+        }
+        let p = app.theme.palette_with(&app.colors, app.glow_strength);
+        let mut footer = None;
+        draw(&ctx, |ctx| {
+            egui::SidePanel::left("test_sidebar")
+                .exact_width(SIDEBAR_WIDTH)
+                .show(ctx, |ui| {
+                    footer = Some(app.render_sidebar(ui, &p));
+                });
+        });
+        let footer = footer.expect("the sidebar was drawn");
+        assert!(
+            footer.right() <= SIDEBAR_WIDTH + 0.5,
+            "with {count} notes the footer ends at {} in a {SIDEBAR_WIDTH}-wide sidebar",
+            footer.right()
+        );
+        assert!(
+            footer.left() >= 0.0,
+            "with {count} notes the footer starts at {}",
+            footer.left()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

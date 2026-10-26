@@ -1619,6 +1619,10 @@ impl EloraApp {
     /// Draws the sidebar and returns the rect the footer took at the bottom of it, so a test can
     /// check that the icons stay inside the panel.
     fn render_sidebar(&mut self, ui: &mut Ui, p: &Palette) -> Rect {
+        // The panel's own rectangle, taken before anything is drawn: a row that comes out wider
+        // than the panel stretches the one `ui.max_rect()` reports, and the footer, which is
+        // anchored to that, would be dragged off the panel's edge with it.
+        let panel_rect = ui.max_rect();
         ui.add_space(4.0);
 
         ui.horizontal(|ui| {
@@ -1715,10 +1719,10 @@ impl EloraApp {
             .filter(|n| !n.trashed && n.ai.touched())
             .count();
 
-        // One row that never wraps: Notes and Pinned keep their counts at the smaller pill
-        // size, and the glyph-only trash button sits to the right of Pinned instead of
-        // dropping onto a second line.
-        ui.horizontal(|ui| {
+        // Notes and Pinned keep their counts at the smaller pill size, and the glyph-only trash
+        // button sits to the right of Pinned. The row wraps rather than overflowing if big
+        // counts ever make it wider than the sidebar.
+        ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
             ui.spacing_mut().button_padding = Vec2::new(6.0, 3.0);
             if nav_pill(
@@ -1750,22 +1754,6 @@ impl EloraApp {
                 self.select_first_visible();
             }
 
-            if (assistant_count > 0 || self.sidebar_section == SidebarSection::Assistant)
-                && nav_icon_pill(
-                    ui,
-                    icon::ROBOT,
-                    self.sidebar_section == SidebarSection::Assistant,
-                    p,
-                )
-                .on_hover_text(format!(
-                    "Notes an assistant made or changed ({assistant_count})"
-                ))
-                .clicked()
-            {
-                self.sidebar_section = SidebarSection::Assistant;
-                self.select_first_visible();
-            }
-
             if (trash_count > 0 || self.sidebar_section == SidebarSection::Trash)
                 && nav_icon_pill(
                     ui,
@@ -1791,14 +1779,47 @@ impl EloraApp {
                 // What the sort button needs: its glyph and padding, the gap before it, and the
                 // arrow the combo box puts on the right of its own field.
                 const SORT_RESERVE: f32 = 52.0;
-                let room = (ui.available_width() - SORT_RESERVE).max(80.0);
+                // The assistant filter, shown once an assistant has made a note.
+                let show_assistant =
+                    assistant_count > 0 || self.sidebar_section == SidebarSection::Assistant;
+                const ASSISTANT_RESERVE: f32 = 34.0;
+                let reserve = SORT_RESERVE
+                    + if show_assistant {
+                        ASSISTANT_RESERVE
+                    } else {
+                        0.0
+                    };
+                let room = (ui.available_width() - reserve).max(80.0);
                 if !all_tags.is_empty() {
                     ui.scope(|ui| {
                         ui.set_max_width(room);
                         tag_filter_menu(ui, p, &all_tags, &mut self.active_tag);
                     });
                 } else {
-                    ui.add_space((ui.available_width() - SORT_RESERVE).max(0.0));
+                    ui.add_space((ui.available_width() - reserve).max(0.0));
+                }
+                if show_assistant {
+                    ui.spacing_mut().button_padding = Vec2::new(6.0, 3.0);
+                    if nav_icon_pill(
+                        ui,
+                        icon::ROBOT,
+                        self.sidebar_section == SidebarSection::Assistant,
+                        p,
+                    )
+                    .on_hover_text(format!(
+                        "Notes an assistant made or changed ({assistant_count})"
+                    ))
+                    .clicked()
+                    {
+                        // A second click leaves the filter again.
+                        self.sidebar_section = if self.sidebar_section == SidebarSection::Assistant
+                        {
+                            SidebarSection::AllNotes
+                        } else {
+                            SidebarSection::Assistant
+                        };
+                        self.select_first_visible();
+                    }
                 }
                 let mut chosen = self.sort;
                 sort_menu(ui, p, &mut chosen);
@@ -1817,7 +1838,7 @@ impl EloraApp {
         // the panel's edge and the list above it gets exactly what is left. A height reserved in
         // advance for it was a few points short, which pushed the icons past the bottom of the
         // panel and cut them off; the same shortfall let the list run underneath them.
-        let content = ui.max_rect();
+        let content = panel_rect;
         let mut footer_ui = ui.new_child(
             UiBuilder::new()
                 .id_salt("elora_sidebar_footer")

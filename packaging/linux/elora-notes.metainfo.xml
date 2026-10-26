@@ -25,6 +25,17 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.10.1" date="2026-10-25">
+      <description>
+        <p>
+          The sidebar footer no longer slides off the edge. With a couple of dozen notes the row
+          of tabs above the list (Notes, Pinned, Trash) was wider than the sidebar, and the footer
+          icons, anchored to that row, were pushed right until the Settings gear was cut off. The
+          footer now stays put whatever the counts are, the tab row wraps instead of overflowing,
+          and the filter for notes an assistant made moved down beside Sort.
+        </p>
+      </description>
+    </release>
     <release version="0.10.0" date="2026-10-25">
       <description>
         <p>
