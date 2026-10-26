@@ -25,6 +25,24 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.10.2" date="2026-10-26">
+      <description>
+        <p>
+          The server installers for Linux and Windows are rewritten. Updating no longer asks for
+          the name, port and password again or overwrites them, and it restarts the server (the
+          Linux installer used to leave the old program running until the next reboot). Downloads
+          are checked against the release's checksums and test-run before a working server is
+          replaced, and the installer waits until the server is really answering before it says so.
+        </p>
+        <p>
+          On Windows the startup task no longer stops after 72 hours or when a laptop is unplugged
+          and is restarted if the server exits, the folder holding the password is limited to
+          Administrators, and passwords with accents or other non-ASCII characters now work. On
+          Linux a server name containing a percent sign no longer breaks the service, uninstalling
+          closes the firewall port, and the installer works when piped into bash.
+        </p>
+      </description>
+    </release>
     <release version="0.10.1" date="2026-10-25">
       <description>
         <p>
