@@ -1,6 +1,6 @@
 [package]
 name = "elora-notes"
-version = "0.10.2"
+version = "0.11.0"
 edition = "2021"
 description = "EloraNotes — A calm, minimalistic cross-platform Markdown notes desktop app"
 authors = ["EloraNotes"]
@@ -52,7 +52,9 @@ arboard = { version = "3", optional = true, features = ["wayland-data-control"] 
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6.0"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# preserve_order keeps the order of a person's own settings when another app's config file is
+# rewritten to add the MCP server.
+serde_json = { version = "1.0", features = ["preserve_order"] }
 ureq = { version = "2", default-features = false, features = ["tls"] }
 yrs = "0.28"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }

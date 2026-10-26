@@ -320,15 +320,15 @@ impl EloraApp {
         }
     }
 
-    /// The MCP section of Settings: the app is its own MCP server (`elora --mcp`), so this only
-    /// has to hand an assistant the command that starts it on this notebook, let the person
-    /// narrow what it may do, and check that the command really works.
+    /// The MCP section of Settings: the app is its own MCP server (`elora --mcp`), so this finds
+    /// the AI apps on the computer and adds that command to them, lets the person narrow what an
+    /// assistant may do, and keeps the by-hand route (the command to copy, and a check that it
+    /// works) for an app that cannot be set up from here.
     pub(super) fn mcp_settings(&mut self, ui: &mut egui::Ui, p: &Palette) {
         ui.label(
             RichText::new(
-                "Let Claude or another MCP client read, search and write these notes. \
-                 Add this server to its settings. Any note can also be made read-only for \
-                 assistants from the robot menu above it.",
+                "Let Claude or another AI app read, search and write these notes. Any note can \
+                 also be made read-only for assistants from the robot menu above it.",
             )
             .size(11.5)
             .color(p.fg_muted),
@@ -363,101 +363,122 @@ impl EloraApp {
         if runs_from_build_folder(&program) {
             ui.label(
                 RichText::new(
-                    "This copy of EloraNotes runs from a build folder: the command stops working \
-                     when the build is cleaned or replaced. Install the app and register that \
+                    "This copy of EloraNotes runs from a build folder: what is added stops \
+                     working when the build is cleaned or replaced. Install the app and add that \
                      one instead.",
                 )
                 .size(11.0)
                 .color(p.danger),
             );
         }
-        let shown = std::iter::once(program.as_str())
-            .chain(args.iter().map(String::as_str))
-            .map(shell_quote)
-            .collect::<Vec<_>>()
-            .join(" ");
-        ui.add(
-            egui::Label::new(
-                RichText::new(&shown)
-                    .monospace()
+        let launch = crate::mcp_clients::Launch {
+            program: program.clone(),
+            args: args.clone(),
+        };
+        self.mcp_clients_ui(ui, p, &launch);
+
+        ui.add_space(4.0);
+        egui::CollapsingHeader::new("Set it up by hand")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(
+                        "For an app that is not listed above: give it this command as an MCP \
+                         server that talks over standard input and output.",
+                    )
                     .size(11.0)
                     .color(p.fg_muted),
-            )
-            .wrap(),
-        );
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .small_button(format!("{}  Copy command", icon::COPY))
-                .clicked()
-            {
-                ui.ctx()
-                    .copy_text(format!("claude mcp add elora-notes -- {shown}"));
-                self.status_message = Some("Copied the Claude Code command".to_string());
-            }
-            if ui
-                .small_button(format!("{}  Copy JSON config", icon::COPY))
-                .clicked()
-            {
-                let config = serde_json::json!({
-                    "mcpServers": { "elora-notes": { "command": program, "args": args } }
+                );
+                let shown = std::iter::once(program.as_str())
+                    .chain(args.iter().map(String::as_str))
+                    .map(shell_quote)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(&shown)
+                            .monospace()
+                            .size(11.0)
+                            .color(p.fg_muted),
+                    )
+                    .wrap(),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .small_button(format!("{}  Copy command", icon::COPY))
+                        .clicked()
+                    {
+                        ui.ctx()
+                            .copy_text(format!("claude mcp add elora-notes -- {shown}"));
+                        self.status_message = Some("Copied the Claude Code command".to_string());
+                    }
+                    if ui
+                        .small_button(format!("{}  Copy JSON config", icon::COPY))
+                        .clicked()
+                    {
+                        let config = serde_json::json!({
+                            "mcpServers": { "elora-notes": { "command": program, "args": args } }
+                        });
+                        ui.ctx()
+                            .copy_text(serde_json::to_string_pretty(&config).unwrap_or_default());
+                        self.status_message = Some("Copied the MCP config".to_string());
+                    }
+                    let testing = self.mcp_check.running.is_some();
+                    if ui
+                        .add_enabled(
+                            !testing,
+                            egui::Button::new(format!("{}  Test connection", icon::REFRESH))
+                                .small(),
+                        )
+                        .on_hover_text(
+                            "Starts the server the way an assistant would and asks it a question",
+                        )
+                        .clicked()
+                    {
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        let wake = ui.ctx().clone();
+                        let (program, args) = (program.clone(), args.clone());
+                        std::thread::spawn(move || {
+                            let _ = tx.send(check_mcp_command(&program, &args));
+                            wake.request_repaint();
+                        });
+                        self.mcp_check.running = Some(rx);
+                        self.mcp_check.result = None;
+                    }
                 });
-                ui.ctx()
-                    .copy_text(serde_json::to_string_pretty(&config).unwrap_or_default());
-                self.status_message = Some("Copied the MCP config".to_string());
-            }
-            let testing = self.mcp_check.running.is_some();
-            if ui
-                .add_enabled(
-                    !testing,
-                    egui::Button::new(format!("{}  Test connection", icon::REFRESH)).small(),
-                )
-                .on_hover_text(
-                    "Starts the server the way an assistant would and asks it a question",
-                )
-                .clicked()
-            {
-                let (tx, rx) = std::sync::mpsc::channel();
-                let wake = ui.ctx().clone();
-                let (program, args) = (program.clone(), args.clone());
-                std::thread::spawn(move || {
-                    let _ = tx.send(check_mcp_command(&program, &args));
-                    wake.request_repaint();
-                });
-                self.mcp_check.running = Some(rx);
-                self.mcp_check.result = None;
-            }
-        });
-        if let Some(rx) = &self.mcp_check.running {
-            match rx.try_recv() {
-                Ok(found) => {
-                    self.mcp_check.result = Some(found);
-                    self.mcp_check.running = None;
+                if let Some(rx) = &self.mcp_check.running {
+                    match rx.try_recv() {
+                        Ok(found) => {
+                            self.mcp_check.result = Some(found);
+                            self.mcp_check.running = None;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            ui.ctx()
+                                .request_repaint_after(std::time::Duration::from_millis(200));
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            self.mcp_check.result =
+                                Some("The test stopped unexpectedly".to_string());
+                            self.mcp_check.running = None;
+                        }
+                    }
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    ui.ctx()
-                        .request_repaint_after(std::time::Duration::from_millis(200));
+                if self.mcp_check.running.is_some() {
+                    ui.label(RichText::new("Testing…").size(11.5).color(p.fg_muted));
+                } else if let Some(found) = &self.mcp_check.result {
+                    let failed = found.starts_with("Could not")
+                        || found.starts_with("It ")
+                        || found.starts_with("The test");
+                    ui.add(
+                        egui::Label::new(RichText::new(found).size(11.5).color(if failed {
+                            p.danger
+                        } else {
+                            p.fg_secondary
+                        }))
+                        .wrap(),
+                    );
                 }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.mcp_check.result = Some("The test stopped unexpectedly".to_string());
-                    self.mcp_check.running = None;
-                }
-            }
-        }
-        if self.mcp_check.running.is_some() {
-            ui.label(RichText::new("Testing…").size(11.5).color(p.fg_muted));
-        } else if let Some(found) = &self.mcp_check.result {
-            let failed = found.starts_with("Could not")
-                || found.starts_with("It ")
-                || found.starts_with("The test");
-            ui.add(
-                egui::Label::new(RichText::new(found).size(11.5).color(if failed {
-                    p.danger
-                } else {
-                    p.fg_secondary
-                }))
-                .wrap(),
-            );
-        }
+            });
     }
 
     /// The shared library section of Settings: where the server is and whether we are on it.

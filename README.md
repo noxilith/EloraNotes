@@ -52,7 +52,7 @@ To host one, download the installer from the [latest release](https://github.com
 
 EloraNotes is its own [MCP](https://modelcontextprotocol.io) server, so Claude or any other MCP client can read, search, write and link your notes — on this computer and in the shared library — without a plugin.
 
-- **One command.** Settings → *AI assistants (MCP)* shows the command to register (`elora --mcp`), copies it as a `claude mcp add` line or a JSON config, and has a **Test connection** button that starts the server and asks it a question.
+- **One click.** Settings → *AI assistants (MCP)* finds the AI apps on your computer (Claude Desktop, Claude Code, Cursor, VS Code, Windsurf, Gemini CLI, Codex) and adds EloraNotes to them with a button, without you editing a config file. Nothing is changed until you press it, other settings in the app's file are kept, and a copy of the old file is saved first. For any other app there is the command to copy (`elora --mcp`), a JSON config to copy, and a **Test connection** button that starts the server and asks it a question.
 - **It shows up as it happens.** Notes an assistant writes appear in the sidebar and in the open window immediately, wear a robot icon, and have their own filter beside *Pinned*.
 - **You decide what it may touch.** Mark any note *Assistants can read, not change* from the robot menu above it. The server can also be started with `--read-only`, `--folder <name>` to show it one folder, or `--no-shared` to leave the shared library out.
 - **A way back.** Before an assistant overwrites or deletes a note, the old text is kept in a hidden `.history` folder (the last 20 versions). The robot menu lists them and restores one.

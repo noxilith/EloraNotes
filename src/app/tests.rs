@@ -4043,6 +4043,7 @@ fn draw(ctx: &egui::Context, mut contents: impl FnMut(&egui::Context)) {
 #[test]
 fn test_the_assistant_features_draw_for_every_kind_of_note() {
     let (mut app, ctx, dir) = drawable_app("draw-assistant");
+    app.mcp_clients.environment = Some(empty_computer(&dir));
     let root = app.storage.root_dir().to_path_buf();
     let mut made = Note::new("Made by AI", "# Hi\n- [ ] one", &root);
     made.ai.created = true;
@@ -4170,4 +4171,116 @@ fn test_the_sidebar_footer_stays_inside_the_panel_with_big_counts() {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// A computer with none of the AI apps on it, in a folder of its own.
+fn empty_computer(under: &Path) -> crate::mcp_clients::Environment {
+    let home = under.join("fake-home");
+    std::fs::create_dir_all(&home).unwrap();
+    crate::mcp_clients::Environment {
+        os: crate::mcp_clients::Os::Linux,
+        config_home: home.join(".config"),
+        home,
+        local_data: None,
+        path_dirs: vec![under.join("fake-bin")],
+        cli_timeout: Duration::from_secs(5),
+    }
+}
+
+/// Draws Settings until the AI-app scan and any work have finished.
+fn settle_ai_apps(app: &mut EloraApp, ctx: &egui::Context) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        draw(ctx, |ctx| app.settings_window(ctx));
+        if !app.mcp_clients.busy() && !app.mcp_clients.reports().is_empty() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "the scan never finished");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Settings finds the AI apps that are installed, adds EloraNotes to the ones asked for without
+/// disturbing what they hold, and notices when what was added no longer matches the options.
+#[test]
+fn test_settings_finds_the_ai_apps_and_adds_the_server_to_them() {
+    use crate::mcp_clients::{Client, Launch, State};
+    let (mut app, ctx, dir) = drawable_app("ai-apps");
+    let environment = empty_computer(&dir);
+    std::fs::create_dir_all(environment.config_home.join("Claude")).unwrap();
+    std::fs::create_dir_all(environment.home.join(".cursor")).unwrap();
+    let desktop_file = environment
+        .config_home
+        .join("Claude/claude_desktop_config.json");
+    std::fs::write(
+        &desktop_file,
+        r#"{ "theme": "dark", "mcpServers": { "other": { "command": "node" } } }"#,
+    )
+    .unwrap();
+    app.mcp_clients.environment = Some(environment.clone());
+    app.show_settings = true;
+
+    settle_ai_apps(&mut app, &ctx);
+    let state_of = |app: &EloraApp, client: Client| {
+        app.mcp_clients
+            .reports()
+            .iter()
+            .find(|r| r.client == client)
+            .map(|r| r.state.clone())
+            .unwrap()
+    };
+    assert_eq!(state_of(&app, Client::ClaudeDesktop), State::NotAdded);
+    assert_eq!(state_of(&app, Client::Cursor), State::NotAdded);
+    assert_eq!(
+        state_of(&app, Client::Codex),
+        State::NotFound,
+        "what is not installed is not offered"
+    );
+    assert!(
+        !environment.home.join(".cursor/mcp.json").exists(),
+        "nothing is written by looking"
+    );
+
+    // The command is the one the Settings page would hand out for these options.
+    let (program, args) = settings::mcp_launch_command(app.storage.root_dir(), &app.mcp_options);
+    let launch = Launch { program, args };
+    app.mcp_clients.start_work(
+        vec![
+            (Client::ClaudeDesktop, clients::Task::Add),
+            (Client::Cursor, clients::Task::Add),
+        ],
+        &launch,
+        &ctx,
+    );
+    settle_ai_apps(&mut app, &ctx);
+    assert_eq!(state_of(&app, Client::ClaudeDesktop), State::Added);
+    assert_eq!(state_of(&app, Client::Cursor), State::Added);
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&desktop_file).unwrap()).unwrap();
+    assert_eq!(written["theme"], "dark");
+    assert!(
+        written["mcpServers"]["other"].is_object(),
+        "what was there stays"
+    );
+    assert_eq!(written["mcpServers"]["elora-notes"]["args"][0], "--mcp");
+    assert!(
+        app.status_message
+            .as_deref()
+            .is_some_and(|m| m.contains("Added to")),
+        "{:?}",
+        app.status_message
+    );
+
+    // Choosing different limits makes what was added out of date, once the choice has settled.
+    app.mcp_options.read_only = true;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while state_of(&app, Client::ClaudeDesktop) != State::Outdated {
+        draw(&ctx, |ctx| app.settings_window(ctx));
+        assert!(
+            Instant::now() < deadline,
+            "the change of options was never noticed"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

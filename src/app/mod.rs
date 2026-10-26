@@ -30,6 +30,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 // The app is split by area; each module adds its own `impl EloraApp` block.
+mod clients;
 mod disk;
 mod export;
 mod graph;
@@ -40,6 +41,7 @@ mod settings;
 mod sharing;
 mod text;
 mod updates;
+use clients::McpClients;
 use disk::DiskWatch;
 use export::*;
 use graph::*;
@@ -290,6 +292,8 @@ pub struct EloraApp {
     history: Option<History>,
     /// What the Settings page last found when it tried the assistant connection.
     mcp_check: McpCheck,
+    /// The AI apps found on this computer, for adding EloraNotes to them from Settings.
+    mcp_clients: McpClients,
     /// The choices that shape the assistant command Settings hands out.
     mcp_options: McpOptions,
 }
@@ -476,6 +480,7 @@ impl EloraApp {
             kofi: KofiMark::load(ctx),
             history: None,
             mcp_check: McpCheck::default(),
+            mcp_clients: McpClients::default(),
             mcp_options: McpOptions::default(),
         };
         // Every client needs a name others can see and a secret the server can recognise it by.
