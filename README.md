@@ -46,6 +46,8 @@ Point the app at an EloraNotes server and its notes join your sidebar. Everyone 
 
 The server is a small binary with an installer for Linux and Windows. It speaks TLS and pins its certificate on the first connection — [the manual covers hosting, identity and privacy](https://noxilith.github.io/docs/#server).
 
+To host one, download the installer from the [latest release](https://github.com/noxilith/EloraNotes/releases/latest): `install-elora-server.sh` on Linux (`sudo bash install-elora-server.sh`) or `install-elora-server.ps1` on Windows (from an Administrator PowerShell: `powershell -ExecutionPolicy Bypass -File .\install-elora-server.ps1`). It asks for a name, a port and a password, installs the server as a service that starts at boot, opens the port in the firewall and checks that the server is really answering. Run it again to update (your settings, password, notes and certificate are kept), reconfigure or uninstall. It verifies the download against the release's checksums, and a scripted install can pass its answers in `ELORA_NAME`, `ELORA_PORT` and `ELORA_PASSWORD`.
+
 ## Working with AI assistants
 
 EloraNotes is its own [MCP](https://modelcontextprotocol.io) server, so Claude or any other MCP client can read, search, write and link your notes — on this computer and in the shared library — without a plugin.

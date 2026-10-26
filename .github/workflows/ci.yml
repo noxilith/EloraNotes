@@ -27,6 +27,25 @@ jobs:
       - name: Check the server without the GUI
         run: cargo check --locked --no-default-features --bin elora-server
 
+  # The server installers run for real, against stand-ins for the system tools (systemd, ufw,
+  # Task Scheduler, the Windows firewall), with the actual server started from what they write.
+  installers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the server
+        run: cargo build --locked --no-default-features --bin elora-server
+      - name: Lint the Linux installer
+        run: shellcheck -S style packaging/server/install-linux.sh && shellcheck -S warning packaging/server/tests/test-install-linux.sh
+      - name: Test the Linux installer
+        run: ELORA_SERVER_BINARY=target/debug/elora-server packaging/server/tests/test-install-linux.sh
+      - name: Test the Windows installer
+        shell: pwsh
+        run: |
+          $env:ELORA_SERVER_BINARY = "target/debug/elora-server"
+          ./packaging/server/tests/test-install-windows.ps1
+
   # The installer and updater code has Windows-only and macOS-only branches that cannot be
   # compiled on Linux, so both are checked on their own runners as well.
   platforms:
@@ -40,3 +59,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Check
         run: cargo check --locked
+      # The server installer has to parse in Windows PowerShell 5.1, the one every Windows ships
+      # with, which is older than the PowerShell the tests run under.
+      - name: Parse the Windows server installer with Windows PowerShell 5.1
+        if: matrix.os == 'windows-latest'
+        shell: powershell
+        run: |
+          $errors = $null; $tokens = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile("$PWD\packaging\server\install-windows.ps1", [ref]$tokens, [ref]$errors)
+          if ($errors) { $errors | ForEach-Object { Write-Host "line $($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
+          Write-Host "parses under PowerShell $($PSVersionTable.PSVersion)"
