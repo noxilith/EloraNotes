@@ -120,8 +120,9 @@ impl NoteSort {
     }
 }
 
-/// How the note graph moves while its window is open: the normal orbit, a slower drift, or a
-/// still picture. Dragging turns the graph in every mode.
+/// How the note graph moves while its window is open: the unlinked notes sway gently, sway more
+/// slowly, or hold still. The clusters settle the same way in every mode, and zooming and
+/// dragging always work. Saved as `orbit`, `slow` and `still`, as before.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphMotion {
@@ -134,13 +135,13 @@ pub enum GraphMotion {
 impl GraphMotion {
     pub fn name(self) -> &'static str {
         match self {
-            Self::Orbit => "Orbit",
+            Self::Orbit => "Drift",
             Self::Slow => "Slow",
             Self::Still => "Still",
         }
     }
 
-    /// Radians per second for the graph's turn. `Still` leaves the turn to a drag.
+    /// How fast the unlinked notes sway. `Still` holds them in place.
     pub fn speed(self) -> f32 {
         match self {
             Self::Orbit => 0.12,

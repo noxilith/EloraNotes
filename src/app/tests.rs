@@ -3764,41 +3764,169 @@ fn test_a_long_title_and_the_footer_both_stay_inside_the_sidebar() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The graph is a set of orbits now: the note with the most links travels inside, the rest
-/// sit on wider rings, and turning the system moves the notes along those rings rather than
-/// throwing them off the canvas.
+/// Linked notes are pulled into clusters, each with its own colour, and the notes nothing links
+/// to are set out on an arc below them rather than mixed in.
 #[test]
-fn test_the_graph_orbits_the_busiest_notes_inside() {
-    let mut nodes: Vec<GraphNode> = (0..30)
+fn test_the_graph_clusters_linked_notes_and_sets_the_rest_on_an_arc_below() {
+    let mut nodes: Vec<GraphNode> = (0..60)
         .map(|i| GraphNode {
             id: format!("n{i}"),
             label: format!("Note {i}"),
             links: Vec::new(),
         })
         .collect();
-    nodes[7].links = (0..nodes.len()).filter(|&i| i != 7).collect();
+    // Two clusters of ten notes, each a hub with spokes, and one link between them.
+    for spoke in 1..10 {
+        nodes[0].links.push(spoke);
+        nodes[10].links.push(10 + spoke);
+    }
+    nodes[9].links.push(19);
 
-    let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(560.0, 500.0));
-    let dots = graph_layout(&nodes, rect, 0.0);
-    assert_eq!(dots.len(), nodes.len());
-    assert!(
-        dots.iter().all(|dot| rect.contains(dot.pos)),
-        "a note was placed outside the graph's canvas"
-    );
-    assert_eq!(dots[7].ring, 0, "the busiest note should orbit inside");
-    assert!(
-        dots.iter().filter(|dot| dot.ring == 2).count() >= 10,
-        "the quiet notes should spread out onto the outer orbits"
-    );
+    let mut view = GraphView::new(nodes);
+    view.settle(Duration::from_secs(10));
+    assert!(view.settled());
+    assert_eq!(view.connected.len(), 20);
+    assert_eq!(view.orphans.len(), 40);
 
-    let turned = graph_layout(&nodes, rect, TAU / 4.0);
-    assert!(
-        dots.iter()
-            .zip(&turned)
-            .any(|(before, after)| before.pos.distance(after.pos) > 1.0),
-        "half a turn should move the notes"
+    let groups: BTreeSet<usize> = view.group.iter().flatten().copied().collect();
+    assert_eq!(groups.len(), 2, "each cluster gets a colour of its own");
+    assert_ne!(group_color(0), group_color(1));
+    assert_eq!(
+        view.group[0], view.group[5],
+        "a hub and its spokes share a colour"
     );
-    assert!(turned.iter().all(|dot| rect.contains(dot.pos)));
+    assert_ne!(view.group[0], view.group[15]);
+
+    let world = view.world_positions();
+    let top_of_orphans = view
+        .orphans
+        .iter()
+        .map(|&i| world[i].y)
+        .fold(f32::MAX, f32::min);
+    let mean_y = |ids: &[usize]| ids.iter().map(|&i| world[i].y).sum::<f32>() / ids.len() as f32;
+    assert!(
+        mean_y(&view.orphans) > mean_y(&view.connected),
+        "the unlinked notes sit below the linked ones"
+    );
+    let reach = view
+        .connected
+        .iter()
+        .map(|&i| world[i].length())
+        .fold(0.0_f32, f32::max);
+    let (low, high) = view
+        .orphans
+        .iter()
+        .map(|&i| world[i].length())
+        .fold((f32::MAX, 0.0_f32), |(lo, hi), d| (lo.min(d), hi.max(d)));
+    assert!(low > 0.0 && top_of_orphans.is_finite() && reach.is_finite() && high >= low);
+    // No two notes sit on the same spot, so every one can be seen and pointed at.
+    for (n, a) in world.iter().enumerate() {
+        for b in &world[n + 1..] {
+            assert!(
+                (*a - *b).length() > 1.0,
+                "two notes landed on top of each other"
+            );
+        }
+    }
+
+    // A vault with nothing linked is a ring, not a pile at the origin.
+    let loose: Vec<GraphNode> = (0..12)
+        .map(|i| GraphNode {
+            id: format!("l{i}"),
+            label: format!("Loose {i}"),
+            links: Vec::new(),
+        })
+        .collect();
+    let ring = GraphView::new(loose).world_positions();
+    assert!(ring.iter().all(|p| p.length() > 20.0));
+}
+
+/// A shared note's links are only known once its text has been read from the server. Until then
+/// its note is on its own; when the links arrive it joins the graph without the rest moving.
+#[test]
+fn test_links_read_from_shared_notes_join_the_graph_when_they_arrive() {
+    let nodes: Vec<GraphNode> = ["Spec", "Progress", "Ideas", "Loose"]
+        .iter()
+        .map(|title| GraphNode {
+            id: title.to_lowercase(),
+            label: title.to_string(),
+            links: Vec::new(),
+        })
+        .collect();
+    let mut view = GraphView::new(nodes);
+    assert_eq!((view.connected.len(), view.orphans.len()), (0, 4));
+
+    view.stage_links(
+        "progress".into(),
+        vec!["spec".into(), "SPEC".into(), "Nowhere".into()],
+    );
+    view.stage_links("ideas".into(), vec!["Progress".into()]);
+    assert!(view.flush(true));
+    assert_eq!(view.connected.len(), 3);
+    assert_eq!(view.orphans, vec![3]);
+    assert_eq!(view.edges.len(), 2, "the same link twice is one line");
+    assert!(view.group[0].is_some() && view.group[3].is_none());
+
+    // Nothing new to fold in: the graph is left as it is.
+    view.stage_links("progress".into(), vec!["Spec".into()]);
+    assert!(!view.flush(true));
+
+    // A note that is placed stays where it is when more links arrive.
+    view.settle(Duration::from_secs(5));
+    let before = view.world_positions()[0];
+    view.stage_links("loose".into(), vec!["Spec".into()]);
+    assert!(view.flush(true));
+    assert_eq!(view.connected.len(), 4);
+    assert!(view.orphans.is_empty());
+    view.settle(Duration::from_secs(5));
+    assert!(before.is_finite() && view.world_positions()[3].is_finite());
+}
+
+/// Reading the shared notes gives up cleanly when there is no library to read from, and says why.
+#[test]
+fn test_reading_shared_links_gives_up_when_the_library_cannot_be_reached() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let todo: Vec<(String, chrono::DateTime<Utc>)> = (0..6)
+        .map(|i| (format!("shared-{i}"), Utc::now()))
+        .collect();
+    load_shared_links(AppSettings::default(), todo, tx);
+    let mut skipped = 0;
+    let mut failed = None;
+    while let Ok(message) = rx.try_recv() {
+        match message {
+            GraphLoad::Skipped => skipped += 1,
+            GraphLoad::Failed(why) => failed = Some(why),
+            GraphLoad::Links { .. } | GraphLoad::Done => panic!("nothing could have been read"),
+        }
+    }
+    assert_eq!(skipped, 2, "two notes are skipped before it gives up");
+    assert!(failed.is_some_and(|why| !why.is_empty()));
+}
+
+/// Zooming with the scroll wheel keeps what is under the pointer under the pointer.
+#[test]
+fn test_zooming_keeps_the_graph_point_under_the_pointer() {
+    let centre = Pos2::new(400.0, 300.0);
+    let pointer = Pos2::new(550.0, 380.0);
+    let (zoom, focus) = (1.5_f32, Vec2::new(30.0, -10.0));
+    let under = |zoom: f32, focus: Vec2| focus + (pointer - centre) / zoom;
+
+    let (zoomed, moved) = zoom_about(zoom, focus, centre, pointer, 2.0);
+    assert!((zoomed - 3.0).abs() < 1e-4);
+    assert!((under(zoomed, moved) - under(zoom, focus)).length() < 1e-3);
+
+    // There is a limit either way, and the point still holds at the limit.
+    let (far, shifted) = zoom_about(zoom, focus, centre, pointer, 1.0e6);
+    assert!(far <= 12.0);
+    assert!((under(far, shifted) - under(zoom, focus)).length() < 1e-3);
+    let (near, _) = zoom_about(zoom, focus, centre, pointer, 1.0e-6);
+    assert!(near >= 0.03);
+
+    // Fitting shows every note: the whole spread fits in the canvas.
+    let world = vec![Vec2::new(-300.0, -50.0), Vec2::new(500.0, 250.0)];
+    let (fit_zoom, fit_focus) = GraphView::fit_target(&world, Vec2::new(800.0, 600.0));
+    assert!(fit_zoom > 0.0 && (fit_focus - Vec2::new(100.0, 100.0)).length() < 1e-3);
+    assert!((500.0 + 300.0) * fit_zoom <= 800.0);
 }
 
 #[test]
@@ -4082,6 +4210,7 @@ fn test_the_assistant_features_draw_for_every_kind_of_note() {
     // the graph, all open at once.
     app.sidebar_section = SidebarSection::Assistant;
     app.show_settings = true;
+    app.settings_page = settings::SettingsPage::Assistants;
     app.mcp_options = McpOptions {
         read_only: true,
         folder: "AI".into(),
@@ -4099,6 +4228,62 @@ fn test_the_assistant_features_draw_for_every_kind_of_note() {
             app.render_sidebar(ui, &p);
         });
     });
+    assert!(app.graph.is_some());
+    // Every page of Settings draws, with the assistant limits and a test result set above.
+    for page in settings::SettingsPage::ALL {
+        app.settings_page = page;
+        draw(&ctx, |ctx| app.settings_window(ctx));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A big vault lays out in reasonable time and is drawn at every zoom without trouble.
+#[test]
+fn test_a_big_graph_settles_quickly_and_draws_at_every_zoom() {
+    let count = 1800;
+    let mut nodes: Vec<GraphNode> = (0..count)
+        .map(|i| GraphNode {
+            id: format!("n{i}"),
+            label: format!("Note number {i}"),
+            links: Vec::new(),
+        })
+        .collect();
+    // Fifteen topics of a hundred notes each: every note links to a few others in its topic, and
+    // a few topics link to each other. The last 300 notes are on their own.
+    for topic in 0..15 {
+        for k in 0..100 {
+            let i = topic * 100 + k;
+            for hop in [1, 7, 13] {
+                nodes[i].links.push(topic * 100 + (k + hop) % 100);
+            }
+        }
+        nodes[topic * 100].links.push(((topic + 1) % 15) * 100);
+    }
+    let started = Instant::now();
+    let mut view = GraphView::new(nodes);
+    view.settle(Duration::from_secs(60));
+    let took = started.elapsed();
+    assert!(view.settled());
+    assert!(
+        took < Duration::from_secs(20),
+        "laying out 1800 notes took {took:?}"
+    );
+    assert_eq!(view.orphans.len(), 300);
+    let topics = view.group.iter().flatten().max().unwrap() + 1;
+    assert!(
+        (4..=20).contains(&topics),
+        "the topics get a handful of colours, not {topics}"
+    );
+
+    let (mut app, ctx, dir) = drawable_app("draw-big-graph");
+    app.graph = Some(view);
+    for zoom in [0.05, 1.0, 4.0, 12.0] {
+        if let Some(view) = app.graph.as_mut() {
+            view.auto_fit = false;
+            view.zoom = zoom;
+        }
+        draw(&ctx, |ctx| app.graph_window(ctx));
+    }
     assert!(app.graph.is_some());
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -4226,6 +4411,7 @@ fn test_settings_finds_the_ai_apps_and_adds_the_server_to_them() {
     .unwrap();
     app.mcp_clients.environment = Some(environment.clone());
     app.show_settings = true;
+    app.settings_page = settings::SettingsPage::Assistants;
 
     settle_ai_apps(&mut app, &ctx);
     let state_of = |app: &EloraApp, client: Client| {
@@ -4301,6 +4487,7 @@ fn test_settings_explains_the_flatpak_sandbox() {
     environment.sandboxed = true;
     app.mcp_clients.environment = Some(environment);
     app.show_settings = true;
+    app.settings_page = settings::SettingsPage::Assistants;
     settle_ai_apps(&mut app, &ctx);
     assert!(app
         .mcp_clients
@@ -4321,6 +4508,7 @@ fn test_settings_adds_the_memory_skill_where_assistants_read_it() {
     std::fs::create_dir_all(environment.home.join(".codex")).unwrap();
     app.mcp_clients.environment = Some(environment.clone());
     app.show_settings = true;
+    app.settings_page = settings::SettingsPage::Assistants;
     settle_ai_apps(&mut app, &ctx);
 
     let state_of = |app: &EloraApp, place: Place| {

@@ -43,6 +43,44 @@ pub(super) fn color_override_row(
     changed
 }
 
+/// The pages of the Settings window.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum SettingsPage {
+    #[default]
+    Appearance,
+    Notes,
+    Assistants,
+    Shared,
+    About,
+}
+
+impl SettingsPage {
+    pub(super) const ALL: [SettingsPage; 5] = [
+        SettingsPage::Appearance,
+        SettingsPage::Notes,
+        SettingsPage::Assistants,
+        SettingsPage::Shared,
+        SettingsPage::About,
+    ];
+
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::Appearance => "Appearance",
+            Self::Notes => "Notes",
+            Self::Assistants => "AI assistants",
+            Self::Shared => "Shared library",
+            Self::About => "About",
+        }
+    }
+}
+
+/// A heading inside a Settings page, with room above it so groups do not run together.
+fn settings_heading(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(10.0);
+    ui.label(RichText::new(title).strong().size(13.0));
+    ui.add_space(3.0);
+}
+
 impl EloraApp {
     /// Settings window: theme, text size, color overrides, glow strength and layout toggles.
     pub(super) fn settings_window(&mut self, ctx: &egui::Context) {
@@ -57,7 +95,7 @@ impl EloraApp {
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
-            .default_width(380.0)
+            .default_width(520.0)
             .show(ctx, |ui| {
                 // The window now carries the notes folder and shortcut reference too, so
                 // it must scroll rather than run off the bottom of a short window.
@@ -66,247 +104,260 @@ impl EloraApp {
                     .auto_shrink([false, false])
                     .max_height(max_height)
                     .show(ui, |ui| {
-                        ui.label(RichText::new("Appearance").strong());
+                        // One page at a time, so what is on screen is one topic instead of a long
+                        // run of sections.
                         ui.horizontal_wrapped(|ui| {
-                            for t in [
-                                ThemeMode::Obsidian,
-                                ThemeMode::Paper,
-                                ThemeMode::Nordic,
-                                ThemeMode::Matcha,
-                                ThemeMode::Sepia,
-                                ThemeMode::Midnight,
-                                ThemeMode::Matugen,
-                            ] {
-                                if ui.selectable_label(self.theme == t, t.name()).clicked() {
-                                    self.theme = t;
-                                    changed = true;
-                                }
-                            }
-                        });
-                        changed |= ui
-                            .add(
-                                egui::Slider::new(&mut self.font_size, 11.0..=22.0)
-                                    .text("Text size"),
-                            )
-                            .changed();
-                        ui.separator();
-
-                        ui.label(RichText::new("Colors").strong());
-                        ui.label("Tick a color to override the theme's default.");
-                        changed |= color_override_row(
-                            ui,
-                            "Background",
-                            &mut self.colors.bg,
-                            defaults.bg_canvas,
-                        );
-                        changed |= color_override_row(
-                            ui,
-                            "Sidebar",
-                            &mut self.colors.sidebar,
-                            defaults.bg_sidebar,
-                        );
-                        changed |= color_override_row(
-                            ui,
-                            "Text",
-                            &mut self.colors.fg,
-                            defaults.fg_primary,
-                        );
-                        changed |= color_override_row(
-                            ui,
-                            "Accent",
-                            &mut self.colors.accent,
-                            defaults.accent,
-                        );
-                        changed |=
-                            color_override_row(ui, "Pin", &mut self.colors.pin, defaults.pin_color);
-                        changed |= color_override_row(
-                            ui,
-                            "Muted text",
-                            &mut self.colors.fg_muted,
-                            defaults.fg_muted,
-                        );
-                        changed |= color_override_row(
-                            ui,
-                            "Borders",
-                            &mut self.colors.border,
-                            defaults.border,
-                        );
-                        changed |= color_override_row(
-                            ui,
-                            "Danger",
-                            &mut self.colors.danger,
-                            defaults.danger,
-                        );
-                        if ui.button("Reset colors to theme").clicked() {
-                            self.colors = Default::default();
-                            changed = true;
-                        }
-                        ui.separator();
-
-                        ui.label(RichText::new("Glow highlights").strong());
-                        changed |= ui
-                            .add(
-                                egui::Slider::new(&mut self.glow_strength, 0.0..=1.0)
-                                    .text("Glow strength"),
-                            )
-                            .changed();
-                        ui.horizontal(|ui| {
-                            ui.label("Default glow color");
-                            changed |= ui.color_edit_button_srgb(&mut self.highlight_rgb).changed();
-                        });
-                        ui.separator();
-
-                        changed |= ui
-                            .checkbox(&mut self.show_formatting_bar, "Show formatting bar")
-                            .changed();
-                        changed |= ui
-                            .checkbox(&mut self.roomy_cards, "Tall note cards")
-                            .on_hover_text(
-                                "Off, each note is one line — a small icon and its title — so about \
-                                 twice as many fit in the list; hovering shows the date and tags. \
-                                 On brings back the taller card with its date and tag row.",
-                            )
-                            .changed();
-                        changed |= ui
-                            .checkbox(
-                                &mut self.show_card_previews,
-                                "Show a preview line on note cards",
-                            )
-                            .on_hover_text(
-                                "Off leaves just the title, date and tags, so the sidebar's \
-                                 cards are shorter and more notes fit at once. On adds the first \
-                                 lines of each note. Only the tall cards have room for it.",
-                            )
-                            .changed();
-                        ui.separator();
-
-                        ui.label(RichText::new("Note graph").strong());
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(
-                                RichText::new("Motion")
-                                    .size(11.5)
-                                    .color(defaults.fg_secondary),
-                            );
-                            for motion in [GraphMotion::Orbit, GraphMotion::Slow, GraphMotion::Still]
-                            {
-                                let hint = match motion {
-                                    GraphMotion::Orbit => {
-                                        "Notes drift around the graph at the usual pace."
-                                    }
-                                    GraphMotion::Slow => {
-                                        "Notes drift at a gentler pace, so the graph is calmer."
-                                    }
-                                    GraphMotion::Still => {
-                                        "No automatic movement. Dragging empty space still turns \
-                                         the graph."
-                                    }
-                                };
+                            for page in SettingsPage::ALL {
                                 if ui
-                                    .selectable_label(self.graph_motion == motion, motion.name())
-                                    .on_hover_text(hint)
+                                    .selectable_label(self.settings_page == page, page.name())
                                     .clicked()
                                 {
-                                    self.graph_motion = motion;
-                                    changed = true;
+                                    self.settings_page = page;
                                 }
                             }
                         });
-                        ui.label(
-                            RichText::new(match self.graph_motion {
-                                GraphMotion::Orbit => "The graph drifts while its window is open.",
-                                GraphMotion::Slow => {
-                                    "A quieter drift, for a graph that should not pull the eye."
-                                }
-                                GraphMotion::Still => {
-                                    "The graph holds its place. Drag it to turn it by hand."
-                                }
-                            })
-                            .size(10.5)
-                            .color(defaults.fg_muted),
-                        );
                         ui.separator();
+                        ui.add_space(4.0);
 
-                        ui.label(RichText::new("Notes folder").strong());
-                        let notes_dir = self.storage.root_dir().display().to_string();
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(notes_dir.clone())
-                                    .monospace()
-                                    .size(11.0)
-                                    .color(defaults.fg_muted),
-                            )
-                            .wrap(),
-                        );
-                        if ui
-                            .small_button(format!("{}  Copy path", icon::COPY))
-                            .clicked()
-                        {
-                            ui.ctx().copy_text(notes_dir);
-                            self.status_message = Some("Copied notes folder path".to_string());
-                        }
-
-                        ui.separator();
-
-                        ui.label(RichText::new("Shortcuts").strong());
-                        egui::Grid::new("elora_settings_shortcuts")
-                            .num_columns(2)
-                            .spacing([14.0, 4.0])
-                            .show(ui, |ui| {
-                                for (keys, action) in [
-                                    ("Right-click selection", "Format / glow highlight"),
-                                    ("Ctrl+B", "Bold"),
-                                    ("Ctrl+Shift+H", "Glow highlight"),
-                                    ("Tab / Shift+Tab", "Indent / unindent"),
-                                    ("Enter", "Keep list & indentation"),
-                                    ("Shift+Enter", "Stay inside quote / item"),
-                                    ("Ctrl+F", "Find in the open note"),
-                                    ("Ctrl+Shift+F", "Search all notes"),
-                                    ("Ctrl+K", "Command palette & quick switcher"),
-                                ] {
+                        match self.settings_page {
+                            SettingsPage::Appearance => {
+                                settings_heading(ui, "Theme");
+                                ui.horizontal_wrapped(|ui| {
+                                    for t in [
+                                        ThemeMode::Obsidian,
+                                        ThemeMode::Paper,
+                                        ThemeMode::Nordic,
+                                        ThemeMode::Matcha,
+                                        ThemeMode::Sepia,
+                                        ThemeMode::Midnight,
+                                        ThemeMode::Matugen,
+                                    ] {
+                                        if ui.selectable_label(self.theme == t, t.name()).clicked() {
+                                            self.theme = t;
+                                            changed = true;
+                                        }
+                                    }
+                                });
+                                changed |= ui
+                                    .add(
+                                        egui::Slider::new(&mut self.font_size, 11.0..=22.0)
+                                            .text("Text size"),
+                                    )
+                                    .changed();
+                                settings_heading(ui, "Glow highlights");
+                                changed |= ui
+                                    .add(
+                                        egui::Slider::new(&mut self.glow_strength, 0.0..=1.0)
+                                            .text("Glow strength"),
+                                    )
+                                    .changed();
+                                ui.horizontal(|ui| {
+                                    ui.label("Default glow color");
+                                    changed |= ui.color_edit_button_srgb(&mut self.highlight_rgb).changed();
+                                });
+                                settings_heading(ui, "Colors");
+                                egui::CollapsingHeader::new("Custom colors")
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        ui.label("Tick a color to override the theme's default.");
+                                        changed |= color_override_row(
+                                            ui,
+                                            "Background",
+                                            &mut self.colors.bg,
+                                            defaults.bg_canvas,
+                                        );
+                                        changed |= color_override_row(
+                                            ui,
+                                            "Sidebar",
+                                            &mut self.colors.sidebar,
+                                            defaults.bg_sidebar,
+                                        );
+                                        changed |= color_override_row(
+                                            ui,
+                                            "Text",
+                                            &mut self.colors.fg,
+                                            defaults.fg_primary,
+                                        );
+                                        changed |= color_override_row(
+                                            ui,
+                                            "Accent",
+                                            &mut self.colors.accent,
+                                            defaults.accent,
+                                        );
+                                        changed |=
+                                            color_override_row(ui, "Pin", &mut self.colors.pin, defaults.pin_color);
+                                        changed |= color_override_row(
+                                            ui,
+                                            "Muted text",
+                                            &mut self.colors.fg_muted,
+                                            defaults.fg_muted,
+                                        );
+                                        changed |= color_override_row(
+                                            ui,
+                                            "Borders",
+                                            &mut self.colors.border,
+                                            defaults.border,
+                                        );
+                                        changed |= color_override_row(
+                                            ui,
+                                            "Danger",
+                                            &mut self.colors.danger,
+                                            defaults.danger,
+                                        );
+                                        if ui.button("Reset colors to theme").clicked() {
+                                            self.colors = Default::default();
+                                            changed = true;
+                                        }
+                                    });
+                            }
+                            SettingsPage::Notes => {
+                                settings_heading(ui, "Note list");
+                                changed |= ui
+                                    .checkbox(&mut self.show_formatting_bar, "Show formatting bar")
+                                    .changed();
+                                changed |= ui
+                                    .checkbox(&mut self.roomy_cards, "Tall note cards")
+                                    .on_hover_text(
+                                        "Off, each note is one line — a small icon and its title — so about \
+                                         twice as many fit in the list; hovering shows the date and tags. \
+                                         On brings back the taller card with its date and tag row.",
+                                    )
+                                    .changed();
+                                changed |= ui
+                                    .checkbox(
+                                        &mut self.show_card_previews,
+                                        "Show a preview line on note cards",
+                                    )
+                                    .on_hover_text(
+                                        "Off leaves just the title, date and tags, so the sidebar's \
+                                         cards are shorter and more notes fit at once. On adds the first \
+                                         lines of each note. Only the tall cards have room for it.",
+                                    )
+                                    .changed();
+                                settings_heading(ui, "Note graph");
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label(
-                                        RichText::new(keys)
-                                            .monospace()
-                                            .size(11.0)
+                                        RichText::new("Motion")
+                                            .size(11.5)
                                             .color(defaults.fg_secondary),
                                     );
-                                    ui.label(
-                                        RichText::new(action).size(11.5).color(defaults.fg_muted),
-                                    );
-                                    ui.end_row();
+                                    for motion in [GraphMotion::Orbit, GraphMotion::Slow, GraphMotion::Still]
+                                    {
+                                        let hint = match motion {
+                                            GraphMotion::Orbit => {
+                                                "The notes with no links sway gently while the graph is open."
+                                            }
+                                            GraphMotion::Slow => {
+                                                "The notes with no links sway more slowly, so the graph is calmer."
+                                            }
+                                            GraphMotion::Still => {
+                                                "Nothing moves on its own. Zooming and dragging still work."
+                                            }
+                                        };
+                                        if ui
+                                            .selectable_label(self.graph_motion == motion, motion.name())
+                                            .on_hover_text(hint)
+                                            .clicked()
+                                        {
+                                            self.graph_motion = motion;
+                                            changed = true;
+                                        }
+                                    }
+                                });
+                                ui.label(
+                                    RichText::new(match self.graph_motion {
+                                        GraphMotion::Orbit => "The notes with no links sway gently.",
+                                        GraphMotion::Slow => {
+                                            "A slower sway, for a graph that should not pull the eye."
+                                        }
+                                        GraphMotion::Still => {
+                                            "The graph holds still. Scroll to zoom and drag to move it."
+                                        }
+                                    })
+                                    .size(10.5)
+                                    .color(defaults.fg_muted),
+                                );
+                                settings_heading(ui, "Notes folder");
+                                let notes_dir = self.storage.root_dir().display().to_string();
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(notes_dir.clone())
+                                            .monospace()
+                                            .size(11.0)
+                                            .color(defaults.fg_muted),
+                                    )
+                                    .wrap(),
+                                );
+                                if ui
+                                    .small_button(format!("{}  Copy path", icon::COPY))
+                                    .clicked()
+                                {
+                                    ui.ctx().copy_text(notes_dir);
+                                    self.status_message = Some("Copied notes folder path".to_string());
                                 }
-                            });
-                        ui.separator();
-
-                        ui.label(RichText::new("AI assistants (MCP)").strong());
-                        self.mcp_settings(ui, &defaults);
-                        ui.separator();
-
-                        ui.label(RichText::new("Shared library").strong());
-                        self.shared_library_settings(ui, &defaults);
-                        ui.separator();
-
-                        ui.label(RichText::new("Updates").strong());
-                        self.update_settings_row(ui, &defaults);
-                        ui.separator();
-
-                        if ui
-                            .button(format!("{}  Reset all settings to defaults", icon::RESTORE))
-                            .clicked()
-                        {
-                            let d = AppSettings::default();
-                            self.theme = ThemeMode::from_name(&d.theme_name);
-                            self.colors = d.colors;
-                            self.font_size = d.font_size;
-                            self.glow_strength = d.glow_strength;
-                            self.highlight_rgb = d.highlight_rgb;
-                            self.show_formatting_bar = d.show_formatting_bar;
-                            self.show_card_previews = d.show_card_previews;
-                            self.roomy_cards = d.roomy_cards;
-                            self.graph_motion = d.graph_motion;
-                            self.sort = d.sort;
-                            self.peer_color = d.peer_color;
-                            self.collab.set_color(self.peer_color);
-                            changed = true;
+                                settings_heading(ui, "Keyboard shortcuts");
+                                egui::CollapsingHeader::new("Show the shortcuts")
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        egui::Grid::new("elora_settings_shortcuts")
+                                            .num_columns(2)
+                                            .spacing([14.0, 4.0])
+                                            .show(ui, |ui| {
+                                                for (keys, action) in [
+                                                    ("Right-click selection", "Format / glow highlight"),
+                                                    ("Ctrl+B", "Bold"),
+                                                    ("Ctrl+Shift+H", "Glow highlight"),
+                                                    ("Tab / Shift+Tab", "Indent / unindent"),
+                                                    ("Enter", "Keep list & indentation"),
+                                                    ("Shift+Enter", "Stay inside quote / item"),
+                                                    ("Ctrl+F", "Find in the open note"),
+                                                    ("Ctrl+Shift+F", "Search all notes"),
+                                                    ("Ctrl+K", "Command palette & quick switcher"),
+                                                ] {
+                                                    ui.label(
+                                                        RichText::new(keys)
+                                                            .monospace()
+                                                            .size(11.0)
+                                                            .color(defaults.fg_secondary),
+                                                    );
+                                                    ui.label(
+                                                        RichText::new(action).size(11.5).color(defaults.fg_muted),
+                                                    );
+                                                    ui.end_row();
+                                                }
+                                            });
+                                    });
+                            }
+                            SettingsPage::Assistants => {
+                                self.mcp_settings(ui, &defaults);
+                            }
+                            SettingsPage::Shared => {
+                                self.shared_library_settings(ui, &defaults);
+                            }
+                            SettingsPage::About => {
+                                settings_heading(ui, "Updates");
+                                self.update_settings_row(ui, &defaults);
+                                settings_heading(ui, "Reset");
+                                if ui
+                                    .button(format!("{}  Reset all settings to defaults", icon::RESTORE))
+                                    .clicked()
+                                {
+                                    let d = AppSettings::default();
+                                    self.theme = ThemeMode::from_name(&d.theme_name);
+                                    self.colors = d.colors;
+                                    self.font_size = d.font_size;
+                                    self.glow_strength = d.glow_strength;
+                                    self.highlight_rgb = d.highlight_rgb;
+                                    self.show_formatting_bar = d.show_formatting_bar;
+                                    self.show_card_previews = d.show_card_previews;
+                                    self.roomy_cards = d.roomy_cards;
+                                    self.graph_motion = d.graph_motion;
+                                    self.sort = d.sort;
+                                    self.peer_color = d.peer_color;
+                                    self.collab.set_color(self.peer_color);
+                                    changed = true;
+                                }
+                            }
                         }
                     });
             });

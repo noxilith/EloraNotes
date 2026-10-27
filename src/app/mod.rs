@@ -180,11 +180,16 @@ pub struct EloraApp {
     /// Glow halo intensity for highlights, 0.0 to 1.0.
     glow_strength: f32,
     show_settings: bool,
+    /// Which page of Settings is showing.
+    settings_page: settings::SettingsPage,
     /// Note graph (live notes and their wiki links). `Some` while the graph window is open.
-    graph: Option<Vec<GraphNode>>,
-    /// How far the graph's orbits have turned, in radians. It resets when the graph opens.
-    graph_angle: f32,
-    /// Whether the graph drifts normally, drifts more slowly, or holds still until it is dragged.
+    graph: Option<GraphView>,
+    /// The thread reading shared notes' links for the open graph.
+    graph_loader: Option<std::sync::mpsc::Receiver<GraphLoad>>,
+    /// Links read from shared notes, by note, with the version they were read from, so reopening
+    /// the graph does not read every note again.
+    graph_links: HashMap<String, (chrono::DateTime<Utc>, Vec<String>)>,
+    /// Whether the unlinked notes in the graph sway normally, more slowly, or hold still.
     graph_motion: GraphMotion,
     /// Shared-library notes assistants may read but not change; see `AppSettings`.
     mcp_read_only_ids: Vec<String>,
@@ -427,8 +432,10 @@ impl EloraApp {
             font_size: settings.font_size,
             glow_strength: settings.glow_strength,
             show_settings: false,
+            settings_page: settings::SettingsPage::default(),
             graph: None,
-            graph_angle: 0.0,
+            graph_loader: None,
+            graph_links: HashMap::new(),
             graph_motion: settings.graph_motion,
             mcp_read_only_ids: settings.mcp_read_only_ids.clone(),
             last_editor_selection: None,

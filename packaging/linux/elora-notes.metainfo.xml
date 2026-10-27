@@ -25,6 +25,18 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.14.0" date="2026-10-28">
+      <description>
+        <p>
+          The note graph is new: linked notes gather into coloured clusters, notes nothing links
+          to wait on an arc below them, and you can zoom, drag and fit it to the window. The links
+          inside shared-library notes are now read from the server, so they appear in the graph.
+          Settings is split into pages. On Windows, an update could leave the old version in place
+          because AI apps keep a copy of EloraNotes running as a background server that locks the
+          file; the installer and the updater now close those copies.
+        </p>
+      </description>
+    </release>
     <release version="0.13.0" date="2026-10-27">
       <description>
         <p>

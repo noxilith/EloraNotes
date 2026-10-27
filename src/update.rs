@@ -765,16 +765,32 @@ pub fn install_and_restart(staged: &Path) -> Result<(), String> {
             if !is_silent_installer(staged) {
                 return Err("The downloaded setup program is not a Windows installer.".to_string());
             }
+            // AI apps keep `elora.exe --mcp` running from this folder, and a running copy locks
+            // the file the setup has to replace. Those copies have no window to ask to close, so
+            // without this the setup cannot write the new files, nothing changes, and the app
+            // offers the same update again.
+            #[cfg(windows)]
+            stop_other_copies();
             // The wizard closes the running app, replaces the files and puts the shortcuts and
-            // uninstall entry back in place; the caller exits right after this returns.
-            std::process::Command::new(staged)
+            // uninstall entry back in place; the caller exits right after this returns. Its log
+            // is kept so a setup that fails can say why.
+            let mut command = std::process::Command::new(staged);
+            command
                 .args([
                     "/SILENT",
                     "/SUPPRESSMSGBOXES",
                     "/CLOSEAPPLICATIONS",
+                    "/FORCECLOSEAPPLICATIONS",
                     "/NORESTART",
                 ])
-                .stdin(std::process::Stdio::null())
+                .stdin(std::process::Stdio::null());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                let log = std::env::temp_dir().join("elora-notes-update.log");
+                command.raw_arg(format!("/LOG=\"{}\"", log.display()));
+            }
+            command
                 .spawn()
                 .map_err(|e| format!("Could not start the EloraNotes setup program: {e}"))?;
             Ok(())
@@ -800,6 +816,37 @@ pub fn install_and_restart(staged: &Path) -> Result<(), String> {
     }
 }
 
+/// The PowerShell that stops every other `elora.exe` started from `exe` (the copies an AI app
+/// runs as an MCP server), but not the process with id `own_pid`. A copy somewhere else is left
+/// alone.
+#[cfg(any(windows, test))]
+fn stop_other_copies_script(exe: &str, own_pid: u32) -> String {
+    let exe = exe.replace('\'', "''");
+    format!(
+        "Get-Process -ErrorAction SilentlyContinue | Where-Object {{ $_.Id -ne {own_pid} -and \
+         $_.Path -eq '{exe}' }} | Stop-Process -Force -ErrorAction SilentlyContinue"
+    )
+}
+
+/// Stops the other running copies of this program, and gives them a moment to let go of the file.
+#[cfg(windows)]
+fn stop_other_copies() {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let script = stop_other_copies_script(&exe.display().to_string(), std::process::id());
+    let _ = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+    std::thread::sleep(Duration::from_millis(400));
+}
+
 fn start(program: &Path, args: &[std::ffi::OsString]) -> Result<(), String> {
     std::process::Command::new(program)
         .args(args)
@@ -814,6 +861,21 @@ fn start(program: &Path, args: &[std::ffi::OsString]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_the_script_that_stops_other_copies_names_the_file_and_spares_this_process() {
+        let script = stop_other_copies_script(
+            r"C:\Users\O'Brien\AppData\Local\Programs\EloraNotes\elora.exe",
+            4242,
+        );
+        assert!(script.contains("$_.Id -ne 4242"), "{script}");
+        // A quote in the path is doubled, so it cannot end the string early.
+        assert!(
+            script.contains(r"'C:\Users\O''Brien\AppData\Local\Programs\EloraNotes\elora.exe'"),
+            "{script}"
+        );
+        assert!(script.contains("Stop-Process -Force"));
+    }
 
     #[test]
     fn test_version_tuple_accepts_tag_prefixes_and_suffixes() {
