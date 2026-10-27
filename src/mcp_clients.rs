@@ -214,6 +214,10 @@ pub struct Report {
     pub state: State,
     /// Where its list lives: a file, or "the claude command".
     pub place: String,
+    /// It holds an entry that starts a different copy of EloraNotes than this one: an older
+    /// install, another path, a moved file. Different limits alone do not count, so a limit set
+    /// on purpose is not mistaken for something gone stale.
+    pub moved: bool,
 }
 
 /// How to reach an app's list of MCP servers.
@@ -403,6 +407,7 @@ pub fn report(env: &Environment, client: Client, launch: &Launch) -> Report {
             client,
             state: State::NotFound,
             place: String::new(),
+            moved: false,
         };
     }
     match &plan.method {
@@ -410,6 +415,7 @@ pub fn report(env: &Environment, client: Client, launch: &Launch) -> Report {
             client,
             state: State::Unavailable(plan.why_not),
             place: String::new(),
+            moved: false,
         },
         Some(Method::Json { paths, key, .. }) => Report {
             client,
@@ -424,12 +430,17 @@ pub fn report(env: &Environment, client: Client, launch: &Launch) -> Report {
                 .map(|path| path.display().to_string())
                 .collect::<Vec<_>>()
                 .join("; "),
+            moved: paths.iter().any(|path| json_moved(path, key, launch)),
         },
-        Some(Method::Cli { program, .. }) => Report {
-            client,
-            state: cli_state(env, program, launch),
-            place: format!("the {} command", program_label(program)),
-        },
+        Some(Method::Cli { program, .. }) => {
+            let (state, moved) = cli_inspect(env, program, launch);
+            Report {
+                client,
+                state,
+                place: format!("the {} command", program_label(program)),
+                moved,
+            }
+        }
     }
 }
 
@@ -518,6 +529,20 @@ fn json_state(path: &Path, key: &str, launch: &Launch) -> State {
     } else {
         State::Outdated
     }
+}
+
+/// True when the file has an EloraNotes entry that starts some other program than this copy.
+fn json_moved(path: &Path, key: &str, launch: &Launch) -> bool {
+    read_json(path)
+        .ok()
+        .and_then(|root| {
+            root.get(key)?
+                .get(SERVER_NAME)?
+                .get("command")?
+                .as_str()
+                .map(|command| command != launch.program)
+        })
+        .unwrap_or(false)
 }
 
 /// Changes the list of servers in a settings file and writes the file back, keeping everything
@@ -625,16 +650,24 @@ fn run(program: &Path, args: &[&str], limit: Duration) -> Result<CommandResult, 
 const LIMIT_FLAGS: [&str; 3] = ["--read-only", "--no-shared", "--folder"];
 
 fn cli_state(env: &Environment, program: &Path, launch: &Launch) -> State {
+    cli_inspect(env, program, launch).0
+}
+
+/// What an app's own command says about EloraNotes: its state, and whether the entry it holds
+/// starts a different copy of the program than this one.
+fn cli_inspect(env: &Environment, program: &Path, launch: &Launch) -> (State, bool) {
     match run(program, &["mcp", "get", SERVER_NAME], env.cli_timeout) {
-        Err(why) => State::Unreadable(why),
-        Ok(result) if result.timed_out => {
-            State::Unreadable("it did not answer in time".to_string())
-        }
-        Ok(result) if !result.ok => State::NotAdded,
+        Err(why) => (State::Unreadable(why), false),
+        Ok(result) if result.timed_out => (
+            State::Unreadable("it did not answer in time".to_string()),
+            false,
+        ),
+        Ok(result) if !result.ok => (State::NotAdded, false),
         Ok(result) => {
             // The app prints the command it holds, in its own layout, so it is searched for the
             // pieces of ours rather than compared as one line.
-            let has_all = result.text.contains(&launch.program)
+            let same_program = result.text.contains(&launch.program);
+            let has_all = same_program
                 && launch
                     .args
                     .iter()
@@ -643,9 +676,9 @@ fn cli_state(env: &Environment, program: &Path, launch: &Launch) -> State {
                 .iter()
                 .all(|flag| result.text.contains(flag) == launch.args.iter().any(|a| a == flag));
             if has_all && same_limits {
-                State::Added
+                (State::Added, false)
             } else {
-                State::Outdated
+                (State::Outdated, !same_program)
             }
         }
     }
@@ -854,6 +887,33 @@ mod tests {
 
     fn state(env: &Environment, client: Client, l: &Launch) -> State {
         report(env, client, l).state
+    }
+
+    #[test]
+    fn an_entry_that_starts_another_copy_is_told_apart_from_one_with_other_limits() {
+        let (env, root) = computer("moved");
+        let dir = env.config_home.join("Claude");
+        fs::create_dir_all(&dir).unwrap();
+        let l = launch(false);
+        add(&env, Client::ClaudeDesktop, &l).unwrap();
+        let here = report(&env, Client::ClaudeDesktop, &l);
+        assert_eq!((here.state, here.moved), (State::Added, false));
+
+        // Other limits make it out of date, but it still starts this very copy.
+        let limited = report(&env, Client::ClaudeDesktop, &launch(true));
+        assert_eq!((limited.state, limited.moved), (State::Outdated, false));
+
+        // EloraNotes now lives somewhere else: the entry is stale and says it moved.
+        let mut elsewhere = launch(false);
+        elsewhere.program = "/home/me/Apps/EloraNotes-0.13.0.AppImage".to_string();
+        let moved = report(&env, Client::ClaudeDesktop, &elsewhere);
+        assert_eq!((moved.state.clone(), moved.moved), (State::Outdated, true));
+
+        // Adding again points it at the new copy, and nothing is stale after that.
+        add(&env, Client::ClaudeDesktop, &elsewhere).unwrap();
+        let after = report(&env, Client::ClaudeDesktop, &elsewhere);
+        assert_eq!((after.state, after.moved), (State::Added, false));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1098,6 +1158,15 @@ esac
                 state(&env, client, &l),
                 State::Outdated,
                 "{client:?}: limits taken away"
+            );
+            // Another copy of the program is told apart from other limits.
+            let mut elsewhere = l.clone();
+            elsewhere.program = "/home/me/Apps/EloraNotes-0.13.0.AppImage".to_string();
+            let found = report(&env, client, &elsewhere);
+            assert!(found.moved, "{client:?}: the program moved");
+            assert!(
+                !report(&env, client, &l).moved,
+                "{client:?}: limits alone are not a move"
             );
 
             remove(&env, client).unwrap();

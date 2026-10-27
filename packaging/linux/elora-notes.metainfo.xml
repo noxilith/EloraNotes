@@ -25,6 +25,17 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.13.0" date="2026-10-27">
+      <description>
+        <p>
+          Updating an AI app's EloraNotes entry is easier. A few seconds after launch,
+          EloraNotes looks at your AI apps and says so if one still starts an older or different
+          copy of itself, and Settings shows those apps in a box with one Update all button.
+          Entries that only differ in limits you set are not flagged. Nothing is changed until you
+          press it.
+        </p>
+      </description>
+    </release>
     <release version="0.12.2" date="2026-10-27">
       <description>
         <p>

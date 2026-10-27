@@ -357,6 +357,7 @@ impl EloraApp {
     pub fn new(cc: &eframe::CreationContext<'_>, storage: NoteStorage) -> Self {
         let mut app = Self::with_context(&cc.egui_ctx, storage);
         app.start_update_check(&cc.egui_ctx, false);
+        app.mcp_clients.watch_at_start = true;
         // A remote keystroke asks for a frame the moment it arrives; an idle window is never
         // asked to draw on its own, so without this the other person's words would only appear
         // the next time this window happened to repaint.
@@ -4061,6 +4062,7 @@ impl eframe::App for EloraApp {
         self.track_window(ctx);
         self.handle_shortcuts(ctx);
         self.poll_update();
+        self.check_ai_apps_at_start(ctx);
         self.poll_collab(ctx);
         self.poll_picture_pick();
         self.poll_disk();

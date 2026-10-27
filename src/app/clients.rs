@@ -60,9 +60,32 @@ pub(super) struct McpClients {
     /// A computer other than this one to look at; only the tests set it.
     pub(super) environment: Option<Environment>,
     sandboxed: Option<bool>,
+    /// Look at the AI apps once, a few seconds after the window opens, and say so if one still
+    /// starts an old copy of EloraNotes. Only the real window turns this on.
+    pub(super) watch_at_start: bool,
+    started: Option<Instant>,
+    start_check: StartCheck,
+}
+
+/// Where the look at launch has got to.
+#[derive(Default, PartialEq, Eq)]
+enum StartCheck {
+    #[default]
+    Waiting,
+    Looking,
+    Done,
 }
 
 impl McpClients {
+    /// The apps that start a different copy of EloraNotes than this one.
+    fn moved(&self) -> Vec<Client> {
+        self.reports
+            .iter()
+            .filter(|report| report.moved)
+            .map(|report| report.client)
+            .collect()
+    }
+
     fn environment(&self) -> Environment {
         self.environment
             .clone()
@@ -178,6 +201,43 @@ impl McpClients {
 }
 
 impl EloraApp {
+    /// A few seconds after launch, looks at the AI apps without changing anything. If one still
+    /// starts an old copy of EloraNotes (the app was reinstalled somewhere else, or moved), says
+    /// where to fix it, so a connection that quietly stopped working is not a mystery.
+    pub(super) fn check_ai_apps_at_start(&mut self, ctx: &egui::Context) {
+        if !self.mcp_clients.watch_at_start || self.mcp_clients.start_check == StartCheck::Done {
+            return;
+        }
+        let began = *self.mcp_clients.started.get_or_insert_with(Instant::now);
+        if self.mcp_clients.start_check == StartCheck::Waiting {
+            if began.elapsed() < Duration::from_secs(4) {
+                ctx.request_repaint_after(Duration::from_secs(1));
+                return;
+            }
+            let (program, args) =
+                settings::mcp_launch_command(self.storage.root_dir(), &self.mcp_options);
+            let launch = Launch { program, args };
+            self.mcp_clients.start_scan(&launch, ctx);
+            self.mcp_clients.start_check = StartCheck::Looking;
+        }
+        if let Some(message) = self.mcp_clients.poll().into_iter().last() {
+            self.status_message = Some(message);
+        }
+        if self.mcp_clients.scan.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(300));
+            return;
+        }
+        self.mcp_clients.start_check = StartCheck::Done;
+        let moved = self.mcp_clients.moved();
+        if !moved.is_empty() {
+            let names: Vec<&str> = moved.iter().map(|client| client.name()).collect();
+            self.status_message = Some(format!(
+                "{} still starts an older or different copy of EloraNotes. Settings → AI assistants → Update fixes it.",
+                names.join(" and ")
+            ));
+        }
+    }
+
     /// Starts a scan when there is none for the command in use. The first one starts at once; a
     /// later change of options waits until it has stopped changing.
     pub(super) fn keep_mcp_clients_current(&mut self, ctx: &egui::Context, launch: &Launch) {
@@ -308,6 +368,53 @@ impl EloraApp {
         });
 
         let mut jobs: Vec<Job> = Vec::new();
+        // Apps that start another copy of EloraNotes come first, with one button for all of them.
+        let moved: Vec<Client> = found
+            .iter()
+            .filter(|report| report.moved)
+            .map(|report| report.client)
+            .collect();
+        if !moved.is_empty() {
+            egui::Frame::new()
+                .fill(p.bg_elevated)
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(Margin::same(8))
+                .show(ui, |ui| {
+                    let names: Vec<&str> = moved.iter().map(|client| client.name()).collect();
+                    ui.label(
+                        RichText::new(format!(
+                            "{} still start{} an older or different copy of EloraNotes.",
+                            names.join(", "),
+                            if names.len() == 1 { "s" } else { "" }
+                        ))
+                        .size(11.5)
+                        .color(p.fg_primary),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "Updating points them at this copy and uses the options above. \
+                             Restart each app afterwards so it loads the new one.",
+                        )
+                        .size(10.5)
+                        .color(p.fg_muted),
+                    );
+                    let label = if moved.len() == 1 {
+                        "Update it".to_string()
+                    } else {
+                        format!("Update all {}", moved.len())
+                    };
+                    if ui
+                        .add_enabled(!busy, egui::Button::new(label).small())
+                        .clicked()
+                    {
+                        jobs = moved
+                            .iter()
+                            .map(|client| Job::Mcp(*client, Task::Add))
+                            .collect();
+                    }
+                });
+            ui.add_space(4.0);
+        }
         for report in &found {
             ui.horizontal_wrapped(|ui| {
                 let name = ui.label(RichText::new(report.client.name()).strong().size(12.5));
@@ -371,12 +478,17 @@ impl EloraApp {
             .filter(|report| matches!(report.state, State::NotAdded | State::Outdated))
             .map(|report| Job::Mcp(report.client, Task::Add))
             .collect();
+        let any_missing = found.iter().any(|report| report.state == State::NotAdded);
+        let any_stale = found.iter().any(|report| report.state == State::Outdated);
+        let all_label = match (any_missing, any_stale) {
+            (true, true) => format!("Add or update all {}", to_add.len()),
+            (false, true) => format!("Update all {}", to_add.len()),
+            _ => format!("Add to all {}", to_add.len()),
+        };
         if to_add.len() > 1
+            && jobs.is_empty()
             && ui
-                .add_enabled(
-                    !busy,
-                    egui::Button::new(format!("Add to all {}", to_add.len())).small(),
-                )
+                .add_enabled(!busy, egui::Button::new(all_label).small())
                 .clicked()
         {
             jobs = to_add;
