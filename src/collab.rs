@@ -237,6 +237,13 @@ enum Command {
         id: String,
         text: String,
     },
+    /// New text for a note that has been read from the room just now, as when an assistant
+    /// rewrites it. The change is made against what the room holds, not against any copy a window
+    /// may have been showing, so rewriting a note replaces it instead of landing on top of it.
+    Replace {
+        id: String,
+        text: String,
+    },
     Cursor {
         id: String,
         byte: usize,
@@ -561,6 +568,20 @@ impl Collab {
         }
         self.sent_body = Some((id.to_string(), body.to_string()));
         self.send(Command::Body {
+            id: id.to_string(),
+            text: body.to_string(),
+        });
+    }
+
+    /// Makes the open note read `body`, whatever it held, by changing only what differs from the
+    /// text the room holds right now. For a caller that has just read the note from the room; a
+    /// window that is typing goes through `send_body`.
+    pub fn replace_body(&mut self, id: &str, body: &str) {
+        if !self.is_connected() {
+            return;
+        }
+        self.sent_body = Some((id.to_string(), body.to_string()));
+        self.send(Command::Replace {
             id: id.to_string(),
             text: body.to_string(),
         });
@@ -1021,6 +1042,21 @@ impl Session {
                     return Ok(());
                 }
                 self.apply_local(&text, events)?;
+            }
+            Command::Replace { id, text } => {
+                if self.open.as_deref() != Some(id.as_str()) || self.awaiting_room_state {
+                    return Ok(());
+                }
+                let current = self.doc_text();
+                if current != text {
+                    let (at, removed, inserted) = diff(&current, &text);
+                    let update = self.write_range(at, removed, &text[at..at + inserted]);
+                    self.send_update(update)?;
+                }
+                // What was shown before is no longer a version this text could be based on.
+                self.window = text;
+                self.recent.clear();
+                self.mirror = self.doc_text();
             }
             Command::SetName(name) => {
                 self.name = name;

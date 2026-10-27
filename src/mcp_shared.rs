@@ -178,7 +178,7 @@ impl Shared {
         };
         let new = change(&current);
         if new != current {
-            state.collab.send_body(id, &new);
+            state.collab.replace_body(id, &new);
         }
         // Commands reach the worker in order, so the change is sent before the room is left.
         state.collab.close_note();

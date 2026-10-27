@@ -155,6 +155,26 @@ fn test_the_mcp_tools_work_on_shared_library_notes() {
         "top\n\nhello\n\nfrom an assistant"
     );
 
+    // Replacing the whole text leaves the new text and nothing of the old: an assistant that
+    // rewrites a note must not find its rewrite stacked on top of the version it replaced.
+    let mut text = String::from("# Progress\n\n");
+    for step in 0..400 {
+        text.push_str(&format!("- [x] step {step} is built and tested\n"));
+    }
+    for round in 0..3 {
+        let rewritten = text.replace("step 7 ", &format!("step 7 (round {round}) "));
+        call(
+            &vault,
+            "update_note",
+            json!({ "note": "Shared", "body": rewritten }),
+        );
+        assert_eq!(
+            call(&vault, "read_note", json!({ "note": "Shared" }))["body"],
+            rewritten,
+            "round {round}"
+        );
+    }
+
     // Properties go through the server's own update.
     let set = call(
         &vault,
@@ -211,18 +231,19 @@ fn test_the_mcp_tools_work_on_shared_library_notes() {
     while Instant::now() < deadline {
         on_disk = std::fs::read_to_string(harness.server_notes.join("shared-0001.md"))
             .unwrap_or_default();
-        if on_disk.contains("from an assistant") {
+        if on_disk.contains("(round 2)") {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(on_disk.contains("from an assistant"), "{on_disk}");
+    assert!(on_disk.contains("(round 2)"), "{on_disk}");
+    assert!(!on_disk.contains("from an assistant"), "{on_disk}");
     assert!(on_disk.contains("pinned: true"), "{on_disk}");
 
     // A second person's assistant sees the same library, including what the first one wrote.
     let bob = vault_for(&harness, "bob", &[]);
     let seen = call(&bob, "read_note", json!({ "note": "Shared" }));
-    assert!(seen["body"].as_str().unwrap().contains("from an assistant"));
+    assert!(seen["body"].as_str().unwrap().contains("(round 2)"));
 
     // A note marked read-only for assistants in the settings stays untouched.
     let guarded = vault_for(&harness, "alice2", &["shared-0001"]);

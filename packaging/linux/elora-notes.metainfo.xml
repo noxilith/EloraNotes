@@ -25,6 +25,15 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.12.2" date="2026-10-27">
+      <description>
+        <p>
+          An assistant that rewrote a note in the shared library could leave its new text on top
+          of the old text instead of replacing it, so a note that was rewritten again and again
+          piled up copies of itself. A rewrite now replaces the text the library holds.
+        </p>
+      </description>
+    </release>
     <release version="0.12.1" date="2026-10-27">
       <description>
         <p>
