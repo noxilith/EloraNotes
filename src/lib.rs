@@ -20,6 +20,7 @@ pub mod mcp_shared;
 pub mod net;
 pub mod people;
 pub mod server;
+pub mod skills;
 pub mod storage;
 #[cfg(feature = "gui")]
 pub mod theme;

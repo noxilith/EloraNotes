@@ -376,6 +376,7 @@ impl EloraApp {
             args: args.clone(),
         };
         self.mcp_clients_ui(ui, p, &launch);
+        self.memory_skill_ui(ui, p, &launch);
 
         ui.add_space(4.0);
         egui::CollapsingHeader::new("Set it up by hand")

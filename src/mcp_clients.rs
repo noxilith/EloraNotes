@@ -122,7 +122,8 @@ pub fn config_home_for(sandboxed: bool, home: &Path, reported: Option<PathBuf>) 
 pub fn flatpak_grant_command(app_id: &str) -> String {
     format!(
         "flatpak override --user --filesystem=~/.config/Claude --filesystem=~/.cursor \\
-         --filesystem=~/.config/Code/User --filesystem=~/.codeium --filesystem=~/.gemini {app_id}"
+         --filesystem=~/.config/Code/User --filesystem=~/.codeium --filesystem=~/.gemini \\
+         --filesystem=~/.claude/skills:create --filesystem=~/.agents/skills:create {app_id}"
     )
 }
 
@@ -173,7 +174,7 @@ impl Environment {
         }
     }
 
-    fn find_program(&self, name: &str) -> Option<PathBuf> {
+    pub fn find_program(&self, name: &str) -> Option<PathBuf> {
         let names: Vec<String> = if self.os == Os::Windows {
             ["exe", "cmd", "bat"]
                 .iter()

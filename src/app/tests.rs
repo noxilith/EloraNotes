@@ -4247,8 +4247,8 @@ fn test_settings_finds_the_ai_apps_and_adds_the_server_to_them() {
     let launch = Launch { program, args };
     app.mcp_clients.start_work(
         vec![
-            (Client::ClaudeDesktop, clients::Task::Add),
-            (Client::Cursor, clients::Task::Add),
+            clients::Job::Mcp(Client::ClaudeDesktop, clients::Task::Add),
+            clients::Job::Mcp(Client::Cursor, clients::Task::Add),
         ],
         &launch,
         &ctx,
@@ -4301,5 +4301,77 @@ fn test_settings_explains_the_flatpak_sandbox() {
         .reports()
         .iter()
         .all(|r| r.state == crate::mcp_clients::State::NotFound));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Settings finds the apps that read skills, adds the memory skill to the ones asked for, and
+/// shows an old copy as out of date.
+#[test]
+fn test_settings_adds_the_memory_skill_where_assistants_read_it() {
+    use crate::skills::{self, Place, State};
+    let (mut app, ctx, dir) = drawable_app("memory-skill");
+    let environment = empty_computer(&dir);
+    std::fs::create_dir_all(environment.home.join(".claude")).unwrap();
+    std::fs::create_dir_all(environment.home.join(".codex")).unwrap();
+    app.mcp_clients.environment = Some(environment.clone());
+    app.show_settings = true;
+    settle_ai_apps(&mut app, &ctx);
+
+    let state_of = |app: &EloraApp, place: Place| {
+        app.mcp_clients
+            .skill_reports()
+            .iter()
+            .find(|r| r.place == place)
+            .map(|r| r.state.clone())
+            .unwrap()
+    };
+    assert_eq!(state_of(&app, Place::ClaudeCode), State::NotAdded);
+    assert_eq!(state_of(&app, Place::Shared), State::NotAdded);
+    assert!(
+        !environment.home.join(".claude/skills").exists(),
+        "looking writes nothing"
+    );
+
+    let (program, args) = settings::mcp_launch_command(app.storage.root_dir(), &app.mcp_options);
+    let launch = crate::mcp_clients::Launch { program, args };
+    app.mcp_clients.start_work(
+        vec![
+            clients::Job::Skill(Place::ClaudeCode, clients::Task::Add),
+            clients::Job::Skill(Place::Shared, clients::Task::Add),
+        ],
+        &launch,
+        &ctx,
+    );
+    settle_ai_apps(&mut app, &ctx);
+    assert_eq!(state_of(&app, Place::ClaudeCode), State::Added);
+    assert_eq!(state_of(&app, Place::Shared), State::Added);
+    for file in [
+        environment
+            .home
+            .join(".claude/skills/elora-memory/SKILL.md"),
+        environment
+            .home
+            .join(".agents/skills/elora-memory/SKILL.md"),
+    ] {
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            skills::SKILL_MD,
+            "{}",
+            file.display()
+        );
+    }
+    assert!(
+        app.status_message
+            .as_deref()
+            .is_some_and(|m| m.contains("memory skill")),
+        "{:?}",
+        app.status_message
+    );
+
+    // An older copy shows as out of date once the page looks again.
+    std::fs::write(Place::ClaudeCode.file(&environment), "an older version").unwrap();
+    app.mcp_clients.start_scan(&launch, &ctx);
+    settle_ai_apps(&mut app, &ctx);
+    assert_eq!(state_of(&app, Place::ClaudeCode), State::Outdated);
     let _ = std::fs::remove_dir_all(&dir);
 }

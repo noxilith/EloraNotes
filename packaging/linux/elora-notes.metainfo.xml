@@ -25,6 +25,16 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.12.0" date="2026-10-26">
+      <description>
+        <p>
+          New Memory bank in Settings: adds a skill that lets an AI assistant keep its long-term
+          memory in your notes, as short notes in an AI Memory folder that you can read and edit.
+          It installs for Claude Code, Codex, Gemini CLI and Cursor, and saves a .zip for Claude
+          Desktop and claude.ai.
+        </p>
+      </description>
+    </release>
     <release version="0.11.1" date="2026-10-26">
       <description>
         <p>

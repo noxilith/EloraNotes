@@ -1,6 +1,8 @@
-//! The part of Settings that finds the AI apps on this computer and adds EloraNotes to them.
+//! The part of Settings that finds the AI apps on this computer, adds EloraNotes to them as an MCP
+//! server, and gives them the memory skill.
 use super::*;
 use crate::mcp_clients::{self, Client, Environment, Launch, Report, State};
+use crate::skills::{self, Place};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 /// What a button press asks for.
@@ -10,19 +12,51 @@ pub(super) enum Task {
     Remove,
 }
 
-type Finished = Vec<(Client, Result<String, String>)>;
+/// One thing a button asks for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Job {
+    Mcp(Client, Task),
+    Skill(Place, Task),
+}
+
+/// What a press was about, so its answer is shown under the right row.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Key {
+    Mcp(Client),
+    Skill(Place),
+}
+
+impl Key {
+    fn label(self) -> String {
+        match self {
+            Key::Mcp(client) => client.name().to_string(),
+            Key::Skill(place) => format!("Memory skill for {}", place.name()),
+        }
+    }
+}
+
+/// What one look at the computer found.
+struct Scanned {
+    clients: Vec<Report>,
+    skills: Vec<skills::Report>,
+}
+
+type Finished = Vec<(Key, Result<String, String>)>;
 
 #[derive(Default)]
 pub(super) struct McpClients {
     reports: Vec<Report>,
+    skill_reports: Vec<skills::Report>,
     /// The command the reports were made for, so a change of options is noticed.
     scanned_for: Option<Launch>,
-    scan: Option<Receiver<Vec<Report>>>,
+    scan: Option<Receiver<Scanned>>,
     /// When the command last changed, so typing a folder name does not scan on every letter.
     changed_at: Option<Instant>,
     work: Option<Receiver<Finished>>,
-    /// What the last press on each app said, and whether it worked.
-    notes: HashMap<Client, (bool, String)>,
+    /// What the last press on each row said, and whether it worked.
+    notes: HashMap<Key, (bool, String)>,
+    /// What saving the skill as a ZIP said.
+    zip_note: Option<(bool, String)>,
     /// A computer other than this one to look at; only the tests set it.
     pub(super) environment: Option<Environment>,
     sandboxed: Option<bool>,
@@ -51,13 +85,21 @@ impl McpClients {
         &self.reports
     }
 
+    #[cfg(test)]
+    pub(super) fn skill_reports(&self) -> &[skills::Report] {
+        &self.skill_reports
+    }
+
     /// Looks at every app, on a thread of its own: asking an app's command what it holds can take
     /// a moment, and the window must keep drawing meanwhile.
     pub(super) fn start_scan(&mut self, launch: &Launch, wake: &egui::Context) {
         let (tx, rx) = std::sync::mpsc::channel();
         let (environment, launch_copy, wake) = (self.environment(), launch.clone(), wake.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(mcp_clients::scan(&environment, &launch_copy));
+            let _ = tx.send(Scanned {
+                clients: mcp_clients::scan(&environment, &launch_copy),
+                skills: skills::scan(&environment),
+            });
             wake.request_repaint();
         });
         self.scan = Some(rx);
@@ -65,23 +107,26 @@ impl McpClients {
         self.changed_at = None;
     }
 
-    pub(super) fn start_work(
-        &mut self,
-        jobs: Vec<(Client, Task)>,
-        launch: &Launch,
-        wake: &egui::Context,
-    ) {
+    pub(super) fn start_work(&mut self, jobs: Vec<Job>, launch: &Launch, wake: &egui::Context) {
         let (tx, rx) = std::sync::mpsc::channel();
         let (environment, launch_copy, wake) = (self.environment(), launch.clone(), wake.clone());
         std::thread::spawn(move || {
             let done: Finished = jobs
                 .into_iter()
-                .map(|(client, task)| {
-                    let result = match task {
-                        Task::Add => mcp_clients::add(&environment, client, &launch_copy),
-                        Task::Remove => mcp_clients::remove(&environment, client),
-                    };
-                    (client, result)
+                .map(|job| match job {
+                    Job::Mcp(client, Task::Add) => (
+                        Key::Mcp(client),
+                        mcp_clients::add(&environment, client, &launch_copy),
+                    ),
+                    Job::Mcp(client, Task::Remove) => {
+                        (Key::Mcp(client), mcp_clients::remove(&environment, client))
+                    }
+                    Job::Skill(place, Task::Add) => {
+                        (Key::Skill(place), skills::add(&environment, place))
+                    }
+                    Job::Skill(place, Task::Remove) => {
+                        (Key::Skill(place), skills::remove(&environment, place))
+                    }
                 })
                 .collect();
             let _ = tx.send(done);
@@ -96,8 +141,9 @@ impl McpClients {
         let mut said = Vec::new();
         if let Some(rx) = &self.scan {
             match rx.try_recv() {
-                Ok(reports) => {
-                    self.reports = reports;
+                Ok(found) => {
+                    self.reports = found.clients;
+                    self.skill_reports = found.skills;
                     self.scan = None;
                 }
                 Err(TryRecvError::Disconnected) => self.scan = None,
@@ -107,7 +153,7 @@ impl McpClients {
         if let Some(rx) = &self.work {
             match rx.try_recv() {
                 Ok(done) => {
-                    for (client, result) in done {
+                    for (key, result) in done {
                         let (ok, text) = match result {
                             Ok(text) => (true, text),
                             Err(text) => (false, text),
@@ -115,9 +161,9 @@ impl McpClients {
                         said.push(if ok {
                             text.clone()
                         } else {
-                            format!("{}: {text}", client.name())
+                            format!("{}: {text}", key.label())
                         });
-                        self.notes.insert(client, (ok, text));
+                        self.notes.insert(key, (ok, text));
                     }
                     self.work = None;
                     // What the apps hold has changed, so they are looked at again.
@@ -261,7 +307,7 @@ impl EloraApp {
             }
         });
 
-        let mut jobs: Vec<(Client, Task)> = Vec::new();
+        let mut jobs: Vec<Job> = Vec::new();
         for report in &found {
             ui.horizontal_wrapped(|ui| {
                 let name = ui.label(RichText::new(report.client.name()).strong().size(12.5));
@@ -299,16 +345,16 @@ impl EloraApp {
                     _ => (false, false, false),
                 };
                 if can_add && ui.add_enabled(!busy, egui::Button::new(RichText::new("Add").size(11.5)).small()).clicked() {
-                    jobs.push((report.client, Task::Add));
+                    jobs.push(Job::Mcp(report.client, Task::Add));
                 }
                 if can_update && ui.add_enabled(!busy, egui::Button::new(RichText::new("Update").size(11.5)).small()).clicked() {
-                    jobs.push((report.client, Task::Add));
+                    jobs.push(Job::Mcp(report.client, Task::Add));
                 }
                 if can_remove && ui.add_enabled(!busy, egui::Button::new(RichText::new("Remove").size(11.5)).small()).clicked() {
-                    jobs.push((report.client, Task::Remove));
+                    jobs.push(Job::Mcp(report.client, Task::Remove));
                 }
             });
-            if let Some((ok, text)) = self.mcp_clients.notes.get(&report.client) {
+            if let Some((ok, text)) = self.mcp_clients.notes.get(&Key::Mcp(report.client)) {
                 ui.add(
                     egui::Label::new(RichText::new(text).size(10.5).color(if *ok {
                         p.fg_secondary
@@ -320,10 +366,10 @@ impl EloraApp {
             }
         }
 
-        let to_add: Vec<(Client, Task)> = found
+        let to_add: Vec<Job> = found
             .iter()
             .filter(|report| matches!(report.state, State::NotAdded | State::Outdated))
-            .map(|report| (report.client, Task::Add))
+            .map(|report| Job::Mcp(report.client, Task::Add))
             .collect();
         if to_add.len() > 1
             && ui
@@ -343,10 +389,189 @@ impl EloraApp {
             );
         }
         if !jobs.is_empty() {
-            for (client, _) in &jobs {
-                self.mcp_clients.notes.remove(client);
+            for job in &jobs {
+                if let Job::Mcp(client, _) = job {
+                    self.mcp_clients.notes.remove(&Key::Mcp(*client));
+                }
             }
             self.mcp_clients.start_work(jobs, launch, &ctx);
+        }
+    }
+}
+
+impl EloraApp {
+    /// The "Memory bank" part of Settings → AI assistants: the skill that teaches an assistant to
+    /// use EloraNotes as its long-term memory, and the buttons that put it where assistants read it.
+    pub(super) fn memory_skill_ui(&mut self, ui: &mut egui::Ui, p: &Palette, launch: &Launch) {
+        let ctx = ui.ctx().clone();
+        let busy = self.mcp_clients.busy();
+        ui.add_space(8.0);
+        ui.label(RichText::new("Memory bank").strong());
+        ui.label(
+            RichText::new(
+                "Let an assistant remember across conversations. The memory skill teaches it to \
+                 look in EloraNotes before it starts and to save what is worth keeping, as \
+                 ordinary notes in an “AI Memory” folder that you can read, edit and delete. It \
+                 works through the connection above, so the assistant has to be added there too.",
+            )
+            .size(11.5)
+            .color(p.fg_muted),
+        );
+        if self.mcp_options.read_only {
+            ui.label(
+                RichText::new(
+                    "Read-only is on above, so an assistant could recall memories but not save any.",
+                )
+                .size(11.0)
+                .color(p.danger),
+            );
+        }
+
+        let found: Vec<skills::Report> = self
+            .mcp_clients
+            .skill_reports
+            .iter()
+            .filter(|report| report.state != skills::State::NotFound)
+            .cloned()
+            .collect();
+        let missing: Vec<&str> = self
+            .mcp_clients
+            .skill_reports
+            .iter()
+            .filter(|report| report.state == skills::State::NotFound)
+            .map(|report| report.place.name())
+            .collect();
+
+        let mut jobs: Vec<Job> = Vec::new();
+        for report in &found {
+            ui.horizontal_wrapped(|ui| {
+                let name = ui.label(RichText::new(report.place.name()).strong().size(12.5));
+                name.on_hover_text(format!("Skill file: {}", report.file.display()));
+                match &report.state {
+                    skills::State::Added => {
+                        ui.label(
+                            RichText::new(format!("{} added", icon::CHECK))
+                                .size(11.5)
+                                .color(p.accent),
+                        );
+                    }
+                    skills::State::NotAdded => {
+                        ui.label(RichText::new("not added yet").size(11.5).color(p.fg_muted));
+                    }
+                    skills::State::Outdated => {
+                        ui.label(
+                            RichText::new("added, out of date")
+                                .size(11.5)
+                                .color(p.fg_secondary),
+                        )
+                        .on_hover_text(
+                            "The skill there differs from this version of EloraNotes: it is older, or was edited. Update replaces it and keeps a copy of the old file.",
+                        );
+                    }
+                    skills::State::Unreadable(why) => {
+                        ui.label(RichText::new(why).size(11.0).color(p.fg_muted));
+                    }
+                    skills::State::NotFound => {}
+                }
+                let (can_add, can_update, can_remove) = match report.state {
+                    skills::State::NotAdded => (true, false, false),
+                    skills::State::Outdated => (false, true, true),
+                    skills::State::Added => (false, false, true),
+                    _ => (false, false, false),
+                };
+                let small = |text: &str| egui::Button::new(RichText::new(text).size(11.5)).small();
+                if can_add && ui.add_enabled(!busy, small("Add")).clicked() {
+                    jobs.push(Job::Skill(report.place, Task::Add));
+                }
+                if can_update && ui.add_enabled(!busy, small("Update")).clicked() {
+                    jobs.push(Job::Skill(report.place, Task::Add));
+                }
+                if can_remove && ui.add_enabled(!busy, small("Remove")).clicked() {
+                    jobs.push(Job::Skill(report.place, Task::Remove));
+                }
+            });
+            if let Some((ok, text)) = self.mcp_clients.notes.get(&Key::Skill(report.place)) {
+                ui.add(
+                    egui::Label::new(RichText::new(text).size(10.5).color(if *ok {
+                        p.fg_secondary
+                    } else {
+                        p.danger
+                    }))
+                    .wrap(),
+                );
+            }
+        }
+        let to_add: Vec<Job> = found
+            .iter()
+            .filter(|report| {
+                matches!(
+                    report.state,
+                    skills::State::NotAdded | skills::State::Outdated
+                )
+            })
+            .map(|report| Job::Skill(report.place, Task::Add))
+            .collect();
+        if to_add.len() > 1
+            && ui
+                .add_enabled(
+                    !busy,
+                    egui::Button::new(
+                        RichText::new(format!("Add to all {}", to_add.len())).size(11.5),
+                    )
+                    .small(),
+                )
+                .clicked()
+        {
+            jobs = to_add;
+        }
+        if !missing.is_empty() && !self.mcp_clients.skill_reports.is_empty() {
+            ui.label(
+                RichText::new(format!("Not found: {}.", missing.join(", ")))
+                    .size(10.5)
+                    .color(p.fg_muted),
+            );
+        }
+        if !jobs.is_empty() {
+            for job in &jobs {
+                if let Job::Skill(place, _) = job {
+                    self.mcp_clients.notes.remove(&Key::Skill(*place));
+                }
+            }
+            self.mcp_clients.start_work(jobs, launch, &ctx);
+        }
+
+        // Claude Desktop and claude.ai keep skills in the app, not in a folder, so they take a
+        // ZIP that is uploaded by hand.
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new("Claude Desktop and claude.ai")
+                    .strong()
+                    .size(12.5),
+            );
+            if ui
+                .add(egui::Button::new(RichText::new("Save skill as .zip").size(11.5)).small())
+                .on_hover_text("They take a skill as an uploaded file: Customize → Skills → Upload")
+                .clicked()
+            {
+                let folder = dirs::download_dir()
+                    .or_else(dirs::home_dir)
+                    .unwrap_or_default();
+                let file = folder.join("elora-memory-skill.zip");
+                self.mcp_clients.zip_note = Some(match skills::save_zip(&file) {
+                    Ok(text) => (true, text),
+                    Err(text) => (false, text),
+                });
+            }
+        });
+        if let Some((ok, text)) = &self.mcp_clients.zip_note {
+            ui.add(
+                egui::Label::new(RichText::new(text).size(10.5).color(if *ok {
+                    p.fg_secondary
+                } else {
+                    p.danger
+                }))
+                .wrap(),
+            );
         }
     }
 }
