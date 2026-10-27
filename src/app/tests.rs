@@ -1814,13 +1814,19 @@ fn test_dragging_a_picture_writes_the_size_of_the_picture_that_was_dragged() {
         &mut preview,
         &mut handles,
     );
-    let moved_to = start + Vec2::new(60.0, 0.0);
-    frame(
-        vec![egui::Event::PointerMoved(moved_to)],
-        &mut images,
-        &mut preview,
-        &mut handles,
-    );
+    // The pointer moves a little each frame, the way a hand does: the picture must keep growing
+    // rather than going back to its first size each time.
+    let mut moved_to = start;
+    for _ in 0..6 {
+        moved_to += Vec2::new(10.0, 0.0);
+        frame(
+            vec![egui::Event::PointerMoved(moved_to)],
+            &mut images,
+            &mut preview,
+            &mut handles,
+        );
+    }
+    assert_eq!(preview.image, Some((1, 460)));
     frame(
         vec![egui::Event::PointerButton {
             pos: moved_to,
@@ -4374,4 +4380,19 @@ fn test_settings_adds_the_memory_skill_where_assistants_read_it() {
     settle_ai_apps(&mut app, &ctx);
     assert_eq!(state_of(&app, Place::ClaudeCode), State::Outdated);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_dragging_a_selection_past_an_edge_scrolls_that_way() {
+    let dt = 1.0 / 60.0;
+    // Inside the note, away from the edges: nothing moves.
+    assert_eq!(drag_scroll_step(300.0, 100.0, 500.0, dt), 0.0);
+    // Above the top the text moves down (towards its start), and faster the further out.
+    let near = drag_scroll_step(95.0, 100.0, 500.0, dt);
+    let far = drag_scroll_step(0.0, 100.0, 500.0, dt);
+    assert!(near > 0.0 && far > near);
+    // Below the bottom it moves the other way.
+    assert!(drag_scroll_step(560.0, 100.0, 500.0, dt) < 0.0);
+    // However far out, it is held to a top speed.
+    assert!(drag_scroll_step(-100000.0, 100.0, 500.0, dt) <= 1800.0 * dt + 0.001);
 }

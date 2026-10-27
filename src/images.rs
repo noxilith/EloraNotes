@@ -117,8 +117,9 @@ fn decode_percent(text: &str) -> String {
 /// A size a picture is being dragged to, before the drag is written into the note.
 struct Resizing {
     key: String,
-    /// Width when the drag started, so the handle follows the pointer from where it was grabbed.
-    start: f32,
+    /// Where the drag has taken the width so far, before it is held between the smallest and the
+    /// room there is; the pointer's movement adds up here frame by frame.
+    raw: f32,
     width: f32,
 }
 
@@ -250,7 +251,7 @@ impl NoteImages {
         if grab.drag_started() {
             self.resizing = Some(Resizing {
                 key: key.clone(),
-                start: size.x,
+                raw: size.x,
                 width: size.x,
             });
         }
@@ -260,7 +261,10 @@ impl NoteImages {
         let mut kept = None;
         if let Some(resizing) = self.resizing.as_mut().filter(|r| r.key == key) {
             if grab.dragged() {
-                resizing.width = (resizing.start + grab.drag_delta().x).clamp(MIN_WIDTH, available);
+                // `drag_delta` is the movement since the last frame, so it is added up: using it
+                // alone would send the picture back to its first size on every frame.
+                resizing.raw += grab.drag_delta().x;
+                resizing.width = resizing.raw.clamp(MIN_WIDTH, available);
                 let rounded = resizing.width.round().max(MIN_WIDTH) as u32;
                 if width != Some(rounded) {
                     kept = Some(rounded);

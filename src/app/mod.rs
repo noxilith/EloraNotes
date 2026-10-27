@@ -4228,6 +4228,49 @@ fn caret_chip(top: Pos2, line_height: f32, size: Vec2, clip: Rect) -> Rect {
     chip
 }
 
+/// Selecting with the mouse and pulling past the top or bottom of the note keeps the note
+/// scrolling that way for as long as the button is held, in the editor and in the preview alike.
+/// egui only scrolls to a selection when it changes, so a held pointer used to stop.
+fn scroll_while_selecting(ui: &mut Ui) {
+    let (pointer, pressed_at, down, dt) = ui.input(|i| {
+        (
+            i.pointer.latest_pos(),
+            i.pointer.press_origin(),
+            i.pointer.primary_down(),
+            i.stable_dt,
+        )
+    });
+    let clip = ui.clip_rect();
+    // The press has to start in the text, not on the scroll bar at the right edge.
+    let in_text = pressed_at.is_some_and(|at| {
+        clip.contains(at) && at.x < clip.right() - 16.0 && ui.ctx().dragged_id().is_some()
+    });
+    if let (true, true, Some(pointer)) = (down, in_text, pointer) {
+        let step = drag_scroll_step(pointer.y, clip.top(), clip.bottom(), dt);
+        if step != 0.0 {
+            ui.scroll_with_delta(Vec2::new(0.0, step));
+            ui.ctx().request_repaint();
+        }
+    }
+}
+
+/// How far to scroll this frame while a selection is being dragged at `pointer_y`: positive moves
+/// the text down (towards its top), negative moves it up. Nothing happens until the pointer is
+/// within a band of the edge or past it; beyond that the speed grows with the distance.
+fn drag_scroll_step(pointer_y: f32, top: f32, bottom: f32, dt: f32) -> f32 {
+    const BAND: f32 = 24.0;
+    const PER_POINT: f32 = 12.0;
+    const FASTEST: f32 = 1800.0;
+    let speed = |distance: f32| ((distance + BAND) * PER_POINT).clamp(0.0, FASTEST) * dt;
+    if pointer_y < top + BAND {
+        speed(top - pointer_y)
+    } else if pointer_y > bottom - BAND {
+        -speed(pointer_y - bottom)
+    } else {
+        0.0
+    }
+}
+
 /// A note's vertical scroll area. The area itself is allowed to reach `bar_extra` points further
 /// right than the text it holds, so the scroll bar sits against the window's edge while the text
 /// keeps the column's inset.
@@ -4246,6 +4289,7 @@ fn note_scroll(
             .show(ui, |ui| {
                 ui.set_max_width(content_width);
                 add(ui);
+                scroll_while_selecting(ui);
             })
     })
     .inner

@@ -25,6 +25,15 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.12.1" date="2026-10-27">
+      <description>
+        <p>
+          Dragging a picture's corner in Preview no longer snaps it back to its original size:
+          it now follows the pointer. Selecting text and pulling past the top or bottom of a note
+          now keeps scrolling while the button is held, in the editor and in Preview.
+        </p>
+      </description>
+    </release>
     <release version="0.12.0" date="2026-10-26">
       <description>
         <p>
