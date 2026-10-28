@@ -25,6 +25,8 @@ use std::time::Duration;
 /// The name the two ends use to agree they are speaking this protocol.
 const ALPN: &[u8] = b"elora-notes/share/1";
 const LINK_PREFIX: &str = "elora://share/";
+/// The page that opens a link in the app, for places where `elora://` cannot be clicked.
+const WEB_PREFIX: &str = "https://noxilith.github.io/join/#";
 
 /// How devices find each other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,17 +68,20 @@ impl Ticket {
         )
     }
 
-    /// Reads a link pasted by a person: spaces and line breaks around it do not matter.
+    /// The same link as a web address that works when clicked in a browser, a chat or an email:
+    /// a small page on the docs site hands it to the app. What follows the `#` is never sent to
+    /// any server, so the secret in it stays between the page's own script and the person.
+    pub fn to_web_link(&self) -> String {
+        let link = self.to_link();
+        format!("{WEB_PREFIX}{}", &link[LINK_PREFIX.len()..])
+    }
+
+    /// Reads a link pasted by a person. Either form works, spaces and line breaks around it do
+    /// not matter, and so does the sentence it was pasted in.
     pub fn from_link(link: &str) -> Result<Self, String> {
-        let link = link.trim();
-        let body = link
-            .get(..LINK_PREFIX.len())
-            .filter(|head| head.eq_ignore_ascii_case(LINK_PREFIX))
-            .map(|_| &link[LINK_PREFIX.len()..])
-            .ok_or("that is not an EloraNotes share link")?;
-        let clean: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        let body = payload_in(link).ok_or("that is not an EloraNotes share link")?;
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(clean)
+            .decode(body)
             .map_err(|_| "that share link is damaged: copy it again")?;
         let ticket: Ticket = serde_json::from_slice(&bytes)
             .map_err(|_| "that share link is damaged: copy it again")?;
@@ -85,6 +90,31 @@ impl Ticket {
         }
         Ok(ticket)
     }
+}
+
+/// The part of a share link that carries the ticket, wherever it sits in `text`.
+fn payload_in(text: &str) -> Option<&str> {
+    let lower = text.to_ascii_lowercase();
+    let start = if let Some(at) = lower.find(LINK_PREFIX) {
+        at + LINK_PREFIX.len()
+    } else {
+        lower.find(WEB_PREFIX).map(|at| at + WEB_PREFIX.len())?
+    };
+    let rest = &text[start..];
+    // The ticket is letters, digits, dashes and underscores; whatever follows (a full stop at the
+    // end of a sentence, a bracket) is not part of it.
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .unwrap_or(rest.len());
+    (end > 0).then(|| &rest[..end])
+}
+
+/// The first share link in `text`, in the form the app uses (`elora://share/…`), or `None`.
+/// Used on command-line arguments and on whatever is on the clipboard.
+pub fn find_link(text: &str) -> Option<String> {
+    let payload = payload_in(text)?;
+    let link = format!("{LINK_PREFIX}{payload}");
+    Ticket::from_link(&link).ok().map(|_| link)
 }
 
 fn secret() -> String {
@@ -129,6 +159,8 @@ pub struct ShareHost {
     local: ServerProfile,
     edit_link: String,
     view_link: String,
+    edit_web: String,
+    view_web: String,
 }
 
 impl ShareHost {
@@ -239,6 +271,8 @@ impl ShareHost {
             },
             edit_link: ticket(&edit_pw, false).to_link(),
             view_link: ticket(&view_pw, true).to_link(),
+            edit_web: ticket(&edit_pw, false).to_web_link(),
+            view_web: ticket(&view_pw, true).to_web_link(),
             dir,
         })
     }
@@ -248,6 +282,14 @@ impl ShareHost {
         match access {
             Access::Edit => &self.edit_link,
             Access::View => &self.view_link,
+        }
+    }
+
+    /// The link for the kind of access given, as a web address that can be clicked anywhere.
+    pub fn web_link(&self, access: Access) -> &str {
+        match access {
+            Access::Edit => &self.edit_web,
+            Access::View => &self.view_web,
         }
     }
 

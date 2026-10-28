@@ -60,6 +60,23 @@ fn test_a_link_is_read_back_and_junk_is_refused() {
         "watching and editing have different secrets"
     );
     assert_eq!(edit.fp, view.fp);
+    // The web form carries the same ticket, and so do links inside a sentence.
+    let web = host.web_link(Access::Edit);
+    assert!(
+        web.starts_with("https://noxilith.github.io/join/#"),
+        "{web}"
+    );
+    assert_eq!(Ticket::from_link(web).unwrap().pw, edit.pw);
+    let sentence = format!("Join my note: {} (it is live!)", host.link(Access::View));
+    assert_eq!(Ticket::from_link(&sentence).unwrap().pw, view.pw);
+    let found = elora_notes::share::find_link(&sentence).unwrap();
+    assert_eq!(found, host.link(Access::View));
+    assert_eq!(
+        elora_notes::share::find_link(&format!("{web}.")).unwrap(),
+        host.link(Access::Edit)
+    );
+    assert!(elora_notes::share::find_link("no link here").is_none());
+    assert!(elora_notes::share::find_link("elora://share/not-a-ticket").is_none());
     // Spaces and line breaks around a pasted link do not matter.
     let wrapped = format!("  {}\n", host.link(Access::Edit));
     assert!(Ticket::from_link(&wrapped).is_ok());

@@ -57,6 +57,12 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 Source: "..\..\target\release\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
 
+[Registry]
+; Opens share links: elora://share/... starts the app with the link as its argument.
+Root: HKCU; Subkey: "Software\Classes\elora"; ValueType: string; ValueData: "URL:EloraNotes share link"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\elora"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""
+Root: HKCU; Subkey: "Software\Classes\elora\shell\open\command"; ValueType: string; ValueData: """{app}\{#AppExe}"" ""%1"""
+
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; IconFilename: "{app}\{#AppExe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; IconFilename: "{app}\{#AppExe}"; Tasks: desktopicon

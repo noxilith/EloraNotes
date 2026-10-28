@@ -4735,3 +4735,39 @@ fn test_a_note_is_shared_by_link_and_edited_from_both_ends() {
     draw(&ctx, |ctx| app.share_windows(ctx));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Opening the program with a share link (a click on it) joins the note without anything else.
+#[test]
+fn test_a_link_the_program_is_opened_with_joins_its_note() {
+    use crate::share::{Access, Network, ShareHost};
+    let (mut app, ctx, dir) = drawable_app("open-with-link");
+    app.shares.network_override = Some(Network::Loopback);
+    let host = ShareHost::start(
+        "Opened by a click",
+        "hello from the host",
+        Network::Loopback,
+    )
+    .unwrap();
+    // Both forms of the link work, as does a sentence around one.
+    app.open_link(format!("Join me: {}", host.web_link(Access::Edit)));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        app.poll_shares(&ctx);
+        if let Some(id) = app.shares.joined_ids.iter().next().cloned() {
+            if app.shares.sessions[&id].ready {
+                let note = app.notes.iter().find(|n| n.id == id).unwrap();
+                assert_eq!(note.title, "Opened by a click");
+                assert_eq!(note.body, "hello from the host");
+                assert_eq!(app.selected_id.as_deref(), Some(id.as_str()));
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "never joined: {:?}",
+            app.shares.message
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

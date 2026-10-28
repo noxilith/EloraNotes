@@ -63,6 +63,11 @@ pub(super) struct Shares {
     pub(super) message: Option<String>,
     /// Tests share over this computer only, with no network.
     pub(super) network_override: Option<Network>,
+    /// Links other copies of the program handed over, and links the program was started with.
+    inbox: Option<crate::links::LinkInbox>,
+    queued: Vec<String>,
+    /// Whether the Join window has already looked at the clipboard for a link.
+    join_checked: bool,
 }
 
 fn random_hex(bytes: usize) -> String {
@@ -72,6 +77,26 @@ fn random_hex(bytes: usize) -> String {
 }
 
 impl EloraApp {
+    /// Starts listening for links handed over by other copies of the program.
+    pub(super) fn listen_for_links(&mut self, ctx: &egui::Context) {
+        let repaint = ctx.clone();
+        self.shares.inbox = Some(crate::links::listen(move || repaint.request_repaint()));
+    }
+
+    /// A share link the program was opened with: it joins as soon as the window is up.
+    pub fn open_link(&mut self, link: String) {
+        self.shares.queued.push(link);
+    }
+
+    /// Joins the note a link shares, bringing the window to the front.
+    fn receive_link(&mut self, ctx: &egui::Context, link: String) {
+        self.shares.join_text = link;
+        self.shares.join_open = true;
+        self.shares.join_checked = true;
+        self.join_link();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
     /// True when typing into this note must not change it right now: a note somebody lets you
     /// only watch, or one whose text has not arrived yet.
     pub(super) fn session_blocks_editing(&self, id: &str) -> bool {
@@ -208,12 +233,20 @@ impl EloraApp {
             self.view_mode = EditorViewMode::Preview;
         }
         self.shares.join_open = false;
+        self.shares.join_checked = false;
         self.shares.join_text.clear();
     }
 
     /// Once a frame: finish what was being started, and bring each shared note up to date with
     /// what the other people have typed.
     pub(super) fn poll_shares(&mut self, ctx: &egui::Context) {
+        let mut arrived = std::mem::take(&mut self.shares.queued);
+        if let Some(inbox) = &self.shares.inbox {
+            arrived.extend(inbox.take());
+        }
+        for link in arrived {
+            self.receive_link(ctx, link);
+        }
         if let Some((id, rx)) = self.shares.starting.take() {
             match rx.try_recv() {
                 Ok(Ok(host)) => self.begin_hosting(id, host),
@@ -354,6 +387,14 @@ impl EloraApp {
             }
         }
 
+        if self.shares.join_open && !self.shares.join_checked {
+            self.shares.join_checked = true;
+            if self.shares.join_text.trim().is_empty() {
+                if let Some(link) = crate::links::link_on_clipboard() {
+                    self.shares.join_text = link;
+                }
+            }
+        }
         if self.shares.join_open {
             let mut open = true;
             egui::Window::new("Join a shared note")
@@ -395,6 +436,7 @@ impl EloraApp {
                 });
             if !open {
                 self.shares.join_open = false;
+                self.shares.join_checked = false;
             }
         }
     }
@@ -429,7 +471,8 @@ impl EloraApp {
             let Role::Hosting { host } = &session.role else {
                 return;
             };
-            let link = host.link(access).to_string();
+            let link = host.web_link(access).to_string();
+            let app_link = host.link(access).to_string();
             let connected = session.connected;
             let error = session.error.clone();
             let people: Vec<(String, [u8; 3])> = session
@@ -454,6 +497,14 @@ impl EloraApp {
                 if ui.button(format!("{}  Copy link", icon::COPY)).clicked() {
                     ui.ctx().copy_text(link.clone());
                     self.status_message = Some("Copied the share link".to_string());
+                }
+                if ui
+                    .button("Copy app link")
+                    .on_hover_text("The elora:// form, which opens EloraNotes directly")
+                    .clicked()
+                {
+                    ui.ctx().copy_text(app_link.clone());
+                    self.status_message = Some("Copied the elora:// link".to_string());
                 }
                 if ui.button("Stop sharing").clicked() {
                     self.stop_sharing(&id);

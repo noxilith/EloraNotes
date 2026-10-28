@@ -25,6 +25,17 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.15.1" date="2026-10-29">
+      <description>
+        <p>
+          Share links now open EloraNotes. Clicking or pasting an elora:// link starts the app (or
+          hands the link to the copy already running) and joins the shared note straight away. The
+          app registers the link type when it starts, and the installers do too. The Share window
+          now copies a web link that also works in chats and opens the app, with Copy app link for
+          the plain one. Join a Shared Note also fills itself from a link on the clipboard.
+        </p>
+      </description>
+    </release>
     <release version="0.15.0" date="2026-10-29">
       <description>
         <p>

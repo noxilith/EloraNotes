@@ -15,6 +15,8 @@ pub mod icon_names;
 pub mod icons;
 #[cfg(feature = "gui")]
 pub mod images;
+#[cfg(feature = "share")]
+pub mod links;
 pub mod live;
 #[cfg(feature = "gui")]
 pub mod markdown;

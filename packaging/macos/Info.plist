@@ -24,6 +24,17 @@
   <string>11.0</string>
   <key>LSApplicationCategoryType</key>
   <string>public.app-category.productivity</string>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key>
+      <string>EloraNotes share link</string>
+      <key>CFBundleURLSchemes</key>
+      <array>
+        <string>elora</string>
+      </array>
+    </dict>
+  </array>
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSHumanReadableCopyright</key>

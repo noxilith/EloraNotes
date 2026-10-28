@@ -23,6 +23,16 @@ fn main() -> eframe::Result<()> {
         }
         return Ok(());
     }
+    // Started from a share link (a click on elora://… or the page that hands it over): if a copy is
+    // already running it takes the link, and this one has nothing more to do.
+    let launch_link = elora_notes::links::link_in_args(std::env::args().skip(1));
+    if let Some(link) = &launch_link {
+        if elora_notes::links::forward(link) {
+            return Ok(());
+        }
+    }
+    // Tell the system that this program opens elora:// links; quick, and on its own thread.
+    std::thread::spawn(elora_notes::links::register_scheme);
     let uses_default_dir = cli_dir.is_none();
     let notes_dir = cli_dir.unwrap_or_else(NoteStorage::default_notes_dir);
     let storage = NoteStorage::new(notes_dir).expect("Failed to initialize EloraNotes directory");
@@ -75,7 +85,13 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "EloraNotes",
         native_options,
-        Box::new(|cc| Ok(Box::new(EloraApp::new(cc, storage)))),
+        Box::new(move |cc| {
+            let mut app = EloraApp::new(cc, storage);
+            if let Some(link) = launch_link {
+                app.open_link(link);
+            }
+            Ok(Box::new(app))
+        }),
     )
 }
 

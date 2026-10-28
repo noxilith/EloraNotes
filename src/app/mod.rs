@@ -365,6 +365,7 @@ impl EloraApp {
     pub fn new(cc: &eframe::CreationContext<'_>, storage: NoteStorage) -> Self {
         let mut app = Self::with_context(&cc.egui_ctx, storage);
         app.start_update_check(&cc.egui_ctx, false);
+        app.listen_for_links(&cc.egui_ctx);
         app.mcp_clients.watch_at_start = true;
         // A remote keystroke asks for a frame the moment it arrives; an idle window is never
         // asked to draw on its own, so without this the other person's words would only appear
