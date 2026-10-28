@@ -289,34 +289,34 @@ final class CaretTextView: UITextView {
 /// One other person's caret: a thin bar in their colour with their name on a tag above it.
 final class PeerCaret: UIView {
     private let bar = UIView()
-    private let tag = UILabel()
+    private let nameLabel = UILabel()
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         isUserInteractionEnabled = false
         addSubview(bar)
-        tag.font = .systemFont(ofSize: 10, weight: .semibold)
-        tag.textColor = .white
-        tag.textAlignment = .center
-        tag.layer.cornerRadius = 4
-        tag.layer.masksToBounds = true
-        addSubview(tag)
+        nameLabel.font = .systemFont(ofSize: 10, weight: .semibold)
+        nameLabel.textColor = .white
+        nameLabel.textAlignment = .center
+        nameLabel.layer.cornerRadius = 4
+        nameLabel.layer.masksToBounds = true
+        addSubview(nameLabel)
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
 
     func show(name: String, color: UIColor, at rect: CGRect, typing: Bool, within width: CGFloat) {
         bar.backgroundColor = color
-        tag.backgroundColor = color
-        tag.text = " \(name) "
-        tag.sizeToFit()
-        var tagFrame = tag.frame
+        nameLabel.backgroundColor = color
+        nameLabel.text = " \(name) "
+        nameLabel.sizeToFit()
+        var tagFrame = nameLabel.frame
         tagFrame.size.height = 15
         // The tag sits above the caret, or below it when the caret is on the first line.
         tagFrame.origin = CGPoint(x: 0, y: rect.minY < 18 ? rect.height + 1 : -16)
         let barWidth: CGFloat = typing ? 3 : 2
         frame = CGRect(x: min(rect.minX, max(0, width - tagFrame.width)), y: rect.minY, width: max(tagFrame.width, barWidth), height: rect.height)
         bar.frame = CGRect(x: rect.minX - frame.minX, y: 0, width: barWidth, height: rect.height)
-        tag.frame = tagFrame
+        nameLabel.frame = tagFrame
     }
 }
