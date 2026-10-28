@@ -19,6 +19,8 @@ struct NoteListView: View {
     @State private var showSettings = false
     @State private var showNew = false
     @State private var showGraph = false
+    @State private var showTrash = false
+    @State private var moving: NoteSummary?
     @State private var path: [String] = []
 
     private var searching: Bool {
@@ -87,6 +89,16 @@ struct NoteListView: View {
                 case "graph": showGraph = true
                 case "settings": showSettings = true
                 case "search": query = "slime"
+                case "trash":
+                    // Screenshots only: delete a note, then open the trash.
+                    Task {
+                        if let note = library.notes.first(where: { $0.title == "Slime Combat" }) {
+                            await library.trash([note.id])
+                        }
+                        showTrash = true
+                    }
+                case "folder":
+                    moving = library.notes.first(where: { $0.title == "Slime Combat" })
                 case "note", "edit":
                     if let note = library.notes.first(where: { $0.title == "Slime Combat" }) {
                         path.append(note.id)
@@ -100,6 +112,28 @@ struct NoteListView: View {
             .sheet(isPresented: $showNew) {
                 NewNoteView { id in path.append(id) }
             }
+            .sheet(isPresented: $showTrash) {
+                TrashView()
+            }
+            .sheet(item: $moving) { note in
+                FolderSheet(note: note)
+            }
+            .overlay(alignment: .bottom) {
+                if let notice = library.notice {
+                    Text(notice)
+                        .font(AppFont.body(15))
+                        .foregroundStyle(palette.fgPrimary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                        .background(palette.elevated, in: RoundedRectangle(cornerRadius: 12))
+                        .overlay(RoundedRectangle(cornerRadius: 12).stroke(palette.border, lineWidth: 1))
+                        .padding(.horizontal, 24)
+                        .padding(.bottom, 74)
+                        .transition(.opacity)
+                }
+            }
+            .animation(.easeInOut(duration: 0.2), value: library.notice)
             .overlay {
                 if library.loading && library.notes.isEmpty {
                     ProgressView()
@@ -180,6 +214,12 @@ struct NoteListView: View {
                 Glyph(Icon.graph, size: 22, color: palette.fgSecondary)
             }
             .accessibilityLabel("Graph")
+            Button {
+                showTrash = true
+            } label: {
+                Glyph(Icon.named("trash"), size: 22, color: palette.fgSecondary)
+            }
+            .accessibilityLabel("Trash")
             Button {
                 showSettings = true
             } label: {
@@ -278,6 +318,23 @@ struct NoteListView: View {
                 NoteRow(note: note, showPreview: showPreviews)
             }
             .buttonStyle(.plain)
+            .contextMenu {
+                Button {
+                    moving = note
+                } label: {
+                    Label(note.folder == nil ? "Add to a folder…" : "Change folder…", systemImage: "folder")
+                }
+                Button {
+                    Task { await library.copy(note) }
+                } label: {
+                    Label(note.shared ? "Copy to this phone" : "Make a copy", systemImage: "doc.on.doc")
+                }
+                Button(role: .destructive) {
+                    Task { await library.trash([note.id]) }
+                } label: {
+                    Label("Delete", systemImage: "trash")
+                }
+            }
             .listRowInsets(inset(indent))
             .listRowBackground(Color.clear)
             .listRowSeparator(.hidden)

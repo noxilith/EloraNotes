@@ -18,6 +18,10 @@ final class Library: ObservableObject {
     @Published var serverConfigured = false
     /// The shared library's name, once connected: the title of its folder in the list.
     @Published var serverName: String?
+    /// Notes in the trash, as last loaded.
+    @Published var trashed: [NoteSummary] = []
+    /// A short message after something was done, which goes away by itself.
+    @Published var notice: String?
     /// Folders the person has collapsed, kept between launches.
     @Published var collapsed: Set<String> = Set(
         UserDefaults.standard.stringArray(forKey: "collapsedFolders") ?? [])
@@ -124,9 +128,73 @@ final class Library: ObservableObject {
             do {
                 try await run { try $0.trashNote(id: id) }
                 notes.removeAll { $0.id == id }
+                showNotice("Moved to the trash. The trash button at the bottom brings it back.")
             } catch {
                 problem = describe(error)
             }
+        }
+    }
+
+    func showNotice(_ text: String) {
+        notice = text
+        Task {
+            try? await Task.sleep(nanoseconds: 3_500_000_000)
+            if notice == text { notice = nil }
+        }
+    }
+
+    /// The folders in use, on this phone or in the shared library, A to Z.
+    func folderNames(shared: Bool) -> [String] {
+        Set(notes.filter { $0.shared == shared }.compactMap { $0.folder }.filter { !$0.isEmpty })
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    func setFolder(_ id: String, to folder: String?) async {
+        do {
+            let summary = try await run { try $0.setFolder(id: id, folder: folder) }
+            replace(summary)
+            showNotice(summary.folder.map { "Moved to \($0)" } ?? "Taken out of its folder")
+        } catch {
+            problem = describe(error)
+        }
+    }
+
+    /// A copy on this phone: of a note here, or of a shared note.
+    @discardableResult
+    func copy(_ note: NoteSummary) async -> NoteSummary? {
+        do {
+            let made = try await run { try $0.copyNote(id: note.id) }
+            replace(made)
+            showNotice(note.shared ? "Copied to this phone as “\(made.title)”" : "Made “\(made.title)”")
+            return made
+        } catch {
+            problem = describe(error)
+            return nil
+        }
+    }
+
+    func loadTrash() async {
+        let list = try? await run { $0.listTrash() }
+        trashed = list?.notes ?? []
+    }
+
+    func restore(_ id: String) async {
+        do {
+            try await run { try $0.restoreNote(id: id) }
+            trashed.removeAll { $0.id == id }
+            await refresh()
+            showNotice("Restored")
+        } catch {
+            problem = describe(error)
+        }
+    }
+
+    func deleteForever(_ id: String) async {
+        do {
+            try await run { try $0.deleteForever(id: id) }
+            trashed.removeAll { $0.id == id }
+        } catch {
+            problem = describe(error)
         }
     }
 

@@ -82,7 +82,7 @@ jobs:
             list:Paper: graph:Paper: note:Paper: \
             list:Nordic: graph:Nordic: list:Matcha: graph:Matcha: \
             list:Sepia: graph:Sepia: list:Midnight: graph:Midnight: \
-            list:Obsidian:previews edit:Obsidian: edit:Paper:
+            list:Obsidian:previews edit:Obsidian: edit:Paper: trash:Obsidian: folder:Obsidian:
           do
             screen=${shot%%:*}; rest=${shot#*:}; theme=${rest%%:*}; extra=${rest#*:}
             args="-EloraDemo YES -EloraDemoShared YES -EloraDemoScreen $screen -EloraTheme $theme"

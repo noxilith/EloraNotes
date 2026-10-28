@@ -8,7 +8,7 @@
 use elora_notes::collab::ServerProfile;
 use elora_notes::graph_layout::{GraphNode, GraphView};
 use elora_notes::live::LiveNote;
-use elora_notes::mcp_shared::{is_shared, note_from_meta, NewNote, Shared};
+use elora_notes::mcp_shared::{is_shared, meta_with, note_from_meta, NewNote, Shared};
 use elora_notes::net::NoteMeta;
 use elora_notes::storage::{extract_wiki_links, AppSettings, Note, NoteStorage};
 use std::collections::HashMap;
@@ -306,7 +306,8 @@ impl Vault {
             .map(ServerSettings::app_settings)
     }
 
-    fn shared_notes(&self) -> Result<Vec<Note>, String> {
+    /// The shared library's notes: the ones in the trash when `trashed`, the others when not.
+    fn shared_notes(&self, trashed: bool) -> Result<Vec<Note>, String> {
         let Some(settings) = self.settings() else {
             return Ok(Vec::new());
         };
@@ -319,7 +320,7 @@ impl Vault {
         Ok(library
             .unwrap_or_default()
             .iter()
-            .filter(|meta| !meta.trashed)
+            .filter(|meta| meta.trashed == trashed)
             .map(|meta| {
                 let body = lock(&self.read)
                     .get(&meta.id)
@@ -338,7 +339,7 @@ impl Vault {
             .filter(|n| !n.trashed)
             .cloned()
             .collect();
-        match self.shared_notes() {
+        match self.shared_notes(false) {
             Ok(shared) => {
                 notes.extend(shared);
                 (notes, None)
@@ -688,6 +689,138 @@ impl Vault {
         }
     }
 
+    /// Moves a note into a folder (or out of its folder with `None`).
+    pub fn set_folder(&self, id: String, folder: Option<String>) -> Result<NoteSummary, CoreError> {
+        let folder = folder.and_then(|name| elora_notes::storage::normalize_folder(&name));
+        {
+            let mut local = lock(&self.local);
+            if let Some(index) = local.notes.iter().position(|n| n.id == id) {
+                local.notes[index].folder = folder;
+                local.notes[index].updated_at = chrono::Utc::now();
+                let note = local.notes[index].clone();
+                local.storage.save_note(&note).map_err(failed)?;
+                return Ok(summary_of(&note));
+            }
+        }
+        let settings = self
+            .settings()
+            .ok_or_else(|| failed("that note is not on this phone"))?;
+        let meta = self.meta_of(&id)?;
+        let mut note = note_from_meta(&meta, String::new());
+        note.folder = folder;
+        let wanted = meta_with(&meta, &note);
+        let saved = self
+            .worker
+            .run(move |shared| shared.update(&settings, &wanted))?
+            .map_err(failed)?;
+        Ok(summary_of(&note_from_meta(&saved, String::new())))
+    }
+
+    /// Makes a copy on this phone: of a note here, or of a shared note, which brings it down from
+    /// the server. The copy is named after the note and ends in "copy".
+    pub fn copy_note(&self, id: String) -> Result<NoteSummary, CoreError> {
+        let (notes, _) = self.all_notes();
+        let source = notes
+            .into_iter()
+            .find(|n| n.id == id)
+            .ok_or_else(|| failed("that note no longer exists"))?;
+        let body = if is_shared(&source) {
+            let settings = self
+                .settings()
+                .ok_or_else(|| failed("no shared library is set up"))?;
+            let wanted = id.clone();
+            self.worker
+                .run(move |shared| shared.read_body(&settings, &wanted))?
+                .map_err(failed)?
+        } else {
+            source.body.clone()
+        };
+        let mut local = lock(&self.local);
+        let taken: Vec<String> = local
+            .notes
+            .iter()
+            .map(|n| n.display_title().to_lowercase())
+            .collect();
+        let base = source.display_title();
+        let mut title = format!("{base} copy");
+        let mut number = 2;
+        while taken.contains(&title.to_lowercase()) {
+            title = format!("{base} copy {number}");
+            number += 1;
+        }
+        let mut copy = Note::new(title, body, local.storage.root_dir());
+        copy.folder = source.folder.clone();
+        copy.explicit_tags = source.explicit_tags.clone();
+        copy.icon = source.icon.clone();
+        local.storage.save_note(&copy).map_err(failed)?;
+        let made = summary_of(&copy);
+        local.notes.push(copy);
+        Ok(made)
+    }
+
+    /// The notes in the trash, on this phone and in the shared library, newest first.
+    pub fn list_trash(&self) -> NoteList {
+        let mut notes: Vec<Note> = lock(&self.local)
+            .notes
+            .iter()
+            .filter(|n| n.trashed)
+            .cloned()
+            .collect();
+        let mut shared_error = None;
+        match self.shared_notes(true) {
+            Ok(shared) => notes.extend(shared),
+            Err(why) => shared_error = Some(why),
+        }
+        let mut notes: Vec<NoteSummary> = notes.iter().map(summary_of).collect();
+        newest_first(&mut notes);
+        NoteList {
+            notes,
+            shared_error,
+            server_name: lock(&self.server_name).clone(),
+        }
+    }
+
+    /// Takes a note out of the trash.
+    pub fn restore_note(&self, id: String) -> Result<(), CoreError> {
+        {
+            let mut local = lock(&self.local);
+            if let Some(index) = local.notes.iter().position(|n| n.id == id) {
+                local.notes[index].trashed = false;
+                let note = local.notes[index].clone();
+                local.storage.save_note(&note).map_err(failed)?;
+                return Ok(());
+            }
+        }
+        let settings = self
+            .settings()
+            .ok_or_else(|| failed("that note is not on this phone"))?;
+        let mut meta = self.meta_of(&id)?;
+        meta.trashed = false;
+        self.worker
+            .run(move |shared| shared.update(&settings, &meta).map(|_| ()))?
+            .map_err(failed)
+    }
+
+    /// Deletes a note for good. A note in the shared library is gone for everybody.
+    pub fn delete_forever(&self, id: String) -> Result<(), CoreError> {
+        {
+            let mut local = lock(&self.local);
+            if let Some(index) = local.notes.iter().position(|n| n.id == id) {
+                let note = local.notes.remove(index);
+                return local.storage.delete_note(&note).map_err(failed);
+            }
+        }
+        let settings = self
+            .settings()
+            .ok_or_else(|| failed("that note is not on this phone"))?;
+        let wanted = id.clone();
+        self.worker
+            .run(move |shared| shared.delete(&settings, &wanted))?
+            .map_err(failed)?;
+        lock(&self.read).remove(&id);
+        Ok(())
+    }
+
     /// Notes matching what was typed, best first. A shared note is matched on its title, tags
     /// and folder, and on its text once it has been opened.
     pub fn search(&self, query: String) -> Vec<NoteSummary> {
@@ -976,6 +1109,61 @@ mod tests {
             identifier: "a-long-enough-identifier".into(),
         }));
         assert!(vault.open_live("anything".into()).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn notes_move_between_folders_are_copied_and_come_back_from_the_trash() {
+        let (vault, dir) = vault("manage");
+        let note = vault
+            .create_note("Plan".into(), None, "the plan [[Other]]".into(), false)
+            .unwrap();
+
+        // Into a folder, out of it again.
+        let moved = vault
+            .set_folder(note.id.clone(), Some("  Games ".into()))
+            .unwrap();
+        assert_eq!(moved.folder.as_deref(), Some("Games"));
+        assert_eq!(
+            vault.set_folder(note.id.clone(), None).unwrap().folder,
+            None
+        );
+        vault
+            .set_folder(note.id.clone(), Some("Games".into()))
+            .unwrap();
+
+        // A copy keeps the text and the folder, and does not clash with the note or an earlier copy.
+        let copy = vault.copy_note(note.id.clone()).unwrap();
+        assert_eq!(copy.title, "Plan copy");
+        assert_eq!(copy.folder.as_deref(), Some("Games"));
+        assert_ne!(copy.id, note.id);
+        assert_eq!(
+            vault.read_note(copy.id.clone()).unwrap().body,
+            "the plan [[Other]]"
+        );
+        assert_eq!(
+            vault.copy_note(note.id.clone()).unwrap().title,
+            "Plan copy 2"
+        );
+
+        // Deleting puts it in the trash, where it can be brought back or deleted for good.
+        let before = vault.list_notes().notes.len();
+        vault.trash_note(copy.id.clone()).unwrap();
+        assert_eq!(vault.list_notes().notes.len(), before - 1);
+        let trash = vault.list_trash();
+        assert_eq!(trash.notes.len(), 1);
+        assert_eq!(trash.notes[0].id, copy.id);
+        vault.restore_note(copy.id.clone()).unwrap();
+        assert!(vault.list_trash().notes.is_empty());
+        assert_eq!(vault.list_notes().notes.len(), before);
+
+        vault.trash_note(copy.id.clone()).unwrap();
+        vault.delete_forever(copy.id.clone()).unwrap();
+        assert!(vault.list_trash().notes.is_empty());
+        vault.reload().unwrap();
+        assert!(vault.read_note(copy.id).is_err(), "gone from the disk too");
+        // The note that was copied is untouched.
+        assert_eq!(vault.read_note(note.id).unwrap().body, "the plan [[Other]]");
         let _ = std::fs::remove_dir_all(dir);
     }
 
