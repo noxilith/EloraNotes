@@ -7,6 +7,7 @@
 #[cfg(feature = "gui")]
 pub mod app;
 pub mod collab;
+pub mod format;
 pub mod graph_layout;
 #[cfg(any(feature = "gui", feature = "icons"))]
 pub mod icon_names;

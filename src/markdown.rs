@@ -1,3 +1,4 @@
+pub use crate::format::{apply_highlight_selection, char_to_byte_idx, rgb_to_hex, wrap_selection};
 use crate::icons::icon;
 use crate::theme::Palette;
 use egui::{
@@ -12,11 +13,6 @@ pub const HIGHLIGHT_PRESETS: &[(&str, [u8; 3])] = &[
     ("Cyan Glow", [78, 205, 255]),
     ("Rose Glow", [255, 112, 150]),
 ];
-
-/// Converts an RGB `[u8; 3]` color to `#RRGGBB` hex string.
-pub fn rgb_to_hex(rgb: [u8; 3]) -> String {
-    format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2])
-}
 
 /// Parses a `#RRGGBB` or `RRGGBB` hex string into `Color32`.
 pub fn parse_hex_color(hex: &str) -> Option<Color32> {
@@ -1428,14 +1424,6 @@ fn append_styled_editor_line(
     flush_plain(job, &line[plain_start..len]);
 }
 
-/// Converts a char index (`usize`) to a byte offset in `s`.
-pub fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
-    s.char_indices()
-        .nth(char_idx)
-        .map(|(b, _)| b)
-        .unwrap_or(s.len())
-}
-
 /// Inserts `insert` at the character range `range`, replacing any selected text.
 /// Appends to the end of `text` when no range is known.
 pub fn insert_at_selection(text: &mut String, range: Option<(usize, usize)>, insert: &str) {
@@ -1449,90 +1437,6 @@ pub fn insert_at_selection(text: &mut String, range: Option<(usize, usize)>, ins
     let b_lo = char_to_byte_idx(text, lo);
     let b_hi = char_to_byte_idx(text, hi);
     text.replace_range(b_lo..b_hi, insert);
-}
-
-/// Wraps (or unwraps if already wrapped) the character range `[start_char..end_char]` with `prefix` and `suffix`.
-/// If `start_char == end_char` (no selection), inserts `prefix + placeholder + suffix` at the cursor.
-pub fn wrap_selection(
-    text: &mut String,
-    range: Option<(usize, usize)>,
-    prefix: &str,
-    suffix: &str,
-    placeholder: &str,
-) {
-    if let Some((c_start, c_end)) = range {
-        let (lo, hi) = if c_start <= c_end {
-            (c_start, c_end)
-        } else {
-            (c_end, c_start)
-        };
-        let b_lo = char_to_byte_idx(text, lo);
-        let b_hi = char_to_byte_idx(text, hi);
-
-        if b_lo < b_hi {
-            let selected = &text[b_lo..b_hi];
-            // If selection itself is already wrapped with prefix/suffix, unwrap it
-            if selected.starts_with(prefix)
-                && selected.ends_with(suffix)
-                && selected.len() >= prefix.len() + suffix.len()
-            {
-                let inner = &selected[prefix.len()..selected.len() - suffix.len()].to_string();
-                text.replace_range(b_lo..b_hi, inner);
-                return;
-            }
-            // Or if the surrounding text right outside [b_lo..b_hi] has prefix/suffix, unwrap that
-            if b_lo >= prefix.len()
-                && b_hi + suffix.len() <= text.len()
-                && &text[b_lo - prefix.len()..b_lo] == prefix
-                && &text[b_hi..b_hi + suffix.len()] == suffix
-            {
-                let inner = selected.to_string();
-                text.replace_range(b_lo - prefix.len()..b_hi + suffix.len(), &inner);
-                return;
-            }
-
-            let wrapped = format!("{prefix}{selected}{suffix}");
-            text.replace_range(b_lo..b_hi, &wrapped);
-            return;
-        }
-        // Empty selection with known cursor position
-        let snippet = format!("{prefix}{placeholder}{suffix}");
-        text.insert_str(b_lo, &snippet);
-    } else {
-        let snippet = format!(" {prefix}{placeholder}{suffix}");
-        text.push_str(&snippet);
-    }
-}
-
-/// Applies a colored glowing highlight `=={#RRGGBB}text==` to the selected character range.
-/// If the selection is already highlighted (`==...==`), updates its color or unwraps if identical.
-pub fn apply_highlight_selection(text: &mut String, range: Option<(usize, usize)>, rgb: [u8; 3]) {
-    let hex = rgb_to_hex(rgb);
-    let prefix = format!("=={{{hex}}}");
-    let suffix = "==";
-
-    if let Some((c_start, c_end)) = range {
-        let (lo, hi) = if c_start <= c_end {
-            (c_start, c_end)
-        } else {
-            (c_end, c_start)
-        };
-        let b_lo = char_to_byte_idx(text, lo);
-        let b_hi = char_to_byte_idx(text, hi);
-
-        if b_lo < b_hi {
-            let selected = text[b_lo..b_hi].to_string();
-            let clean = strip_highlight_markers(&selected);
-            let wrapped = format!("{prefix}{clean}{suffix}");
-            text.replace_range(b_lo..b_hi, &wrapped);
-            return;
-        }
-        let snippet = format!("{prefix}highlighted{suffix}");
-        text.insert_str(b_lo, &snippet);
-    } else {
-        let snippet = format!(" {prefix}highlighted{suffix}");
-        text.push_str(&snippet);
-    }
 }
 
 /// Strips markdown formatting markers (`**`, `*`, `~~`, `__`, `` ` ``, `=={#HEX}`, `==`) from the selected range.
@@ -1553,19 +1457,6 @@ pub fn clear_formatting_selection(text: &mut String, range: Option<(usize, usize
     let selected = &text[b_lo..b_hi];
     let cleaned = strip_all_inline_markers(selected);
     text.replace_range(b_lo..b_hi, &cleaned);
-}
-
-fn strip_highlight_markers(s: &str) -> String {
-    let mut out = s.trim();
-    if let Some(inner) = out.strip_prefix("==").and_then(|r| r.strip_suffix("==")) {
-        out = inner;
-    }
-    if let Some(after_brace) = out.strip_prefix("{#") {
-        if after_brace.len() >= 7 && after_brace.as_bytes()[6] == b'}' {
-            out = &after_brace[7..];
-        }
-    }
-    out.to_string()
 }
 
 pub fn strip_all_inline_markers(s: &str) -> String {
@@ -2542,6 +2433,27 @@ mod tests {
         // Without a known cursor, the text is appended.
         insert_at_selection(&mut text, None, "!");
         assert_eq!(text, "X\u{ec36} world!");
+    }
+
+    /// The phone's formatting module strips marks the way the desktop's parser does.
+    #[test]
+    fn test_the_shared_stripper_agrees_with_the_inline_parser() {
+        for sample in [
+            "**bold** and *italic*",
+            "~~gone~~ and __under__",
+            "`code` and plain",
+            "==marked== and =={#FFC800}glowing==",
+            "{color:#FF0000}red{/color} text",
+            "a [[Note]] and [[Note|shown]] link",
+            "plain words only",
+            "**bold *inner* bold**",
+        ] {
+            assert_eq!(
+                crate::format::strip_inline_markers(sample),
+                strip_all_inline_markers(sample),
+                "{sample}"
+            );
+        }
     }
 
     #[test]
