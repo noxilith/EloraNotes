@@ -20,11 +20,16 @@ struct NoteView: View {
     @State private var liveReady = false
     @State private var liveError: String?
     @State private var people: [LivePerson] = []
+    @State private var showShare = false
     private let tick = Timer.publish(every: 0.06, on: .main, in: .common).autoconnect()
 
     private var shared: Bool { detail?.summary.shared ?? false }
-    /// A shared note can be edited once its live connection has its text.
-    private var canEdit: Bool { detail != nil && (!shared || liveReady) }
+    /// The share by link this note is part of, when it is on this phone and being shared.
+    private var sharing: ShareSession? { library.shares[noteID] }
+    /// A note in the shared library, or one shared by link, is edited through a live connection.
+    private var editedLive: Bool { shared || sharing != nil }
+    /// A note edited live can be edited once its connection has its text.
+    private var canEdit: Bool { detail != nil && (!editedLive || liveReady) }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -42,7 +47,13 @@ struct NoteView: View {
         .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                if detail != nil, !shared {
+                    Button { showShare = true } label: {
+                        Image(systemName: sharing == nil ? "person.crop.circle.badge.plus" : "person.2.fill")
+                    }
+                    .accessibilityLabel("Share")
+                }
                 Button(editing ? "Done" : "Edit") {
                     Task { await toggle() }
                 }
@@ -58,14 +69,28 @@ struct NoteView: View {
                     .padding()
             }
         }
+        .sheet(isPresented: $showShare) {
+            ShareSheet(noteID: noteID, shareName: library.serverDisplayName, onStarted: { session in
+                live = session.live()
+                liveReady = false
+            }, onStopped: {
+                live = nil
+                liveReady = false
+                people = []
+            })
+            .environmentObject(library)
+            .environment(\.palette, palette)
+        }
         .task { await load() }
         .onReceive(tick) { _ in look() }
         .onChange(of: draft) { _, _ in
-            if live == nil { scheduleSave() }
+            if live == nil || sharing != nil { scheduleSave() }
         }
         .onDisappear {
-            live?.close()
-            live = nil
+            if sharing == nil {
+                live?.close()
+                live = nil
+            }
             Task { await save() }
         }
     }
@@ -173,7 +198,11 @@ struct NoteView: View {
                 // Screenshots only: open straight into the editor, with the keyboard up.
                 editing = true
             }
-            if found.summary.shared, live == nil {
+            if let session = library.shares[noteID] {
+                // Still shared from before: carry on with the same connection.
+                live = session.live()
+                liveReady = true
+            } else if found.summary.shared, live == nil {
                 // Opening the note live: its text arrives through `look`.
                 live = try? await library.run { try $0.openLive(id: noteID) }
             }
@@ -219,8 +248,9 @@ struct NoteView: View {
 
     private func save() async {
         pending?.cancel()
-        // A shared note is kept up to date by its live connection as it is typed.
-        guard live == nil, draft != saved else { return }
+        // A note in the shared library is kept up to date by its live connection as it is typed. One
+        // shared by link is also kept on this phone.
+        guard live == nil || sharing != nil, draft != saved else { return }
         let body = draft
         do {
             let summary = try await library.run { try $0.saveNote(id: noteID, body: body) }

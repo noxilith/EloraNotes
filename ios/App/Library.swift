@@ -18,6 +18,9 @@ final class Library: ObservableObject {
     @Published var serverConfigured = false
     /// The shared library's name, once connected: the title of its folder in the list.
     @Published var serverName: String?
+    /// Notes from this phone being shared by link, by note id. Sharing goes on while the note is
+    /// closed and stops with Stop sharing or when the app quits.
+    @Published var shares: [String: ShareSession] = [:]
     /// Notes in the trash, as last loaded.
     @Published var trashed: [NoteSummary] = []
     /// A short message after something was done, which goes away by itself.
@@ -59,6 +62,10 @@ final class Library: ObservableObject {
         if collapsed.contains(key) { collapsed.remove(key) } else { collapsed.insert(key) }
         UserDefaults.standard.set(Array(collapsed), forKey: "collapsedFolders")
     }
+
+    /// The name the person uses in the shared library, which is also how they show up to the people
+    /// they share a note with.
+    var serverDisplayName: String { store.load()?.displayName ?? "" }
 
     func applyServer() {
         let settings = store.load()

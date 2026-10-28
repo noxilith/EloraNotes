@@ -10,6 +10,7 @@ use elora_notes::graph_layout::{GraphNode, GraphView};
 use elora_notes::live::LiveNote;
 use elora_notes::mcp_shared::{is_shared, meta_with, note_from_meta, NewNote, Shared};
 use elora_notes::net::NoteMeta;
+use elora_notes::share::{Access, Network, ShareHost};
 use elora_notes::storage::{extract_wiki_links, AppSettings, Note, NoteStorage};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -204,6 +205,43 @@ impl LiveSession {
 
     pub fn close(&self) {
         self.note.close();
+    }
+}
+
+/// A note from this phone being shared by link: the links to give out, and the note open for live
+/// editing like everybody else's. Sharing stops when it is dropped or stopped.
+#[derive(uniffi::Object)]
+pub struct ShareSession {
+    host: Mutex<Option<ShareHost>>,
+    live: Arc<LiveSession>,
+    edit_link: String,
+    view_link: String,
+    edit_web: String,
+    view_web: String,
+}
+
+#[uniffi::export]
+impl ShareSession {
+    /// The link to give out: one that lets people edit, or one that only lets them watch. The web
+    /// form can be clicked in chats.
+    pub fn link(&self, view_only: bool, web: bool) -> String {
+        match (view_only, web) {
+            (false, false) => self.edit_link.clone(),
+            (true, false) => self.view_link.clone(),
+            (false, true) => self.edit_web.clone(),
+            (true, true) => self.view_web.clone(),
+        }
+    }
+
+    /// The note as everybody sees it: its text, who else is here, and the phone's own typing.
+    pub fn live(&self) -> Arc<LiveSession> {
+        self.live.clone()
+    }
+
+    /// Closes the door: the link stops working.
+    pub fn stop(&self) {
+        self.live.close();
+        lock(&self.host).take();
     }
 }
 
@@ -500,6 +538,42 @@ impl Vault {
                 settings.identifier,
                 id,
             ),
+        }))
+    }
+
+    /// Starts sharing a note that is on this phone, by link, with nobody running a server. Takes
+    /// a moment (the relay is reached first), so ask for it away from the screen's own thread.
+    pub fn start_share(&self, id: String, name: String) -> Result<Arc<ShareSession>, CoreError> {
+        let (title, body) = {
+            let local = lock(&self.local);
+            let note = local
+                .notes
+                .iter()
+                .find(|n| n.id == id)
+                .ok_or_else(|| failed("only notes on this phone can be shared by link"))?;
+            (note.display_title(), note.body.clone())
+        };
+        let host = ShareHost::start(&title, &body, Network::Internet).map_err(failed)?;
+        let name = if name.trim().is_empty() {
+            "Host".to_string()
+        } else {
+            name
+        };
+        let live = Arc::new(LiveSession {
+            note: LiveNote::open(
+                host.local_profile(),
+                name,
+                format!("phone-{}", host.note_id()),
+                host.note_id().to_string(),
+            ),
+        });
+        Ok(Arc::new(ShareSession {
+            edit_link: host.link(Access::Edit).to_string(),
+            view_link: host.link(Access::View).to_string(),
+            edit_web: host.web_link(Access::Edit).to_string(),
+            view_web: host.web_link(Access::View).to_string(),
+            host: Mutex::new(Some(host)),
+            live,
         }))
     }
 

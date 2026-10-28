@@ -24,8 +24,9 @@ bindgen = ["uniffi/cli"]
 [workspace]
 
 [dependencies]
-# No window and none of what lets AI apps use the notes: the phone app has neither.
-elora-notes = { path = "../..", default-features = false, features = ["icons"] }
+# No window and none of what lets AI apps use the notes: the phone app has neither. It can share a
+# note by link, like the desktop app.
+elora-notes = { path = "../..", default-features = false, features = ["icons", "share"] }
 uniffi = "0.29"
 chrono = "0.4"
 
