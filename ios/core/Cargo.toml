@@ -30,9 +30,12 @@ elora-notes = { path = "../..", default-features = false, features = ["icons", "
 uniffi = "0.29"
 chrono = "0.4"
 
-# netdev 0.46.3 (under iroh) does not compile for iOS with the current libc: see vendor/netdev.
+# netdev 0.46.3 and netwatch 0.19.3 (under iroh) do not compile for iOS with the current libc. The
+# copies in vendor/ differ only in leaving out what needs the missing routing-socket constants; the
+# phone then reaches others through the relay and finds no network changes of its own.
 [patch.crates-io]
 netdev = { path = "vendor/netdev" }
+netwatch = { path = "vendor/netwatch" }
 
 [profile.release]
 lto = "thin"
