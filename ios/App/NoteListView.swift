@@ -75,13 +75,19 @@ struct NoteListView: View {
             }
             .refreshable { await library.refresh() }
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
+                ToolbarItemGroup(placement: .topBarLeading) {
                     Button {
                         showSettings = true
                     } label: {
                         Image(systemName: "gearshape")
                     }
                     .accessibilityLabel("Settings")
+                    if let kofi = URL(string: "https://ko-fi.com/noxilith") {
+                        Link(destination: kofi) {
+                            KofiMark()
+                        }
+                        .accessibilityLabel("Support EloraNotes on Ko-fi")
+                    }
                 }
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     Button {
