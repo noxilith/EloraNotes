@@ -151,6 +151,7 @@ impl ShareHost {
             bind: "127.0.0.1".to_string(),
             view_password: view_pw.clone(),
             identity_dir: Some(dir.join("identity")),
+            open_names: true,
         })?);
         let listener = server.listen()?;
         let port = listener

@@ -526,7 +526,12 @@ impl Server {
                 .people
                 .lock()
                 .map_err(|_| "the people list is poisoned")?;
-            if let Err(message) = people.claim(&name, &key) {
+            let claimed = if self.config.open_names {
+                Ok(())
+            } else {
+                people.claim(&name, &key).map(|_| ())
+            };
+            if let Err(message) = claimed {
                 drop(people);
                 self.push(client, FRAME_JSON, json(&ServerMsg::Error { message }));
                 return Ok(false);

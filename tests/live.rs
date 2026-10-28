@@ -67,6 +67,7 @@ fn start_server() -> Harness {
         bind: "127.0.0.1".into(),
         view_password: "peek".into(),
         identity_dir: Some(dir.join("server")),
+        open_names: false,
     };
     let server = Arc::new(Server::new(config.clone()).expect("server"));
     let fingerprint = elora_notes::tls::read_fingerprint(&config).expect("fingerprint");

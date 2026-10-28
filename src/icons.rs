@@ -123,6 +123,7 @@ pub mod icon {
     pub const LIST: &str = "\u{eb6b}";
     pub const LIST_CHECK: &str = "\u{eb6a}";
     pub const LINK: &str = "\u{eade}";
+    pub const SHARE: &str = "\u{eb21}";
     pub const ARROW_BACK_UP: &str = "\u{eb77}";
     pub const ARROWS_SORT: &str = "\u{eb5a}";
     pub const SORT_ASC: &str = "\u{eb26}";

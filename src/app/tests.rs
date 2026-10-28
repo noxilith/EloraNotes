@@ -4585,3 +4585,153 @@ fn test_dragging_a_selection_past_an_edge_scrolls_that_way() {
     // However far out, it is held to a top speed.
     assert!(drag_scroll_step(-100000.0, 100.0, 500.0, dt) <= 1800.0 * dt + 0.001);
 }
+
+/// Sharing a note by link from the app: the host's note, a joined copy in the same app, and a
+/// watcher, all edited through the real tunnel on this computer.
+#[test]
+fn test_a_note_is_shared_by_link_and_edited_from_both_ends() {
+    use crate::share::{Access, Network};
+    let (mut app, ctx, dir) = drawable_app("share-link");
+    app.shares.network_override = Some(Network::Loopback);
+    let note = Note::new("Game plan", "the first idea", app.storage.root_dir());
+    let host_id = note.id.clone();
+    app.storage.save_note(&note).unwrap();
+    app.notes.push(note);
+    app.selected_id = Some(host_id.clone());
+
+    // Start sharing and wait for it to be ready.
+    app.start_sharing(&host_id);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        app.poll_shares(&ctx);
+        if app.shares.sessions.get(&host_id).is_some_and(|s| s.ready) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "sharing never got ready");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let (edit_link, view_link) = match &app.shares.sessions[&host_id].role {
+        shares::Role::Hosting { host } => (
+            host.link(Access::Edit).to_string(),
+            host.link(Access::View).to_string(),
+        ),
+        _ => panic!("not hosting"),
+    };
+
+    let join = |app: &mut EloraApp, link: &str| -> String {
+        let before: BTreeSet<String> = app.shares.joined_ids.clone();
+        app.shares.join_text = link.to_string();
+        app.shares.join_open = true;
+        app.join_link();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            app.poll_shares(&ctx);
+            if let Some(id) = app.shares.joined_ids.difference(&before).next().cloned() {
+                if app.shares.sessions[&id].ready {
+                    return id;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "never joined: {:?}; joining {}; joined {:?}; sessions {:?}",
+                app.shares.message,
+                app.shares.joining.is_some(),
+                app.shares.joined_ids,
+                app.shares
+                    .sessions
+                    .iter()
+                    .map(|(id, s)| (id.clone(), s.ready, s.connected, s.error.clone()))
+                    .collect::<Vec<_>>()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let editing = join(&mut app, &edit_link);
+    let watching = join(&mut app, &view_link);
+    assert!(!app.shares.join_open, "the join window closes once joined");
+    let body_of =
+        |app: &EloraApp, id: &str| app.notes.iter().find(|n| n.id == id).unwrap().body.clone();
+    assert_eq!(body_of(&app, &editing), "the first idea");
+    assert!(
+        app.session_blocks_editing(&watching),
+        "a watcher cannot type"
+    );
+    assert!(!app.session_blocks_editing(&editing));
+    assert_eq!(
+        app.view_mode,
+        EditorViewMode::Preview,
+        "watching opens in preview"
+    );
+
+    // The host types: the editing guest and the watcher see it.
+    let at = |app: &EloraApp, id: &str| app.notes.iter().position(|n| n.id == id).unwrap();
+    let host_at = at(&app, &host_id);
+    app.notes[host_at].body = "the first idea, and a second".to_string();
+    app.send_session_edits(host_at);
+    let settle = |app: &mut EloraApp, what: &str, done: &dyn Fn(&EloraApp) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !done(app) {
+            app.poll_shares(&ctx);
+            assert!(Instant::now() < deadline, "gave up waiting for {what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let (e, w) = (editing.clone(), watching.clone());
+    settle(&mut app, "the guests to see the host", &|app| {
+        body_of(app, &e) == "the first idea, and a second"
+            && body_of(app, &w) == "the first idea, and a second"
+    });
+
+    // The editing guest types: it reaches the host's note, and is saved to the host's file.
+    let guest_at = at(&app, &editing);
+    app.notes[guest_at].body = "Idea: the first idea, and a second".to_string();
+    app.send_session_edits(guest_at);
+    let h = host_id.clone();
+    settle(&mut app, "the host to see the guest", &|app| {
+        body_of(app, &h) == "Idea: the first idea, and a second"
+    });
+    let saved = std::fs::read_to_string(&app.notes[at(&app, &host_id)].file_path).unwrap();
+    assert!(
+        saved.contains("Idea: the first idea, and a second"),
+        "{saved}"
+    );
+
+    // The watcher's own changes are put back, and nothing reaches anybody.
+    let watch_at = at(&app, &watching);
+    app.notes[watch_at].body = "vandalism".to_string();
+    app.send_session_edits(watch_at);
+    for _ in 0..40 {
+        app.poll_shares(&ctx);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        body_of(&app, &host_id),
+        "Idea: the first idea, and a second"
+    );
+    assert_eq!(
+        body_of(&app, &watching),
+        "Idea: the first idea, and a second"
+    );
+
+    // Joined notes never reach the disk, and leaving takes them from the list.
+    let joined_file = app.notes[at(&app, &editing)].file_path.clone();
+    assert!(!joined_file.exists());
+    app.leave_shared(&editing);
+    app.leave_shared(&watching);
+    assert!(app.shares.joined_ids.is_empty());
+    assert!(app
+        .notes
+        .iter()
+        .all(|n| n.id == host_id || !n.id.starts_with("shared-with-you")));
+
+    // Stopping ends the session, and the note stays here as it was.
+    app.stop_sharing(&host_id);
+    assert!(app.shares.sessions.is_empty());
+    assert!(body_of(&app, &host_id).starts_with("Idea:"));
+
+    // The windows draw in every state.
+    app.shares.share_open = true;
+    app.shares.join_open = true;
+    draw(&ctx, |ctx| app.share_windows(ctx));
+    let _ = std::fs::remove_dir_all(&dir);
+}

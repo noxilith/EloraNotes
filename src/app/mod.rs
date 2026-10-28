@@ -37,6 +37,7 @@ mod history;
 mod pictures;
 mod preview;
 mod settings;
+mod shares;
 mod sharing;
 mod text;
 mod updates;
@@ -178,6 +179,8 @@ pub struct EloraApp {
     font_size: f32,
     /// Glow halo intensity for highlights, 0.0 to 1.0.
     glow_strength: f32,
+    /// Notes shared by link, and the windows for sharing and joining them.
+    shares: shares::Shares,
     show_settings: bool,
     /// Which page of Settings is showing.
     settings_page: settings::SettingsPage,
@@ -336,6 +339,7 @@ enum PaletteCommand {
     ToggleGraph,
     SwitchSection(SidebarSection),
     BrokenLinks,
+    JoinSharedNote,
 }
 
 #[derive(Clone, Copy)]
@@ -430,6 +434,7 @@ impl EloraApp {
             colors: settings.colors,
             font_size: settings.font_size,
             glow_strength: settings.glow_strength,
+            shares: Default::default(),
             show_settings: false,
             settings_page: settings::SettingsPage::default(),
             graph: None,
@@ -651,6 +656,10 @@ impl EloraApp {
     /// Saves a note where it belongs: to disk, or back to the server it came from.
     fn persist_note(&mut self, note_idx: usize) -> Result<(), String> {
         let note = self.notes[note_idx].clone();
+        // A note joined from a link exists only while the session does.
+        if self.shares.joined_ids.contains(&note.id) {
+            return Ok(());
+        }
         if !self.is_remote(&note.id) {
             let saved = self.storage.save_note(&note).map_err(|e| e.to_string());
             // Something else changed the file since it was read here; that version is now a
@@ -923,6 +932,10 @@ impl EloraApp {
     }
 
     fn move_to_trash(&mut self, id: &str) {
+        if self.shares.joined_ids.contains(id) {
+            self.leave_shared(id);
+            return;
+        }
         if let Some(idx) = self.notes.iter().position(|n| n.id == id) {
             self.notes[idx].trashed = true;
             self.notes[idx].pinned = false;
@@ -945,6 +958,10 @@ impl EloraApp {
     }
 
     fn permanently_delete_by_id(&mut self, id: &str) {
+        if self.shares.joined_ids.contains(id) {
+            self.leave_shared(id);
+            return;
+        }
         if let Some(pos) = self.notes.iter().position(|n| n.id == id) {
             if self.is_remote(id) {
                 self.collab.delete_note(id, true);
@@ -987,6 +1004,9 @@ impl EloraApp {
     }
 
     fn apply_editor_format(&mut self, note_idx: usize, op: EditorFormatOp) {
+        if self.session_blocks_editing(&self.notes[note_idx].id.clone()) {
+            return;
+        }
         let range = self.last_editor_selection;
         let body = &mut self.notes[note_idx].body;
 
@@ -1055,6 +1075,9 @@ impl EloraApp {
             PaletteCommand::ExportVaultHtml => self.export_html(true),
             PaletteCommand::ImportMarkdown => self.import_markdown(),
             PaletteCommand::ToggleGraph => self.toggle_graph(),
+            PaletteCommand::JoinSharedNote => {
+                self.shares.join_open = true;
+            }
             PaletteCommand::BrokenLinks => {
                 self.broken_links = self.collect_broken_links();
                 self.broken_links_open = true;
@@ -1329,6 +1352,12 @@ impl EloraApp {
                 "Import Markdown From Import Folder",
                 "",
                 PaletteCommand::ImportMarkdown,
+            ),
+            (
+                icon::USER_PLUS,
+                "Join a Shared Note From a Link",
+                "share link join collaborate edit together watch",
+                PaletteCommand::JoinSharedNote,
             ),
             (
                 icon::LINK,
@@ -2104,12 +2133,15 @@ impl EloraApp {
         // server's notes get their own group, titled with the server's name.
         let mut folder_groups: Vec<(String, Vec<usize>)> = Vec::new();
         let mut remote_indices: Vec<usize> = Vec::new();
+        let mut joined_indices: Vec<usize> = Vec::new();
         let mut unfiled: Vec<usize> = Vec::new();
         let mut trashed_indices: Vec<usize> = Vec::new();
         let server_label = self.collab.server_name().unwrap_or("Shared").to_string();
         for &i in &filtered {
             let note = &self.notes[i];
-            if self.remote_ids.contains(&note.id) {
+            if self.shares.joined_ids.contains(&note.id) {
+                joined_indices.push(i);
+            } else if self.remote_ids.contains(&note.id) {
                 remote_indices.push(i);
             } else if note.trashed {
                 trashed_indices.push(i);
@@ -2128,6 +2160,7 @@ impl EloraApp {
         // Each group follows the sort the sidebar is set to; the groups themselves keep their
         // own order, so folders stay alphabetical and pinned notes stay on top.
         self.sort_group(&mut unfiled);
+        self.sort_group(&mut joined_indices);
         self.sort_group(&mut trashed_indices);
         for (_, list) in &mut folder_groups {
             self.sort_group(list);
@@ -2166,6 +2199,41 @@ impl EloraApp {
                             self.roomy_cards,
                         );
                         ui.add_space(4.0);
+                    }
+
+                    // Notes joined from a link: people are in them right now.
+                    if !joined_indices.is_empty() {
+                        let key = "shared-with-you".to_string();
+                        let collapsed = !folders_open && self.collapsed_folders.contains(&key);
+                        if folder_header_with(
+                            ui,
+                            icon::USERS,
+                            "Shared with you",
+                            joined_indices.len(),
+                            collapsed,
+                            p,
+                        )
+                        .clicked()
+                        {
+                            toggled_folder = Some(key);
+                        }
+                        if !collapsed {
+                            ui.add_space(2.0);
+                            render_note_rows(
+                                ui,
+                                &self.notes,
+                                &joined_indices,
+                                self.selected_id.as_deref(),
+                                p,
+                                &self.search_query,
+                                None,
+                                &mut picked,
+                                SIDEBAR_INDENT_STEP,
+                                self.show_card_previews,
+                                self.roomy_cards,
+                            );
+                            ui.add_space(3.0);
+                        }
                     }
 
                     if !remote_indices.is_empty() {
@@ -2677,11 +2745,15 @@ impl EloraApp {
         }
 
         // Who else has this note open, with the colour of their caret.
-        let peers: Vec<crate::collab::RemotePeer> = if self.is_remote(&note_id) {
-            self.collab.peers().to_vec()
-        } else {
-            Vec::new()
-        };
+        let peers: Vec<crate::collab::RemotePeer> =
+            if let Some(session) = self.shares.sessions.get(&note_id) {
+                session.peers.clone()
+            } else if self.is_remote(&note_id) {
+                self.collab.peers().to_vec()
+            } else {
+                Vec::new()
+            };
+        let locked = self.session_blocks_editing(&note_id);
         if !peers.is_empty() {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(5.0, 2.0);
@@ -2743,6 +2815,7 @@ impl EloraApp {
             .desired_width(f32::INFINITY)
             .min_size(Vec2::new(available.x, min_height))
             .layouter(&mut layouter)
+            .interactive(!locked)
             // Tab indents inside the note instead of moving to the next widget.
             .lock_focus(true)
             .show(ui);
@@ -3427,6 +3500,29 @@ impl EloraApp {
                         ));
                         self.status_message = Some("Copied Markdown to clipboard".to_string());
                     }
+
+                    // Share this note by link, so people can edit it with you or watch it live.
+                    let sharing = self.shares.sessions.contains_key(&selected_id);
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(icon::SHARE).size(14.5).color(if sharing {
+                                    p.accent
+                                } else {
+                                    p.fg_secondary
+                                }),
+                            )
+                            .frame(false),
+                        )
+                        .on_hover_text(if sharing {
+                            "Sharing this note by link"
+                        } else {
+                            "Share this note by link: let people edit it with you or watch live"
+                        })
+                        .clicked()
+                    {
+                        self.shares.share_open = !self.shares.share_open;
+                    }
                 }
 
                 ui.add_space(4.0);
@@ -4020,6 +4116,9 @@ impl EloraApp {
             }
         }
 
+        // A note shared by link hands the others what was typed, and where the caret is.
+        self.send_session_edits(note_idx);
+
         if needs_save {
             if let Err(e) = self.persist_note(note_idx) {
                 self.status_message = Some(format!("Auto-save error: {e}"));
@@ -4074,6 +4173,7 @@ impl eframe::App for EloraApp {
         self.poll_disk();
         self.sync_open_note();
         self.settings_window(ctx);
+        self.share_windows(ctx);
         self.graph_window(ctx);
         self.history_window(ctx);
         self.broken_links_window(ctx);

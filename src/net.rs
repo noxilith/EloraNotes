@@ -422,6 +422,11 @@ pub struct ServerConfig {
     /// shared per-user folder: a temporary server for one shared note has a folder of its own.
     #[serde(default, skip_serializing)]
     pub identity_dir: Option<PathBuf>,
+    /// Lets any number of people use the same display name. A library keeps a name for one person
+    /// so nobody can pass as somebody a note was shared with; a temporary server for one shared
+    /// note has no such notes, and two people may well be called the same.
+    #[serde(default)]
+    pub open_names: bool,
 }
 
 impl Default for ServerConfig {
@@ -434,6 +439,7 @@ impl Default for ServerConfig {
             bind: default_bind(),
             view_password: String::new(),
             identity_dir: None,
+            open_names: false,
         }
     }
 }
