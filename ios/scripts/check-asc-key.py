@@ -147,8 +147,17 @@ def main() -> int:
     ok = True
     q = urllib.parse.quote(BUNDLE_ID)
     status, body = ask(jwt, f"/v1/bundleIds?filter[identifier]={q}")
+    team = os.environ.get("APPLE_TEAM_ID", "").strip()
     if status == 200 and body.get("data"):
         print(f"The bundle ID {BUNDLE_ID} is registered.")
+        # The part of an App ID before the bundle ID is the team's own ID, so Apple says which
+        # team this is, and it is used even when the APPLE_TEAM_ID secret is wrong or has a stray space.
+        seed = (body["data"][0].get("attributes") or {}).get("seedId", "")
+        if seed and seed != team:
+            print(f"APPLE_TEAM_ID is {'empty' if not team else 'not'} this team's ID. Apple says the team is {seed}; using that.")
+            team = seed
+        elif seed:
+            print("APPLE_TEAM_ID matches the team.")
     else:
         print(f"The bundle ID {BUNDLE_ID} is NOT registered yet (Certificates, Identifiers & Profiles > Identifiers).")
         ok = False
@@ -159,6 +168,10 @@ def main() -> int:
     else:
         print("There is NO app record for that bundle ID yet (App Store Connect > Apps > + New App).")
         ok = False
+    env_file = os.environ.get("GITHUB_ENV")
+    if env_file and team:
+        with open(env_file, "a") as out:
+            out.write(f"APPLE_TEAM_ID={team}\n")
     status, _ = ask(jwt, "/v1/certificates?limit=1")
     if status == 200:
         print("The key can manage signing certificates.")
