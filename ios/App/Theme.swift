@@ -99,6 +99,7 @@ struct Themed: ViewModifier {
 
     func body(content: Content) -> some View {
         content
+            .background(WindowColor(color: UIColor(theme.palette.sidebar)))
             .environment(\.palette, theme.palette)
             .font(AppFont.body(16))
             .tint(theme.palette.accent)
@@ -161,5 +162,33 @@ struct Glyph: View {
 
     var body: some View {
         Text(glyph).font(AppFont.icon(size)).foregroundStyle(color)
+    }
+}
+
+/// Paints the app's window in the theme's colour. Behind the keyboard, and in the rounded corners
+/// around it, what shows through is the window itself, which is black unless it is told otherwise.
+struct WindowColor: UIViewRepresentable {
+    let color: UIColor
+
+    final class Anchor: UIView {
+        var color: UIColor = .clear {
+            didSet { window?.backgroundColor = color }
+        }
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            window?.backgroundColor = color
+        }
+    }
+
+    func makeUIView(context: Context) -> Anchor {
+        let anchor = Anchor()
+        anchor.isUserInteractionEnabled = false
+        anchor.color = color
+        return anchor
+    }
+
+    func updateUIView(_ anchor: Anchor, context: Context) {
+        anchor.color = color
     }
 }

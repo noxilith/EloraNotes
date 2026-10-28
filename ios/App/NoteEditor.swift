@@ -29,11 +29,19 @@ struct NoteEditor: UIViewRepresentable {
         view.alwaysBounceVertical = true
         view.keyboardDismissMode = .interactive
         view.autocapitalizationType = .sentences
+        // Markdown is full of marks that autocorrect and smart punctuation would "fix" (two dashes,
+        // straight quotes, double brackets). With them off the keyboard's empty suggestions strip
+        // goes too, so the formatting bar sits directly on the keys. Misspelt words stay underlined.
+        view.autocorrectionType = .no
+        view.smartQuotesType = .no
+        view.smartDashesType = .no
+        view.spellCheckingType = .yes
         view.onLayout = { [weak coordinator = context.coordinator] in coordinator?.placeCarets() }
         context.coordinator.view = view
         if DemoData.screen == "edit" {
             DispatchQueue.main.async { view.becomeFirstResponder() }
         }
+        view.keyboardAppearance = palette.isDark ? .dark : .light
         let bar = FormatBar { [weak coordinator = context.coordinator] button in coordinator?.press(button) }
         bar.apply(palette)
         view.inputAccessoryView = bar
@@ -45,6 +53,7 @@ struct NoteEditor: UIViewRepresentable {
         let coordinator = context.coordinator
         coordinator.parent = self
         view.isEditable = editable
+        view.keyboardAppearance = palette.isDark ? .dark : .light
         if coordinator.palette.canvas != palette.canvas || coordinator.palette.accent != palette.accent {
             coordinator.palette = palette
             coordinator.bar?.apply(palette)
