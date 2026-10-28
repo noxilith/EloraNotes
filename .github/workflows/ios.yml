@@ -69,6 +69,10 @@ jobs:
           defaults write com.apple.iphonesimulator ConnectHardwareKeyboard -bool false
           xcrun simctl boot "$udid"
           xcrun simctl bootstatus "$udid" -b
+          # The keyboard's first-run "slide to type" panel would cover the keyboard in screenshots.
+          xcrun simctl spawn "$udid" defaults write com.apple.keyboard.preferences DidShowContinuousPathIntroduction -bool true
+          xcrun simctl spawn "$udid" defaults write com.apple.keyboard.preferences DidShowGestureKeyboardIntroduction -bool true
+          xcrun simctl spawn "$udid" defaults write com.apple.keyboard.preferences KeyboardAutocorrection -bool false
           xcrun simctl install "$udid" build/DerivedData/Build/Products/Debug-iphonesimulator/EloraNotes.app
           mkdir -p build/screenshots
           # screen:theme:extra launch arguments. Every theme is looked at once or twice; the
