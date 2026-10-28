@@ -102,6 +102,15 @@ jobs:
       ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
     steps:
       - uses: actions/checkout@v4
+      # App Store Connect only takes apps built with the iOS 26 SDK (Xcode 26) or later.
+      - name: Use the newest Xcode
+        run: |
+          latest=$(ls -d /Applications/Xcode_2[6-9]*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$latest" ]; then
+            echo "This runner has no Xcode 26 or later. It has:"; ls -d /Applications/Xcode*; exit 1
+          fi
+          sudo xcode-select -s "$latest/Contents/Developer"
+          xcodebuild -version
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
