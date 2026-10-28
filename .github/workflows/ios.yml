@@ -65,6 +65,8 @@ jobs:
           if [ -z "$udid" ]; then
             udid=$(xcrun simctl list devices available | grep -E "iPhone" | head -1 | sed -E 's/.*\(([0-9A-F-]{36})\).*/\1/')
           fi
+          # Show the on-screen keyboard even though a Mac keyboard is attached, so the formatting bar above it is visible.
+          defaults write com.apple.iphonesimulator ConnectHardwareKeyboard -bool false
           xcrun simctl boot "$udid"
           xcrun simctl bootstatus "$udid" -b
           xcrun simctl install "$udid" build/DerivedData/Build/Products/Debug-iphonesimulator/EloraNotes.app
@@ -76,7 +78,7 @@ jobs:
             list:Paper: graph:Paper: note:Paper: \
             list:Nordic: graph:Nordic: list:Matcha: graph:Matcha: \
             list:Sepia: graph:Sepia: list:Midnight: graph:Midnight: \
-            list:Obsidian:previews
+            list:Obsidian:previews edit:Obsidian: edit:Paper:
           do
             screen=${shot%%:*}; rest=${shot#*:}; theme=${rest%%:*}; extra=${rest#*:}
             args="-EloraDemo YES -EloraDemoShared YES -EloraDemoScreen $screen -EloraTheme $theme"

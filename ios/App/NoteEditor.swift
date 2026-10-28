@@ -31,6 +31,13 @@ struct NoteEditor: UIViewRepresentable {
         view.autocapitalizationType = .sentences
         view.onLayout = { [weak coordinator = context.coordinator] in coordinator?.placeCarets() }
         context.coordinator.view = view
+        if DemoData.screen == "edit" {
+            DispatchQueue.main.async { view.becomeFirstResponder() }
+        }
+        let bar = FormatBar { [weak coordinator = context.coordinator] button in coordinator?.press(button) }
+        bar.apply(palette)
+        view.inputAccessoryView = bar
+        context.coordinator.bar = bar
         return view
     }
 
@@ -40,6 +47,7 @@ struct NoteEditor: UIViewRepresentable {
         view.isEditable = editable
         if coordinator.palette.canvas != palette.canvas || coordinator.palette.accent != palette.accent {
             coordinator.palette = palette
+            coordinator.bar?.apply(palette)
             coordinator.restyle()
         }
         if incoming.id != coordinator.lastIncoming {
@@ -53,6 +61,7 @@ struct NoteEditor: UIViewRepresentable {
     final class Coordinator: NSObject, UITextViewDelegate {
         var parent: NoteEditor
         weak var view: CaretTextView?
+        var bar: FormatBar?
         var palette: Palette
         var lastIncoming = -1
         var people: [LivePerson] = []
@@ -96,6 +105,26 @@ struct NoteEditor: UIViewRepresentable {
             }
             let old = view.text ?? ""
             if old == new { restyle(); return }
+            let (removed, inserted) = Self.diff(old, new)
+            let insertedLength = (inserted as NSString).length
+            func carry(_ place: Int) -> Int {
+                if place <= removed.location { return place }
+                if place >= removed.location + removed.length { return place - removed.length + insertedLength }
+                return removed.location + insertedLength
+            }
+            let selection = view.selectedRange
+            let from = carry(selection.location)
+            let to = carry(selection.location + selection.length)
+            quiet = true
+            view.textStorage.replaceCharacters(in: removed, with: inserted)
+            view.selectedRange = NSRange(location: from, length: max(0, to - from))
+            quiet = false
+            restyle()
+            placeCarets()
+        }
+
+        /// What differs between two texts: the range of the old text that goes, and what replaces it.
+        static func diff(_ old: String, _ new: String) -> (removed: NSRange, inserted: String) {
             let before = old as NSString
             let after = new as NSString
             let shortest = min(before.length, after.length)
@@ -112,24 +141,32 @@ struct NoteEditor: UIViewRepresentable {
                 tail += 1
             }
             if tail > 0, UTF16.isTrailSurrogate(before.character(at: before.length - tail)) { tail -= 1 }
+            return (
+                NSRange(location: start, length: before.length - start - tail),
+                after.substring(with: NSRange(location: start, length: after.length - start - tail))
+            )
+        }
 
-            let removed = NSRange(location: start, length: before.length - start - tail)
-            let inserted = after.substring(with: NSRange(location: start, length: after.length - start - tail))
-            let insertedLength = (inserted as NSString).length
-            func carry(_ place: Int) -> Int {
-                if place <= removed.location { return place }
-                if place >= removed.location + removed.length { return place - removed.length + insertedLength }
-                return removed.location + insertedLength
-            }
+        /// A formatting button was pressed: the change comes from the shared Rust code, and goes in
+        /// as an edit, so it can be undone and is sent to everyone else like typing.
+        func press(_ button: FormatButton) {
+            guard let view, view.isEditable, view.markedTextRange == nil else { return }
             let selection = view.selectedRange
-            let from = carry(selection.location)
-            let to = carry(selection.location + selection.length)
-            quiet = true
-            view.textStorage.replaceCharacters(in: removed, with: inserted)
-            view.selectedRange = NSRange(location: from, length: max(0, to - from))
-            quiet = false
-            restyle()
-            placeCarets()
+            let done = formatText(
+                text: view.text, start: UInt32(selection.location),
+                end: UInt32(selection.location + selection.length), button: button)
+            guard done.text != view.text else { return }
+            let (removed, inserted) = Self.diff(view.text, done.text)
+            if let from = view.position(from: view.beginningOfDocument, offset: removed.location),
+               let to = view.position(from: from, offset: removed.length),
+               let range = view.textRange(from: from, to: to)
+            {
+                view.replace(range, withText: inserted)
+            }
+            view.selectedRange = NSRange(location: Int(done.start), length: Int(done.end - done.start))
+            // Whether or not the text view tells its delegate about this, it is now what it is.
+            textViewDidChange(view)
+            textViewDidChangeSelection(view)
         }
 
         // MARK: Styling

@@ -169,6 +169,10 @@ struct NoteView: View {
             saved = found.body
             editorText = EditorText(id: editorText.id + 1, text: found.body)
             message = nil
+            if library.launchRoute == "edit" {
+                // Screenshots only: open straight into the editor, with the keyboard up.
+                editing = true
+            }
             if found.summary.shared, live == nil {
                 // Opening the note live: its text arrives through `look`.
                 live = try? await library.run { try $0.openLive(id: noteID) }

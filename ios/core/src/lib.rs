@@ -706,6 +706,86 @@ impl Vault {
     }
 }
 
+/// One of the formatting buttons above the keyboard: the same set the desktop editor has.
+#[derive(Clone, Copy, Debug, PartialEq, uniffi::Enum)]
+pub enum FormatButton {
+    Bold,
+    Italic,
+    Strikethrough,
+    Underline,
+    InlineCode,
+    Highlight { red: u8, green: u8, blue: u8 },
+    TextColor { red: u8, green: u8, blue: u8 },
+    WikiLink,
+    Heading1,
+    Heading2,
+    Bullet,
+    Checklist,
+    Quote,
+    CodeFence,
+    ClearFormatting,
+}
+
+/// The text after a button was pressed, with the selection to put back. Positions are in UTF-16
+/// units, which is how iOS counts text.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct FormattedText {
+    pub text: String,
+    pub start: u32,
+    pub end: u32,
+}
+
+/// Which character of `text` the UTF-16 offset `offset` is at.
+fn char_at_utf16(text: &str, offset: usize) -> usize {
+    let mut units = 0;
+    for (index, c) in text.chars().enumerate() {
+        if units >= offset {
+            return index;
+        }
+        units += c.len_utf16();
+    }
+    text.chars().count()
+}
+
+/// How many UTF-16 units the first `count` characters of `text` take.
+fn utf16_of_chars(text: &str, count: usize) -> usize {
+    text.chars().take(count).map(char::len_utf16).sum()
+}
+
+/// Presses a formatting button with the selection at `start..end` (UTF-16 units): the very change
+/// the desktop's button makes, from the same code.
+#[uniffi::export]
+pub fn format_text(text: String, start: u32, end: u32, button: FormatButton) -> FormattedText {
+    use elora_notes::format::{apply, Op};
+    let op = match button {
+        FormatButton::Bold => Op::Bold,
+        FormatButton::Italic => Op::Italic,
+        FormatButton::Strikethrough => Op::Strikethrough,
+        FormatButton::Underline => Op::Underline,
+        FormatButton::InlineCode => Op::InlineCode,
+        FormatButton::Highlight { red, green, blue } => Op::Highlight([red, green, blue]),
+        FormatButton::TextColor { red, green, blue } => Op::TextColor([red, green, blue]),
+        FormatButton::WikiLink => Op::WikiLink,
+        FormatButton::Heading1 => Op::Heading1,
+        FormatButton::Heading2 => Op::Heading2,
+        FormatButton::Bullet => Op::Bullet,
+        FormatButton::Checklist => Op::Checklist,
+        FormatButton::Quote => Op::Quote,
+        FormatButton::CodeFence => Op::CodeFence,
+        FormatButton::ClearFormatting => Op::ClearFormatting,
+    };
+    let range = (
+        char_at_utf16(&text, start as usize),
+        char_at_utf16(&text, end as usize),
+    );
+    let done = apply(op, &text, range);
+    FormattedText {
+        start: utf16_of_chars(&done.text, done.selection.0) as u32,
+        end: utf16_of_chars(&done.text, done.selection.1) as u32,
+        text: done.text,
+    }
+}
+
 /// The character that draws a Tabler icon in the icon font, by the icon's name.
 #[uniffi::export]
 pub fn icon_glyph(name: String) -> Option<String> {
@@ -897,6 +977,30 @@ mod tests {
         }));
         assert!(vault.open_live("anything".into()).is_err());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn formatting_buttons_count_text_the_way_ios_does() {
+        // An emoji is two UTF-16 units, so "word" starts at offset 4 here, not 3.
+        let done = format_text("😀 word".into(), 3, 7, FormatButton::Bold);
+        assert_eq!(done.text, "😀 **word**");
+        assert_eq!((done.start, done.end), (5, 9));
+        let again = format_text(done.text, done.start, done.end, FormatButton::Bold);
+        assert_eq!(again.text, "😀 word");
+        assert_eq!((again.start, again.end), (3, 7));
+        let heading = format_text(String::new(), 0, 0, FormatButton::Heading1);
+        assert_eq!(heading.text, "\n# Heading 1\n");
+        let glow = format_text(
+            "hi".into(),
+            0,
+            2,
+            FormatButton::Highlight {
+                red: 255,
+                green: 200,
+                blue: 0,
+            },
+        );
+        assert_eq!(glow.text, "=={#FFC800}hi==");
     }
 
     #[test]

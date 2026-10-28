@@ -87,7 +87,7 @@ struct NoteListView: View {
                 case "graph": showGraph = true
                 case "settings": showSettings = true
                 case "search": query = "slime"
-                case "note":
+                case "note", "edit":
                     if let note = library.notes.first(where: { $0.title == "Slime Combat" }) {
                         path.append(note.id)
                     }
