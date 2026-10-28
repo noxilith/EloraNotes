@@ -36,3 +36,10 @@ config.local.toml
 
 # Local assistant settings
 .claude/
+
+# The iPhone app: built output, and the Xcode project that is generated from ios/project.yml.
+/ios/core/target/
+/ios/build/
+/ios/Frameworks/
+/ios/Generated/
+/ios/*.xcodeproj/

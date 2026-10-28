@@ -27,6 +27,31 @@ jobs:
       - name: Check the server without the GUI
         run: cargo check --locked --no-default-features --bin elora-server
 
+  # The iPhone app's core is a crate of its own, built for the phone by the iOS workflow. It is
+  # tested here on every change, since it shares the library with the desktop app and the server.
+  mobile-core:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ios/core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt -- --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      # The phone app has no window code and none of the AI features, so neither may creep in.
+      - name: Check the core pulls in no window or AI code
+        run: |
+          if cargo tree --locked | grep -E "eframe|egui|winit"; then
+            echo "window code reached the phone core"; exit 1
+          fi
+          if cargo tree --locked -e features -i elora-notes | grep -E 'feature "(gui|assistants)"'; then
+            echo "a desktop feature reached the phone core"; exit 1
+          fi
+
   # The server installers run for real, against stand-ins for the system tools (systemd, ufw,
   # Task Scheduler, the Windows firewall), with the actual server started from what they write.
   installers:

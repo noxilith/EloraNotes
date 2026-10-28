@@ -271,6 +271,28 @@ fn wait_for<T>(
     }
 }
 
+/// Asks a server for the fingerprint of its certificate, which is how a person is shown who they
+/// are about to trust. Nothing is accepted: the connection is only used to see the answer, and
+/// the profile's own fingerprint is ignored so a server that is already trusted can be checked
+/// against it by the caller.
+pub fn probe_fingerprint(
+    profile: &crate::collab::ServerProfile,
+    name: &str,
+    identifier: &str,
+) -> Result<String, String> {
+    let mut probe = profile.clone();
+    probe.fingerprint = None;
+    let mut collab = Collab::new();
+    collab.connect(probe, name.to_string(), identifier.to_string());
+    let result = wait_for(&mut collab, CONNECT_WAIT, |event| match event {
+        Incoming::Unverified { fingerprint } => Some(Ok(fingerprint.clone())),
+        Incoming::Offline(reason) => Some(Err(reason.clone())),
+        _ => None,
+    });
+    collab.disconnect();
+    result
+}
+
 /// A shared note as the same type local notes have. It has no file here, which is how the two
 /// are told apart, and no text until it is asked for.
 pub fn note_from_meta(meta: &NoteMeta, body: String) -> Note {

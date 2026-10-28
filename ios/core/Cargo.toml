@@ -1,0 +1,30 @@
+[package]
+name = "elora-mobile-core"
+version = "0.1.0"
+edition = "2021"
+description = "The part of EloraNotes the iPhone app shares with the desktop app: notes on disk, and the shared library."
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+name = "elora_mobile_core"
+crate-type = ["staticlib", "lib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+
+# Its own workspace: the desktop app's Cargo.lock stays as it is, and this crate is only built
+# for the phone (and by its own tests).
+[workspace]
+
+[dependencies]
+# No window and none of what lets AI apps use the notes: the phone app has neither.
+elora-notes = { path = "../..", default-features = false }
+uniffi = { version = "0.29", features = ["cli"] }
+chrono = "0.4"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

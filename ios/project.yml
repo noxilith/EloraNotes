@@ -1,0 +1,53 @@
+# The Xcode project is generated from this file (`xcodegen generate`), so it never has to be
+# edited by hand or kept in the repository. The CI job and ios/README.md say how.
+name: EloraNotes
+options:
+  bundleIdPrefix: io.github.noxilith
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MARKETING_VERSION: "${MARKETING_VERSION}"
+    CURRENT_PROJECT_VERSION: "${BUILD_NUMBER}"
+    DEVELOPMENT_TEAM: "${APPLE_TEAM_ID}"
+targets:
+  EloraNotes:
+    type: application
+    platform: iOS
+    sources:
+      - App
+      - Generated
+    dependencies:
+      # The Rust core, built by scripts/build-core.sh. It is a static library, so nothing is
+      # embedded in the app.
+      - framework: Frameworks/EloraCore.xcframework
+        embed: false
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: EloraNotes
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # The notes folder shows up in the Files app, so notes can be copied in and out.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        # The shared library may be a server on the same network.
+        NSLocalNetworkUsageDescription: EloraNotes connects to your shared library server, which may be on your local network.
+        # Only the standard encryption of the operating system is used.
+        ITSAppUsesNonExemptEncryption: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.noxilith.EloraNotes
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_STYLE: Automatic
+        TARGETED_DEVICE_FAMILY: "1,2"

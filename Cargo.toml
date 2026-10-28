@@ -23,7 +23,10 @@ path = "src/bin/elora-server.rs"
 default = ["gui"]
 # Everything that draws a window. `cargo build --no-default-features --bin elora-server`
 # produces a server binary with no X11/GL/wayland dependency at all.
-gui = ["dep:eframe", "dep:egui", "dep:image", "dep:arboard", "dep:rfd"]
+gui = ["assistants", "dep:eframe", "dep:egui", "dep:image", "dep:arboard", "dep:rfd"]
+# The parts that let AI apps use the notes: the MCP server, the setup of AI apps' settings and the
+# memory skill. A build that does not want them (the server, the phone app's core) leaves them out.
+assistants = []
 
 [dependencies]
 eframe = { version = "0.31", optional = true, default-features = false, features = [

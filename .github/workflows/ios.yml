@@ -1,0 +1,145 @@
+name: iOS
+
+# Builds the iPhone app on a Mac. A plain push only checks that it compiles for the simulator;
+# running the workflow by hand with "testflight" ticked also signs it and sends it to TestFlight.
+# See ios/README.md for the Apple account setup the second part needs.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "ios/**"
+      - ".github/workflows/ios.yml"
+  pull_request:
+    paths:
+      - "ios/**"
+      - ".github/workflows/ios.yml"
+  workflow_dispatch:
+    inputs:
+      testflight:
+        description: "Sign it and upload it to TestFlight"
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - name: Test the core
+        working-directory: ios/core
+        run: cargo test --locked
+      - name: Build the core for the phone
+        run: ios/scripts/build-core.sh
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Make the Xcode project
+        working-directory: ios
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          export MARKETING_VERSION="$(cat VERSION)"
+          xcodegen generate
+      - name: Build for the simulator
+        working-directory: ios
+        run: >
+          xcodebuild -project EloraNotes.xcodeproj -scheme EloraNotes
+          -sdk iphonesimulator -destination 'generic/platform=iOS Simulator'
+          -derivedDataPath build/DerivedData
+          CODE_SIGNING_ALLOWED=NO build
+      # Starts the app in the simulator with made-up notes (-EloraDemo) on each screen and takes a
+      # picture, so the app can be looked at without a phone or a Mac.
+      - name: Take screenshots in the simulator
+        working-directory: ios
+        run: |
+          set -euo pipefail
+          udid=$(xcrun simctl list devices available | grep -E "iPhone" | head -1 | sed -E 's/.*\(([0-9A-F-]{36})\).*/\1/')
+          xcrun simctl boot "$udid"
+          xcrun simctl bootstatus "$udid" -b
+          xcrun simctl install "$udid" build/DerivedData/Build/Products/Debug-iphonesimulator/EloraNotes.app
+          mkdir -p build/screenshots
+          for screen in list note graph search settings; do
+            xcrun simctl terminate "$udid" io.github.noxilith.EloraNotes 2>/dev/null || true
+            xcrun simctl launch "$udid" io.github.noxilith.EloraNotes -EloraDemo YES -EloraDemoScreen "$screen"
+            sleep 10
+            xcrun simctl io "$udid" screenshot "build/screenshots/$screen.png"
+          done
+      - name: Keep the screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iphone-screenshots
+          path: ios/build/screenshots
+          if-no-files-found: ignore
+
+  testflight:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.testflight
+    runs-on: macos-15
+    env:
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - name: Check the Apple secrets are set
+        run: |
+          for name in APPLE_TEAM_ID ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8; do
+            if [ -z "${!name}" ]; then echo "Missing the $name secret; see ios/README.md"; exit 1; fi
+          done
+      - name: Build the core for the phone
+        run: ios/scripts/build-core.sh
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Make the Xcode project
+        working-directory: ios
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          export MARKETING_VERSION="$(cat VERSION)"
+          xcodegen generate
+      - name: Save the App Store Connect key
+        run: |
+          mkdir -p "$RUNNER_TEMP/keys"
+          printf '%s' "$ASC_KEY_P8" > "$RUNNER_TEMP/keys/AuthKey_$ASC_KEY_ID.p8"
+      - name: Archive
+        working-directory: ios
+        run: >
+          xcodebuild archive -project EloraNotes.xcodeproj -scheme EloraNotes
+          -configuration Release -destination 'generic/platform=iOS'
+          -archivePath build/EloraNotes.xcarchive
+          -allowProvisioningUpdates
+          -authenticationKeyPath "$RUNNER_TEMP/keys/AuthKey_$ASC_KEY_ID.p8"
+          -authenticationKeyID "$ASC_KEY_ID"
+          -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+      - name: Sign it and upload it to TestFlight
+        working-directory: ios
+        run: |
+          cat > build/ExportOptions.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>$APPLE_TEAM_ID</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>uploadSymbols</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          xcodebuild -exportArchive -archivePath build/EloraNotes.xcarchive \
+            -exportOptionsPlist build/ExportOptions.plist \
+            -exportPath build/export \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/keys/AuthKey_$ASC_KEY_ID.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
