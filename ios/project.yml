@@ -26,6 +26,10 @@ targets:
       # embedded in the app.
       - framework: Frameworks/EloraCore.xcframework
         embed: false
+      # What finding the phone's network connections (for sharing a note by link) calls into.
+      - sdk: SystemConfiguration.framework
+      - sdk: Security.framework
+      - sdk: CoreFoundation.framework
     info:
       path: App/Info.plist
       properties:
