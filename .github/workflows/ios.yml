@@ -32,6 +32,11 @@ jobs:
       - name: Test the core
         working-directory: ios/core
         run: cargo test --locked
+      - name: Use just the Key ID
+        # The Key ID is the 10 characters after "AuthKey_" in the file's name; a pasted file name works too.
+        run: |
+          id="${ASC_KEY_ID#AuthKey_}"; id="${id%.p8}"
+          echo "ASC_KEY_ID=$id" >> "$GITHUB_ENV"
       - name: Check the Apple key and save it
         run: python3 ios/scripts/check-asc-key.py --write "$RUNNER_TEMP/keys/AuthKey_$ASC_KEY_ID.p8"
       - name: Build the core for the phone

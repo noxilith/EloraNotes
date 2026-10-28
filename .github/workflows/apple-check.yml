@@ -15,5 +15,10 @@ jobs:
       ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
     steps:
       - uses: actions/checkout@v4
+      - name: Use just the Key ID
+        # The Key ID is the 10 characters after "AuthKey_" in the file's name; a pasted file name works too.
+        run: |
+          id="${ASC_KEY_ID#AuthKey_}"; id="${id%.p8}"
+          echo "ASC_KEY_ID=$id" >> "$GITHUB_ENV"
       - name: Ask Apple
         run: python3 ios/scripts/check-asc-key.py
