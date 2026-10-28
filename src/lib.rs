@@ -8,12 +8,13 @@
 pub mod app;
 pub mod collab;
 pub mod graph_layout;
-#[cfg(feature = "gui")]
+#[cfg(any(feature = "gui", feature = "icons"))]
 pub mod icon_names;
 #[cfg(feature = "gui")]
 pub mod icons;
 #[cfg(feature = "gui")]
 pub mod images;
+pub mod live;
 #[cfg(feature = "gui")]
 pub mod markdown;
 #[cfg(feature = "assistants")]
