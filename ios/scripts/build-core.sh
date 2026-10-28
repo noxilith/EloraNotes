@@ -19,7 +19,7 @@ device="target/aarch64-apple-ios/release/libelora_mobile_core.a"
 simulator="target/aarch64-apple-ios-sim/release/libelora_mobile_core.a"
 
 # The interface is read out of the compiled library, so the Swift side always matches it.
-cargo run --release --locked --bin uniffi-bindgen -- generate \
+cargo run --release --locked --features bindgen --bin uniffi-bindgen -- generate \
   --library "$device" --language swift --out-dir "$build/bindings"
 
 cp "$build/bindings/elora_mobile_core.swift" "$here/Generated/"

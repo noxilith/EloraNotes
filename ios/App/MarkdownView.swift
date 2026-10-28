@@ -101,11 +101,11 @@ struct MarkdownView: View {
                 switch block {
                 case .heading(let level, let value):
                     Text(inline(value))
-                        .font(level == 1 ? .title.bold() : level == 2 ? .title2.bold() : .headline)
+                        .font(AppFont.bold(level == 1 ? 24 : level == 2 ? 20 : 17))
                         .padding(.top, level <= 2 ? 6 : 2)
                 case .bullet(let depth, let value):
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Text("•")
+                        Text("•").foregroundStyle(palette.accent)
                         Text(inline(value))
                     }
                     .padding(.leading, CGFloat(depth) * 16)
@@ -122,7 +122,7 @@ struct MarkdownView: View {
                     }
                 case .code(let value):
                     Text(value)
-                        .font(.system(.footnote, design: .monospaced))
+                        .font(AppFont.mono(14))
                         .padding(10)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .background(palette.elevated, in: RoundedRectangle(cornerRadius: 8))
@@ -134,6 +134,8 @@ struct MarkdownView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .font(AppFont.body(18))
+        .lineSpacing(5)
         .foregroundStyle(palette.fgPrimary)
         .textSelection(.enabled)
         .environment(

@@ -100,6 +100,7 @@ struct Themed: ViewModifier {
     func body(content: Content) -> some View {
         content
             .environment(\.palette, theme.palette)
+            .font(AppFont.body(16))
             .tint(theme.palette.accent)
             .preferredColorScheme(theme.palette.isDark ? .dark : .light)
     }
@@ -107,4 +108,58 @@ struct Themed: ViewModifier {
 
 extension View {
     func themed() -> some View { modifier(Themed()) }
+}
+
+/// The fonts the desktop app uses: Ubuntu Light for text, DejaVu Sans Bold for anything bold,
+/// Hack for code, and the Tabler icon font for every icon.
+enum AppFont {
+    static func body(_ size: CGFloat) -> Font { .custom("Ubuntu-Light", size: size, relativeTo: .body) }
+    static func bold(_ size: CGFloat) -> Font { .custom("DejaVuSans-Bold", size: size, relativeTo: .body) }
+    static func mono(_ size: CGFloat) -> Font { .custom("Hack-Regular", size: size, relativeTo: .body) }
+    static func icon(_ size: CGFloat) -> Font { .custom("tabler-icons", size: size) }
+}
+
+/// The icons the app draws itself, as Tabler glyphs (the same ones the desktop app uses).
+enum Icon {
+    static let plus = "\u{eb0b}"
+    static let search = "\u{eb1c}"
+    static let pinned = "\u{ed60}"
+    static let folder = "\u{eaad}"
+    static let file = "\u{eaa2}"
+    static let chevronRight = "\u{ea61}"
+    static let chevronDown = "\u{ea5f}"
+    static let feather = "\u{ee8b}"
+    static let settings = "\u{eb20}"
+    static let cloud = "\u{ea76}"
+    static let graph = "\u{f288}"
+    static let edit = "\u{ea98}"
+    static let eye = "\u{ea9a}"
+
+    private static var known: [String: String] = [:]
+
+    /// A note's own icon by name, or the plain page the desktop shows when it has none.
+    static func named(_ name: String?) -> String {
+        guard let name, !name.isEmpty else { return file }
+        if let found = known[name] { return found }
+        let glyph = iconGlyph(name: name) ?? file
+        known[name] = glyph
+        return glyph
+    }
+}
+
+/// One icon from the icon font.
+struct Glyph: View {
+    let glyph: String
+    var size: CGFloat = 16
+    var color: Color
+
+    init(_ glyph: String, size: CGFloat = 16, color: Color) {
+        self.glyph = glyph
+        self.size = size
+        self.color = color
+    }
+
+    var body: some View {
+        Text(glyph).font(AppFont.icon(size)).foregroundStyle(color)
+    }
 }

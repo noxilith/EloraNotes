@@ -68,6 +68,13 @@ struct SettingsView: View {
                 Section("About") {
                     LabeledContent("App", value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")
                     LabeledContent("Core", value: coreVersion())
+                    if let policy = URL(string: "https://noxilith.github.io/docs/privacy/") {
+                        Link("Privacy policy", destination: policy)
+                    }
+                    if let support = URL(string: "https://github.com/noxilith/EloraNotes/issues") {
+                        Link("Support and feedback", destination: support)
+                    }
+                    NavigationLink("Open-source credits") { AcknowledgementsView() }
                     Text("Notes on this phone are kept in the EloraNotes folder of the Files app.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)

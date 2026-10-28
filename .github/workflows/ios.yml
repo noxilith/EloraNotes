@@ -60,7 +60,11 @@ jobs:
         working-directory: ios
         run: |
           set -euo pipefail
-          udid=$(xcrun simctl list devices available | grep -E "iPhone" | head -1 | sed -E 's/.*\(([0-9A-F-]{36})\).*/\1/')
+          # A Pro Max phone: its 6.9-inch screen is the size App Store Connect asks for.
+          udid=$(xcrun simctl list devices available | grep -E "iPhone .*Pro Max" | tail -1 | sed -E 's/.*\(([0-9A-F-]{36})\).*/\1/')
+          if [ -z "$udid" ]; then
+            udid=$(xcrun simctl list devices available | grep -E "iPhone" | head -1 | sed -E 's/.*\(([0-9A-F-]{36})\).*/\1/')
+          fi
           xcrun simctl boot "$udid"
           xcrun simctl bootstatus "$udid" -b
           xcrun simctl install "$udid" build/DerivedData/Build/Products/Debug-iphonesimulator/EloraNotes.app

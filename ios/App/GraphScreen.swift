@@ -147,7 +147,7 @@ struct GraphScreen: View {
                         guard bounds.insetBy(dx: -20, dy: -20).contains(place) else { continue }
                         let resolved = context.resolve(
                             Text(point.title.count > 24 ? String(point.title.prefix(24)) + "…" : point.title)
-                                .font(.system(size: selected == index ? 13 : 10.5))
+                                .font(AppFont.body(selected == index ? 14 : 11.5))
                                 .foregroundColor(selected == index ? palette.fgPrimary : palette.fgSecondary))
                         let measured = resolved.measure(in: CGSize(width: 220, height: 30))
                         let r = radius(point, z)
@@ -202,7 +202,7 @@ struct GraphScreen: View {
                 let point = data.points[index]
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(point.title).font(.headline).foregroundStyle(palette.fgPrimary).lineLimit(1)
+                        Text(point.title).font(AppFont.body(19)).foregroundStyle(palette.fgPrimary).lineLimit(1)
                         Text("\(point.degree) link\(point.degree == 1 ? "" : "s")")
                             .font(.caption).foregroundStyle(palette.fgSecondary)
                     }

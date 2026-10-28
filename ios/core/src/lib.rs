@@ -7,6 +7,7 @@
 
 use elora_notes::collab::ServerProfile;
 use elora_notes::graph_layout::{GraphNode, GraphView};
+use elora_notes::live::LiveNote;
 use elora_notes::mcp_shared::{is_shared, note_from_meta, NewNote, Shared};
 use elora_notes::net::NoteMeta;
 use elora_notes::storage::{extract_wiki_links, AppSettings, Note, NoteStorage};
@@ -44,6 +45,8 @@ fn failed(message: impl ToString) -> CoreError {
 pub struct NoteSummary {
     pub id: String,
     pub title: String,
+    /// The note's own icon, by Tabler Icons name (`flare`, `device-gamepad`), when it has one.
+    pub icon: Option<String>,
     pub folder: Option<String>,
     pub tags: Vec<String>,
     pub pinned: bool,
@@ -137,6 +140,73 @@ pub struct GraphData {
     pub shared_error: Option<String>,
 }
 
+/// Somebody else with a shared note open: who, in what colour, and where their caret is.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct LivePerson {
+    pub name: String,
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+    /// Their caret, in bytes into the note's text.
+    pub cursor: Option<u32>,
+    pub typing: bool,
+}
+
+/// What a look at an open shared note found.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct LiveUpdate {
+    pub connected: bool,
+    pub error: Option<String>,
+    /// The whole text, when somebody else changed it (and the first time it is known).
+    pub text: Option<String>,
+    pub people: Vec<LivePerson>,
+}
+
+/// A shared note held open for live editing. Closed when it is dropped.
+#[derive(uniffi::Object)]
+pub struct LiveSession {
+    note: LiveNote,
+}
+
+#[uniffi::export]
+impl LiveSession {
+    /// What has changed since the last look: cheap enough to ask every few hundredths of a second.
+    pub fn poll(&self) -> LiveUpdate {
+        let look = self.note.poll();
+        LiveUpdate {
+            connected: look.connected,
+            error: look.error,
+            text: look.text,
+            people: look
+                .peers
+                .into_iter()
+                .map(|peer| LivePerson {
+                    name: peer.name,
+                    red: peer.color[0],
+                    green: peer.color[1],
+                    blue: peer.color[2],
+                    cursor: peer.cursor.map(|byte| byte as u32),
+                    typing: peer.typing,
+                })
+                .collect(),
+        }
+    }
+
+    /// The editor's whole text after a change.
+    pub fn set_text(&self, text: String) {
+        self.note.set_text(&text);
+    }
+
+    /// Where the caret is, in bytes into the text.
+    pub fn set_cursor(&self, byte: u32) {
+        self.note.set_cursor(byte as usize);
+    }
+
+    pub fn close(&self) {
+        self.note.close();
+    }
+}
+
 type Job = Box<dyn FnOnce(&Shared) + Send>;
 
 /// The shared library's client is not `Send`, so it lives on a thread of its own and calls are
@@ -206,6 +276,7 @@ fn summary_of(note: &Note) -> NoteSummary {
     NoteSummary {
         id: note.id.clone(),
         title: note.display_title(),
+        icon: note.icon.clone(),
         folder: note.folder.clone(),
         tags: note.all_tags(),
         pinned: note.pinned,
@@ -408,6 +479,27 @@ impl Vault {
             links,
             backlinks,
         })
+    }
+
+    /// Opens a shared note for live editing: its text, and everybody else's carets, as they move.
+    pub fn open_live(&self, id: String) -> Result<Arc<LiveSession>, CoreError> {
+        let server = lock(&self.server)
+            .clone()
+            .ok_or_else(|| failed("no shared library is set up"))?;
+        if server.fingerprint.is_none() {
+            return Err(failed(
+                "confirm the server's certificate in Settings before editing shared notes",
+            ));
+        }
+        let settings = server.app_settings();
+        Ok(Arc::new(LiveSession {
+            note: LiveNote::open(
+                settings.server,
+                settings.display_name,
+                settings.identifier,
+                id,
+            ),
+        }))
     }
 
     /// Replaces a note's text with `body` and returns the note as it is now.
@@ -614,6 +706,16 @@ impl Vault {
     }
 }
 
+/// The character that draws a Tabler icon in the icon font, by the icon's name.
+#[uniffi::export]
+pub fn icon_glyph(name: String) -> Option<String> {
+    use elora_notes::icon_names::TABLER_ICON_NAMES;
+    TABLER_ICON_NAMES
+        .binary_search_by_key(&name.as_str(), |(known, _)| known)
+        .ok()
+        .map(|at| TABLER_ICON_NAMES[at].1.to_string())
+}
+
 /// The version of this crate, for the About screen.
 #[uniffi::export]
 pub fn core_version() -> String {
@@ -778,6 +880,34 @@ mod tests {
         assert!(graph.edges.iter().all(
             |e| (e.from as usize) < graph.points.len() && (e.to as usize) < graph.points.len()
         ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn live_editing_needs_a_confirmed_server() {
+        let (vault, dir) = vault("live");
+        assert!(vault.open_live("anything".into()).is_err());
+        vault.set_server(Some(ServerSettings {
+            host: "127.0.0.1".into(),
+            port: 1,
+            password: "secret".into(),
+            fingerprint: None,
+            display_name: "Me".into(),
+            identifier: "a-long-enough-identifier".into(),
+        }));
+        assert!(vault.open_live("anything".into()).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn note_icons_are_found_by_name() {
+        assert_eq!(icon_glyph("feather".into()).as_deref(), Some("\u{ee8b}"));
+        assert_eq!(icon_glyph("no-such-icon".into()), None);
+        let (vault, dir) = vault("icons");
+        let made = vault
+            .create_note("Plain".into(), None, String::new(), false)
+            .unwrap();
+        assert_eq!(made.icon, None);
         let _ = std::fs::remove_dir_all(dir);
     }
 
