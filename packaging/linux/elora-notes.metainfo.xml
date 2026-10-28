@@ -25,6 +25,17 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.15.0" date="2026-10-29">
+      <description>
+        <p>
+          Share a note by link, with no server. A new Share button on every note makes a link that
+          anyone can open to edit the note with you or only watch it live, with each person's
+          caret in their colour with their name. Paste a link into Join a Shared Note From a Link
+          in the command palette to join one. The note stays a normal file on the computer that
+          shared it, and the link works while EloraNotes is open there.
+        </p>
+      </description>
+    </release>
     <release version="0.14.0" date="2026-10-28">
       <description>
         <p>

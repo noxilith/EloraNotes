@@ -48,6 +48,10 @@ The server is a small binary with an installer for Linux and Windows. It speaks 
 
 To host one, download the installer from the [latest release](https://github.com/noxilith/EloraNotes/releases/latest): `install-elora-server.sh` on Linux (`sudo bash install-elora-server.sh`) or `install-elora-server.ps1` on Windows (from an Administrator PowerShell: `powershell -ExecutionPolicy Bypass -File .\install-elora-server.ps1`). It asks for a name, a port and a password, installs the server as a service that starts at boot, opens the port in the firewall and checks that the server is really answering. Run it again to update (your settings, password, notes and certificate are kept), reconfigure or uninstall. It verifies the download against the release's checksums, and a scripted install can pass its answers in `ELORA_NAME`, `ELORA_PORT` and `ELORA_PASSWORD`.
 
+## Share a note with anyone, no server needed
+
+The **Share** button on a note makes a link. Choose whether people can *edit* the note or only *watch* it, send them the link, and they join from **Join a Shared Note From a Link** in the command palette (Ctrl+K). You type together in real time, each person's caret shows in their colour with their name, and nobody needs an account or a server of their own. The connection goes directly between your computers (public relays only help them find each other, and only ever see encrypted traffic). The note stays a normal file on the computer that shared it, and the link works while EloraNotes is open there. Treat a link like a password: anyone who has it can get in, and **Stop sharing** cancels it.
+
 ## Working with AI assistants
 
 EloraNotes is its own [MCP](https://modelcontextprotocol.io) server, so Claude or any other MCP client can read, search, write and link your notes — on this computer and in the shared library — without a plugin.
