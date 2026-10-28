@@ -12,6 +12,8 @@ settings:
     MARKETING_VERSION: "${MARKETING_VERSION}"
     CURRENT_PROJECT_VERSION: "${BUILD_NUMBER}"
     DEVELOPMENT_TEAM: "${APPLE_TEAM_ID}"
+    # The Rust core is built for the phone and for the Apple-silicon simulator only.
+    "EXCLUDED_ARCHS[sdk=iphonesimulator*]": x86_64
 targets:
   EloraNotes:
     type: application

@@ -50,7 +50,7 @@ jobs:
           xcodebuild -project EloraNotes.xcodeproj -scheme EloraNotes
           -sdk iphonesimulator -destination 'generic/platform=iOS Simulator'
           -derivedDataPath build/DerivedData
-          CODE_SIGNING_ALLOWED=NO build
+          ARCHS=arm64 CODE_SIGNING_ALLOWED=NO build
       # Starts the app in the simulator with made-up notes (-EloraDemo) on each screen and takes a
       # picture, so the app can be looked at without a phone or a Mac.
       - name: Take screenshots in the simulator
