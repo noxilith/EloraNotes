@@ -23,6 +23,9 @@ on:
 
 jobs:
   build:
+    # A run made to upload to TestFlight goes straight to signing; the simulator check and its
+    # screenshots run for pushes and for ordinary manual runs.
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.testflight) }}
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -32,13 +35,6 @@ jobs:
       - name: Test the core
         working-directory: ios/core
         run: cargo test --locked
-      - name: Use just the Key ID
-        # The Key ID is the 10 characters after "AuthKey_" in the file's name; a pasted file name works too.
-        run: |
-          id="${ASC_KEY_ID#AuthKey_}"; id="${id%.p8}"
-          echo "ASC_KEY_ID=$id" >> "$GITHUB_ENV"
-      - name: Check the Apple key and save it
-        run: python3 ios/scripts/check-asc-key.py --write "$RUNNER_TEMP/keys/AuthKey_$ASC_KEY_ID.p8"
       - name: Build the core for the phone
         run: ios/scripts/build-core.sh
       - name: Install XcodeGen
@@ -97,7 +93,6 @@ jobs:
           if-no-files-found: ignore
 
   testflight:
-    needs: build
     if: github.event_name == 'workflow_dispatch' && inputs.testflight
     runs-on: macos-15
     env:
@@ -115,6 +110,13 @@ jobs:
           for name in APPLE_TEAM_ID ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8; do
             if [ -z "${!name}" ]; then echo "Missing the $name secret; see ios/README.md"; exit 1; fi
           done
+      - name: Use just the Key ID
+        # The Key ID is the 10 characters after "AuthKey_" in the file's name; a pasted file name works too.
+        run: |
+          id="${ASC_KEY_ID#AuthKey_}"; id="${id%.p8}"
+          echo "ASC_KEY_ID=$id" >> "$GITHUB_ENV"
+      - name: Check the Apple key and save it
+        run: python3 ios/scripts/check-asc-key.py --write "$RUNNER_TEMP/keys/AuthKey_$ASC_KEY_ID.p8"
       - name: Build the core for the phone
         run: ios/scripts/build-core.sh
       - name: Install XcodeGen
