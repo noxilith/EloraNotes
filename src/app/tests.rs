@@ -4771,3 +4771,43 @@ fn test_a_link_the_program_is_opened_with_joins_its_note() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// When the host of a joined note cannot be reached any more, the note closes and what it said
+/// last stays behind as a note of the person's own.
+#[test]
+fn test_a_joined_note_whose_host_is_lost_closes_and_leaves_a_copy() {
+    use crate::share::{Access, Network, ShareHost};
+    let (mut app, ctx, dir) = drawable_app("lost-host");
+    app.shares.network_override = Some(Network::Loopback);
+    app.shares.lost_after = Some(Duration::from_millis(500));
+    let host = ShareHost::start("Plans", "what we know", Network::Loopback).unwrap();
+    app.open_link(host.link(Access::Edit).to_string());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let joined = loop {
+        app.poll_shares(&ctx);
+        if let Some(id) = app.shares.joined_ids.iter().next().cloned() {
+            if app.shares.sessions[&id].ready {
+                break id;
+            }
+        }
+        assert!(Instant::now() < deadline, "never joined");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    drop(host);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while app.notes.iter().any(|n| n.id == joined) {
+        app.poll_shares(&ctx);
+        assert!(Instant::now() < deadline, "the lost note never closed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(app.shares.joined_ids.is_empty());
+    let copy = app
+        .notes
+        .iter()
+        .find(|n| n.title == "Plans (copy)")
+        .expect("a copy is kept");
+    assert_eq!(copy.body, "what we know");
+    assert!(copy.file_path.exists(), "the copy is a file on disk");
+    assert_eq!(app.selected_id.as_deref(), Some(copy.id.as_str()));
+    let _ = std::fs::remove_dir_all(&dir);
+}

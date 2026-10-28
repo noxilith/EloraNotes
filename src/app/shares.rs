@@ -30,7 +30,12 @@ pub(super) struct Session {
     pub(super) peers: Vec<RemotePeer>,
     pub(super) connected: bool,
     pub(super) error: Option<String>,
+    /// Since when the connection to the host has been down, for a note joined from a link.
+    lost_since: Option<Instant>,
 }
+
+/// How long a joined note may be cut off before it is given up and kept as a copy.
+const LOST_AFTER: Duration = Duration::from_secs(8);
 
 impl Session {
     pub(super) fn view_only(&self) -> bool {
@@ -68,6 +73,8 @@ pub(super) struct Shares {
     queued: Vec<String>,
     /// Whether the Join window has already looked at the clipboard for a link.
     join_checked: bool,
+    /// Tests shorten the wait before a cut-off note is given up.
+    pub(super) lost_after: Option<Duration>,
 }
 
 fn random_hex(bytes: usize) -> String {
@@ -193,6 +200,7 @@ impl EloraApp {
                 peers: Vec::new(),
                 connected: false,
                 error: None,
+                lost_since: None,
             },
         );
     }
@@ -226,6 +234,7 @@ impl EloraApp {
                 peers: Vec::new(),
                 connected: false,
                 error: None,
+                lost_since: None,
             },
         );
         self.selected_id = Some(id);
@@ -276,6 +285,7 @@ impl EloraApp {
         // Somebody's typing arrives at any moment, and an idle window is never asked to draw.
         ctx.request_repaint_after(Duration::from_millis(60));
 
+        let mut lost = Vec::new();
         let ids: Vec<String> = self.shares.sessions.keys().cloned().collect();
         for id in ids {
             let Some(index) = self.notes.iter().position(|n| n.id == id) else {
@@ -288,6 +298,19 @@ impl EloraApp {
             let look = session.live.poll();
             session.connected = look.connected;
             session.error = look.error;
+            if !session.hosting() && session.ready {
+                if session.connected {
+                    session.lost_since = None;
+                } else if session
+                    .lost_since
+                    .get_or_insert_with(Instant::now)
+                    .elapsed()
+                    > self.shares.lost_after.unwrap_or(LOST_AFTER)
+                {
+                    lost.push(id);
+                    continue;
+                }
+            }
             session.peers = look
                 .peers
                 .iter()
@@ -338,6 +361,29 @@ impl EloraApp {
                 }
             }
         }
+        for id in lost {
+            self.keep_copy_of_lost(&id);
+        }
+    }
+
+    /// A note joined from a link whose host cannot be reached any more: it closes, and what it
+    /// said last stays as a note of the person's own.
+    fn keep_copy_of_lost(&mut self, id: &str) {
+        let Some(note) = self.notes.iter().find(|n| n.id == id) else {
+            return;
+        };
+        let (title, body) = (note.display_title(), note.body.clone());
+        self.leave_shared(id);
+        let copy = Note::new(format!("{title} (copy)"), body, self.storage.root_dir());
+        if let Err(why) = self.storage.save_note(&copy) {
+            self.status_message = Some(format!("Could not keep a copy of {title}: {why}"));
+            return;
+        }
+        self.selected_id = Some(copy.id.clone());
+        self.notes.push(copy);
+        self.status_message = Some(format!(
+            "Lost the connection to {title}. It is closed, and a copy is saved as a note here."
+        ));
     }
 
     /// Hands the other people what was typed in the open note, and where the caret is.
