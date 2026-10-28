@@ -75,7 +75,7 @@ impl Shared {
         })
     }
 
-    fn server_name(&self) -> Option<String> {
+    pub fn server_name(&self) -> Option<String> {
         self.state.borrow().collab.server_name().map(str::to_string)
     }
 

@@ -8,6 +8,7 @@ struct EloraNotesApp: App {
         WindowGroup {
             NoteListView()
                 .environmentObject(library)
+                .themed()
                 .task { await library.start() }
         }
     }

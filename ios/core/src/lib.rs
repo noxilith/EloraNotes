@@ -75,6 +75,8 @@ pub struct NoteDetail {
 pub struct NoteList {
     pub notes: Vec<NoteSummary>,
     pub shared_error: Option<String>,
+    /// The shared library's own name, once connected: the title of its folder.
+    pub server_name: Option<String>,
 }
 
 /// How to reach a shared library.
@@ -194,6 +196,7 @@ pub struct Vault {
     local: Mutex<Local>,
     server: Mutex<Option<ServerSettings>>,
     worker: Worker,
+    server_name: Mutex<Option<String>>,
     /// The text of shared notes already read, by id, with the version it was read at, so
     /// backlinks and search can use it without going back to the server.
     read: Mutex<HashMap<String, (i64, String)>>,
@@ -236,10 +239,12 @@ impl Vault {
         let Some(settings) = self.settings() else {
             return Ok(Vec::new());
         };
-        let library = self
+        let (library, name) = self
             .worker
-            .run(move |shared| shared.library(&settings))
-            .map_err(|e| e.to_string())??;
+            .run(move |shared| (shared.library(&settings), shared.server_name()))
+            .map_err(|e| e.to_string())?;
+        let library = library?;
+        *lock(&self.server_name) = name;
         Ok(library
             .unwrap_or_default()
             .iter()
@@ -299,6 +304,7 @@ impl Vault {
             local: Mutex::new(Local { storage, notes }),
             server: Mutex::new(None),
             worker: Worker::new(),
+            server_name: Mutex::new(None),
             read: Mutex::new(HashMap::new()),
         }))
     }
@@ -313,6 +319,7 @@ impl Vault {
     /// Sets, or with `None` forgets, the shared library to use.
     pub fn set_server(&self, settings: Option<ServerSettings>) {
         *lock(&self.server) = settings;
+        *lock(&self.server_name) = None;
         lock(&self.read).clear();
     }
 
@@ -343,6 +350,7 @@ impl Vault {
         NoteList {
             notes,
             shared_error,
+            server_name: lock(&self.server_name).clone(),
         }
     }
 

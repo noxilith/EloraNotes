@@ -6,6 +6,7 @@ struct NoteView: View {
     let noteID: String
     @Binding var path: [String]
     @EnvironmentObject private var library: Library
+    @Environment(\.palette) private var palette
     @State private var detail: NoteDetail?
     @State private var draft = ""
     @State private var saved = ""
@@ -20,6 +21,8 @@ struct NoteView: View {
             } else if editing {
                 TextEditor(text: $draft)
                     .font(.body)
+                    .foregroundStyle(palette.fgPrimary)
+                    .scrollContentBackground(.hidden)
                     .padding(.horizontal, 12)
             } else {
                 ScrollView {
@@ -29,7 +32,7 @@ struct NoteView: View {
                         }
                         if let backlinks = detail?.backlinks, !backlinks.isEmpty {
                             Divider()
-                            Text("Linked from").font(.headline)
+                            Text("Linked from").font(.headline).foregroundStyle(palette.fgPrimary)
                             ForEach(backlinks) { note in
                                 Button(note.title) { path.append(note.id) }
                             }
@@ -40,6 +43,9 @@ struct NoteView: View {
                 }
             }
         }
+        .background(palette.canvas)
+        .toolbarBackground(palette.sidebar, for: .navigationBar)
+        .toolbarBackground(.visible, for: .navigationBar)
         .navigationTitle(detail?.summary.title ?? "Note")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {

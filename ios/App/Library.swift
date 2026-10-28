@@ -16,6 +16,11 @@ final class Library: ObservableObject {
     @Published var loading = false
     @Published var problem: String?
     @Published var serverConfigured = false
+    /// The shared library's name, once connected: the title of its folder in the list.
+    @Published var serverName: String?
+    /// Folders the person has collapsed, kept between launches.
+    @Published var collapsed: Set<String> = Set(
+        UserDefaults.standard.stringArray(forKey: "collapsedFolders") ?? [])
     /// Set when the app was started in demo mode to open on a particular screen.
     @Published var launchRoute: String?
 
@@ -27,6 +32,7 @@ final class Library: ObservableObject {
         guard vault == nil else { return }
         do {
             if DemoData.enabled {
+                UserDefaults.standard.set(DemoData.previews, forKey: "showPreviews")
                 let demo = try Vault.open(directory: DemoData.folder())
                 DemoData.seed(demo)
                 vault = demo
@@ -43,6 +49,11 @@ final class Library: ObservableObject {
         } catch {
             problem = describe(error)
         }
+    }
+
+    func toggleFolder(_ key: String) {
+        if collapsed.contains(key) { collapsed.remove(key) } else { collapsed.insert(key) }
+        UserDefaults.standard.set(Array(collapsed), forKey: "collapsedFolders")
     }
 
     func applyServer() {
@@ -73,6 +84,16 @@ final class Library: ObservableObject {
         }.value
         notes = list.notes
         sharedError = list.sharedError
+        serverName = list.serverName
+        if DemoData.sharedPreview {
+            // For screenshots only: some notes shown as if they came from a shared library.
+            notes = notes.map { note in
+                var note = note
+                if note.folder == "Audio" || note.folder == "Life" { note.shared = true }
+                return note
+            }
+            serverName = "Home server"
+        }
         loading = false
     }
 

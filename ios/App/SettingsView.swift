@@ -3,6 +3,9 @@ import SwiftUI
 struct SettingsView: View {
     @EnvironmentObject private var library: Library
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.palette) private var palette
+    @AppStorage("EloraTheme") private var themeName = AppTheme.obsidian.rawValue
+    @AppStorage("showPreviews") private var showPreviews = false
     @State private var host = ""
     @State private var port = "7331"
     @State private var password = ""
@@ -15,6 +18,29 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section("Appearance") {
+                    ForEach(AppTheme.allCases) { theme in
+                        Button {
+                            themeName = theme.rawValue
+                        } label: {
+                            HStack(spacing: 12) {
+                                swatch(theme)
+                                Text(theme.rawValue).foregroundStyle(palette.fgPrimary)
+                                Spacer()
+                                if theme.rawValue == themeName {
+                                    Image(systemName: "checkmark").foregroundStyle(palette.accent)
+                                }
+                            }
+                        }
+                    }
+                }
+                Section {
+                    Toggle("Show a preview line", isOn: $showPreviews)
+                } header: {
+                    Text("Note list")
+                } footer: {
+                    Text("Adds the first lines of each note under its name. Off keeps the list short.")
+                }
                 Section {
                     TextField("Server address", text: $host)
                         .textInputAutocapitalization(.never)
@@ -47,6 +73,10 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+            .scrollContentBackground(.hidden)
+            .background(palette.canvas)
+            .toolbarBackground(palette.sidebar, for: .navigationBar)
+            .toolbarBackground(.visible, for: .navigationBar)
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -65,6 +95,18 @@ struct SettingsView: View {
                 Text("Its certificate code is:\n\n\(grouped(confirming ?? ""))\n\nOnly continue if it matches the code EloraNotes shows on your computer.")
             }
         }
+    }
+
+    /// Four dots in the theme's own colours.
+    private func swatch(_ theme: AppTheme) -> some View {
+        let colors = theme.palette
+        return HStack(spacing: -6) {
+            ForEach(Array([colors.canvas, colors.elevated, colors.accent, colors.fgPrimary].enumerated()), id: \.offset) { _, color in
+                Circle().fill(color).frame(width: 18, height: 18)
+                    .overlay(Circle().stroke(colors.border, lineWidth: 1))
+            }
+        }
+        .frame(width: 64, alignment: .leading)
     }
 
     private var ready: Bool {

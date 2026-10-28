@@ -3,6 +3,7 @@ import SwiftUI
 struct NewNoteView: View {
     @EnvironmentObject private var library: Library
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.palette) private var palette
     let created: (String) -> Void
     @State private var title = ""
     @State private var folder = ""
@@ -27,6 +28,10 @@ struct NewNoteView: View {
                     Section { Text(message).foregroundStyle(.red).font(.footnote) }
                 }
             }
+            .scrollContentBackground(.hidden)
+            .background(palette.canvas)
+            .toolbarBackground(palette.sidebar, for: .navigationBar)
+            .toolbarBackground(.visible, for: .navigationBar)
             .navigationTitle("New note")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

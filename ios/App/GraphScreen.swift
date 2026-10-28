@@ -6,6 +6,7 @@ import SwiftUI
 struct GraphScreen: View {
     @Binding var path: [String]
     @EnvironmentObject private var library: Library
+    @Environment(\.palette) private var palette
     @State private var data: GraphData?
     @State private var loading = true
     @State private var zoom: CGFloat = 1
@@ -16,9 +17,12 @@ struct GraphScreen: View {
     @GestureState private var pinch: CGFloat = 1
 
     private func color(_ group: UInt32?) -> Color {
-        guard let group else { return Color.gray }
+        guard let group else { return palette.fgMuted }
         let hue = (Double(group) * 0.618034).truncatingRemainder(dividingBy: 1)
-        return Color(hue: hue, saturation: 0.5, brightness: 1.0)
+        // Pale colours on a dark page, deeper ones on a light page, so they stay readable.
+        return palette.isDark
+            ? Color(hue: hue, saturation: 0.5, brightness: 1.0)
+            : Color(hue: hue, saturation: 0.62, brightness: 0.72)
     }
 
     private func radius(_ point: GraphPoint, _ z: CGFloat) -> CGFloat {
@@ -31,16 +35,26 @@ struct GraphScreen: View {
             y: size.height / 2 + (CGFloat(point.y) - focus.y) * z + drag.height)
     }
 
-    /// Zoom and focus that show every note.
+    /// Zoom and focus that show the linked notes filling the screen, with the arc of loose notes
+    /// reaching round them rather than shrinking them to fit.
     private func fit() {
         guard let points = data?.points, !points.isEmpty, size.width > 0 else { return }
-        let xs = points.map { CGFloat($0.x) }
-        let ys = points.map { CGFloat($0.y) }
-        let (lowX, highX, lowY, highY) = (xs.min()!, xs.max()!, ys.min()!, ys.max()!)
-        let wide = highX - lowX + 70
-        let tall = highY - lowY + 70
-        zoom = min(6, max(0.03, min(size.width / wide, size.height / tall)))
-        focus = CGPoint(x: (lowX + highX) / 2, y: (lowY + highY) / 2)
+        func box(_ chosen: [GraphPoint]) -> (low: CGPoint, high: CGPoint) {
+            let xs = chosen.map { CGFloat($0.x) }
+            let ys = chosen.map { CGFloat($0.y) }
+            return (CGPoint(x: xs.min() ?? 0, y: ys.min() ?? 0), CGPoint(x: xs.max() ?? 0, y: ys.max() ?? 0))
+        }
+        func zoomFor(_ b: (low: CGPoint, high: CGPoint)) -> CGFloat {
+            let wide = b.high.x - b.low.x + 70
+            let tall = b.high.y - b.low.y + 70
+            return min(size.width / wide, size.height / tall)
+        }
+        let all = box(points)
+        let linked = points.filter { $0.group != nil }
+        let core = linked.isEmpty ? all : box(linked)
+        let everything = zoomFor(all)
+        zoom = min(6, max(0.03, min(zoomFor(core), everything * 2.4)))
+        focus = CGPoint(x: (core.low.x + core.high.x) / 2, y: (core.low.y + core.high.y) / 2)
     }
 
     private func zoomBy(_ factor: CGFloat) {
@@ -88,10 +102,10 @@ struct GraphScreen: View {
                         line.addLine(to: at[b])
                         let touches = selected == a || selected == b
                         let same = points[a].group == points[b].group
-                        let shade = same ? color(points[a].group) : Color.gray
+                        let shade = same ? color(points[a].group) : palette.fgMuted
                         let opacity = selected == nil ? (same ? 0.35 : 0.2) : (touches ? 0.9 : 0.08)
                         context.stroke(
-                            line, with: .color(touches ? Color.accentColor.opacity(0.9) : shade.opacity(opacity)),
+                            line, with: .color(touches ? palette.accent.opacity(0.9) : shade.opacity(opacity)),
                             lineWidth: touches ? 1.6 : 0.8)
                     }
 
@@ -99,7 +113,7 @@ struct GraphScreen: View {
                         let place = at[index]
                         let r = radius(point, z)
                         let dim = selected != nil && selected != index && !lit.contains(index)
-                        let base = selected == index ? Color.accentColor : color(point.group)
+                        let base = selected == index ? palette.accent : color(point.group)
                         if point.degree >= 6 || selected == index {
                             for (scale, alpha) in [(2.6, 0.08), (1.7, 0.16)] {
                                 let glow = CGRect(
@@ -115,23 +129,26 @@ struct GraphScreen: View {
                     // Names: the busiest notes first, fewer as the picture gets smaller, and never
                     // two on top of each other.
                     let few = points.count <= 40
-                    let minimum = few ? 0 : Int((8 / z).rounded(.up))
+                    let minimum = few ? 0 : Int((5 / z).rounded(.up))
                     var taken: [CGRect] = []
                     let order = points.indices.sorted { points[$0].degree > points[$1].degree }
+                    let hubs = Set(order.prefix(10).filter { points[$0].degree >= 3 })
                     var drawn = 0
                     for index in order {
                         let point = points[index]
                         let chosen = selected == index || lit.contains(index)
                         let wanted = selected != nil
                             ? chosen
-                            : (point.group != nil ? Int(point.degree) >= minimum : (few || z >= 2.5))
+                            : (point.group != nil
+                                ? (Int(point.degree) >= minimum || hubs.contains(index))
+                                : (few || z >= 2.5))
                         guard wanted, drawn < 160 else { continue }
                         let place = at[index]
                         guard bounds.insetBy(dx: -20, dy: -20).contains(place) else { continue }
                         let resolved = context.resolve(
                             Text(point.title.count > 24 ? String(point.title.prefix(24)) + "…" : point.title)
                                 .font(.system(size: selected == index ? 13 : 10.5))
-                                .foregroundColor(selected == index ? .primary : .secondary))
+                                .foregroundColor(selected == index ? palette.fgPrimary : palette.fgSecondary))
                         let measured = resolved.measure(in: CGSize(width: 220, height: 30))
                         let r = radius(point, z)
                         var box = CGRect(
@@ -169,7 +186,7 @@ struct GraphScreen: View {
                     if data != nil { fit() }
                 }
             }
-            .background(Color(.systemBackground))
+            .background(palette.canvas)
             .overlay {
                 if loading {
                     VStack(spacing: 8) {
@@ -185,22 +202,25 @@ struct GraphScreen: View {
                 let point = data.points[index]
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(point.title).font(.headline).lineLimit(1)
+                        Text(point.title).font(.headline).foregroundStyle(palette.fgPrimary).lineLimit(1)
                         Text("\(point.degree) link\(point.degree == 1 ? "" : "s")")
-                            .font(.caption).foregroundStyle(.secondary)
+                            .font(.caption).foregroundStyle(palette.fgSecondary)
                     }
                     Spacer()
                     Button("Open") { path.append(point.id) }
                         .buttonStyle(.borderedProminent)
                 }
                 .padding()
-                .background(.regularMaterial)
+                .background(palette.sidebar)
             } else if let why = data?.sharedError {
                 Label(why, systemImage: "exclamationmark.triangle")
                     .font(.footnote).foregroundStyle(.secondary)
                     .padding(8)
             }
         }
+        .background(palette.canvas)
+        .toolbarBackground(palette.sidebar, for: .navigationBar)
+        .toolbarBackground(.visible, for: .navigationBar)
         .navigationTitle("Graph")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {

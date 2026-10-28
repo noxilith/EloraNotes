@@ -62,11 +62,24 @@ jobs:
           xcrun simctl bootstatus "$udid" -b
           xcrun simctl install "$udid" build/DerivedData/Build/Products/Debug-iphonesimulator/EloraNotes.app
           mkdir -p build/screenshots
-          for screen in list note graph search settings; do
+          # screen:theme:extra launch arguments. Every theme is looked at once or twice; the
+          # demo shows some notes as if they were in a shared library (the cloud folder).
+          for shot in \
+            list:Obsidian: note:Obsidian: graph:Obsidian: search:Obsidian: settings:Obsidian: \
+            list:Paper: graph:Paper: note:Paper: \
+            list:Nordic: graph:Nordic: list:Matcha: graph:Matcha: \
+            list:Sepia: graph:Sepia: list:Midnight: graph:Midnight: \
+            list:Obsidian:previews
+          do
+            screen=${shot%%:*}; rest=${shot#*:}; theme=${rest%%:*}; extra=${rest#*:}
+            args="-EloraDemo YES -EloraDemoShared YES -EloraDemoScreen $screen -EloraTheme $theme"
+            name="$screen-$(echo "$theme" | tr 'A-Z' 'a-z')"
+            if [ "$extra" = "previews" ]; then args="$args -EloraDemoPreviews YES"; name="$name-previews"; fi
             xcrun simctl terminate "$udid" io.github.noxilith.EloraNotes 2>/dev/null || true
-            xcrun simctl launch "$udid" io.github.noxilith.EloraNotes -EloraDemo YES -EloraDemoScreen "$screen"
-            sleep 10
-            xcrun simctl io "$udid" screenshot "build/screenshots/$screen.png"
+            # shellcheck disable=SC2086
+            xcrun simctl launch "$udid" io.github.noxilith.EloraNotes $args
+            sleep 8
+            xcrun simctl io "$udid" screenshot "build/screenshots/$name.png"
           done
       - name: Keep the screenshots
         if: always()

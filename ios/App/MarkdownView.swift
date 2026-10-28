@@ -7,6 +7,7 @@ struct MarkdownView: View {
     let text: String
     let links: [NoteLink]
     let open: (String) -> Void
+    @Environment(\.palette) private var palette
 
     private enum Block {
         case heading(Int, String)
@@ -111,28 +112,29 @@ struct MarkdownView: View {
                 case .task(let done, let value):
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
                         Image(systemName: done ? "checkmark.square.fill" : "square")
-                            .foregroundStyle(done ? Color.accentColor : .secondary)
+                            .foregroundStyle(done ? palette.accent : palette.fgMuted)
                         Text(inline(value)).strikethrough(done)
                     }
                 case .quote(let value):
                     HStack(spacing: 10) {
-                        Rectangle().fill(Color.accentColor).frame(width: 3)
-                        Text(inline(value)).foregroundStyle(.secondary)
+                        Rectangle().fill(palette.accent).frame(width: 3)
+                        Text(inline(value)).foregroundStyle(palette.fgSecondary)
                     }
                 case .code(let value):
                     Text(value)
                         .font(.system(.footnote, design: .monospaced))
                         .padding(10)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+                        .background(palette.elevated, in: RoundedRectangle(cornerRadius: 8))
                 case .rule:
-                    Divider()
+                    Rectangle().fill(palette.border).frame(height: 1)
                 case .paragraph(let value):
                     Text(inline(value))
                 }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .foregroundStyle(palette.fgPrimary)
         .textSelection(.enabled)
         .environment(
             \.openURL,

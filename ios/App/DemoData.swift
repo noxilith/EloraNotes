@@ -6,6 +6,10 @@ import Foundation
 enum DemoData {
     static var enabled: Bool { UserDefaults.standard.bool(forKey: "EloraDemo") }
     static var screen: String? { UserDefaults.standard.string(forKey: "EloraDemoScreen") }
+    /// Turns the preview line in the list on, which the app keeps in its own settings.
+    static var previews: Bool { UserDefaults.standard.bool(forKey: "EloraDemoPreviews") }
+    /// Shows some demo notes as if they were in a shared library, to see how that looks.
+    static var sharedPreview: Bool { UserDefaults.standard.bool(forKey: "EloraDemoShared") }
 
     static func folder() -> String {
         FileManager.default.temporaryDirectory
