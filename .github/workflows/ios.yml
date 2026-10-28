@@ -32,6 +32,8 @@ jobs:
       - name: Test the core
         working-directory: ios/core
         run: cargo test --locked
+      - name: Check the Apple key and save it
+        run: python3 ios/scripts/check-asc-key.py --write "$RUNNER_TEMP/keys/AuthKey_$ASC_KEY_ID.p8"
       - name: Build the core for the phone
         run: ios/scripts/build-core.sh
       - name: Install XcodeGen
@@ -119,11 +121,8 @@ jobs:
         run: |
           export MARKETING_VERSION="$(cat VERSION)"
           xcodegen generate
-      - name: Save the App Store Connect key
-        run: |
-          mkdir -p "$RUNNER_TEMP/keys"
-          printf '%s' "$ASC_KEY_P8" > "$RUNNER_TEMP/keys/AuthKey_$ASC_KEY_ID.p8"
       - name: Archive
+        timeout-minutes: 20
         working-directory: ios
         run: >
           xcodebuild archive -project EloraNotes.xcodeproj -scheme EloraNotes
@@ -134,6 +133,7 @@ jobs:
           -authenticationKeyID "$ASC_KEY_ID"
           -authenticationKeyIssuerID "$ASC_ISSUER_ID"
       - name: Sign it and upload it to TestFlight
+        timeout-minutes: 20
         working-directory: ios
         run: |
           cat > build/ExportOptions.plist <<PLIST

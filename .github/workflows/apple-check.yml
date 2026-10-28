@@ -1,0 +1,19 @@
+name: Check Apple key
+
+# Takes seconds and needs no Mac: asks Apple whether the four secrets for TestFlight work, and says
+# what is wrong when they do not. Run it from the Actions tab after changing a secret.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ask Apple
+        run: python3 ios/scripts/check-asc-key.py
