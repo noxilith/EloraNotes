@@ -30,6 +30,10 @@ elora-notes = { path = "../..", default-features = false, features = ["icons", "
 uniffi = "0.29"
 chrono = "0.4"
 
+# netdev 0.46.3 (under iroh) does not compile for iOS with the current libc: see vendor/netdev.
+[patch.crates-io]
+netdev = { path = "vendor/netdev" }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
