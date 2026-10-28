@@ -261,6 +261,7 @@ fn init(args: &[String]) -> Result<(), String> {
         password,
         notes_dir,
         bind,
+        ..ServerConfig::default()
     };
 
     std::fs::create_dir_all(&config.notes_dir)

@@ -18,6 +18,16 @@ struct Harness {
     profile: ServerProfile,
 }
 
+impl Harness {
+    /// The same server, as somebody let in with the view password.
+    fn viewer(&self) -> ServerProfile {
+        ServerProfile {
+            password: "peek".into(),
+            ..self.profile.clone()
+        }
+    }
+}
+
 impl Drop for Harness {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
@@ -33,8 +43,6 @@ fn start_server() -> Harness {
             .unwrap()
             .as_nanos()
     ));
-    // SAFETY: this file holds a single test, so nothing else reads the environment meanwhile.
-    unsafe { std::env::set_var("ELORA_SERVER_DIR", dir.join("server")) };
     let notes = dir.join("server-notes");
     std::fs::create_dir_all(&notes).unwrap();
     let owner_key = people::public_key(&key("alice"));
@@ -57,6 +65,8 @@ fn start_server() -> Harness {
         password: "letmein".into(),
         notes_dir: notes,
         bind: "127.0.0.1".into(),
+        view_password: "peek".into(),
+        identity_dir: Some(dir.join("server")),
     };
     let server = Arc::new(Server::new(config.clone()).expect("server"));
     let fingerprint = elora_notes::tls::read_fingerprint(&config).expect("fingerprint");
@@ -191,4 +201,72 @@ fn test_two_people_edit_one_shared_note_and_see_each_others_carets() {
     a.until("bob to leave", |w| {
         w.last.peers.iter().all(|p| p.name != "bob")
     });
+}
+
+/// A "view only" link: whoever joins with the view password sees the note and everybody's typing,
+/// and nothing they send changes it.
+#[test]
+fn test_a_reader_sees_everything_and_changes_nothing() {
+    let harness = start_server();
+    let editor = LiveNote::open(
+        harness.profile.clone(),
+        "alice".into(),
+        key("alice"),
+        "shared-0001".into(),
+    );
+    let reader = LiveNote::open(
+        harness.viewer(),
+        "bob".into(),
+        key("bob"),
+        "shared-0001".into(),
+    );
+    let (mut e, mut r) = (Watcher::new(&editor), Watcher::new(&reader));
+    e.until("the editor's text", |w| w.text.is_some());
+    r.until("the reader's text", |w| w.text.is_some());
+    assert_eq!(r.text.as_deref(), Some("hello world"));
+
+    // What the editor types reaches the reader, and the reader sees where the editor is.
+    editor.set_text("hello brave world");
+    editor.set_cursor(5);
+    r.until("the editor's words", |w| {
+        w.text.as_deref() == Some("hello brave world")
+    });
+    r.until("the editor's caret", |w| {
+        w.last
+            .peers
+            .iter()
+            .any(|p| p.name == "alice" && p.cursor == Some(5))
+    });
+
+    // What the reader sends changes nothing: not for the editor, and not on the server.
+    reader.set_text("hello brave world, hacked");
+    let quiet_until = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < quiet_until {
+        let look = editor.poll();
+        assert!(
+            look.text.as_deref().is_none_or(|t| !t.contains("hacked")),
+            "the reader's text reached the editor"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let on_disk = std::fs::read_to_string(harness.dir.join("server-notes/shared-0001.md")).unwrap();
+    assert!(!on_disk.contains("hacked"), "{on_disk}");
+
+    // A wrong password is still turned away, and an empty view password lets nobody in.
+    let wrong = LiveNote::open(
+        ServerProfile {
+            password: "nope".into(),
+            ..harness.profile.clone()
+        },
+        "mallory".into(),
+        key("mallory"),
+        "shared-0001".into(),
+    );
+    let mut w = Watcher::new(&wrong);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while w.last.error.is_none() && Instant::now() < deadline {
+        w.last = wrong.poll();
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    assert!(w.last.error.is_some() && !w.last.connected, "{:?}", w.last);
 }

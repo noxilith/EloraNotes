@@ -116,6 +116,8 @@ struct Client {
     /// account name disappear together.
     awareness: Mutex<HashSet<u64>>,
     authed: AtomicBool,
+    /// Let in with the view password: may read, and never change anything.
+    read_only: AtomicBool,
     outbox: Mutex<Vec<Frame>>,
 }
 
@@ -163,7 +165,7 @@ impl Server {
             .map_err(|e| format!("could not create {}: {e}", config.notes_dir.display()))?;
         let tls = crate::tls::server_config(&config)?;
         let library = Library::load(&config.notes_dir)?;
-        let people = Registry::load(ServerConfig::data_dir().join("people.json"))?;
+        let people = Registry::load(config.identity_folder().join("people.json"))?;
         Ok(Self {
             config,
             tls,
@@ -229,36 +231,71 @@ impl Server {
 
     /// Accepts connections until the listener fails.
     pub fn run(self: Arc<Self>) -> Result<(), String> {
+        let listener = self.listen()?;
         let addr = format!("{}:{}", self.config.bind, self.config.port);
-        let listener =
-            TcpListener::bind(&addr).map_err(|e| format!("could not listen on {addr}: {e}"))?;
         eprintln!(
             "elora-server \"{}\" listening on {addr} — {} note(s) in {}",
             self.config.name,
             self.library.lock().map(|l| l.notes.len()).unwrap_or(0),
             self.config.notes_dir.display()
         );
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => {
-                    let address = stream.peer_addr().ok().map(|peer| peer.ip());
-                    // Over the limit, the socket is simply closed: answering would mean a TLS
-                    // handshake, which is the very work being refused.
-                    let Some(admission) = self.admit(address) else {
-                        continue;
-                    };
-                    let server = Arc::clone(&self);
-                    std::thread::spawn(move || {
-                        let _admission = admission;
-                        if let Err(error) = server.serve(stream, address) {
-                            eprintln!("connection ended: {error}");
-                        }
-                    });
-                }
-                Err(error) => eprintln!("accept failed: {error}"),
-            }
+        self.serve_listener(listener, None)
+    }
+
+    /// Opens the port the config names (port 0 lets the system pick one: ask the listener).
+    pub fn listen(&self) -> Result<TcpListener, String> {
+        let addr = format!("{}:{}", self.config.bind, self.config.port);
+        TcpListener::bind(&addr).map_err(|e| format!("could not listen on {addr}: {e}"))
+    }
+
+    /// Serves connections from `listener`. With a `stop` flag it returns once the flag is set
+    /// (people already connected stay until their connection ends); without one, it runs until
+    /// the listener fails.
+    pub fn serve_listener(
+        self: Arc<Self>,
+        listener: TcpListener,
+        stop: Option<Arc<AtomicBool>>,
+    ) -> Result<(), String> {
+        if stop.is_some() {
+            listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         }
-        Ok(())
+        loop {
+            let accepted = listener.accept();
+            let stream = match accepted {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if stop
+                        .as_ref()
+                        .is_some_and(|stop| stop.load(Ordering::SeqCst))
+                    {
+                        return Ok(());
+                    }
+                    std::thread::sleep(Duration::from_millis(40));
+                    continue;
+                }
+                Err(error) => {
+                    if stop.is_some() {
+                        return Err(format!("accept failed: {error}"));
+                    }
+                    eprintln!("accept failed: {error}");
+                    continue;
+                }
+            };
+            stream.set_nonblocking(false).ok();
+            let address = stream.peer_addr().ok().map(|peer| peer.ip());
+            // Over the limit, the socket is simply closed: answering would mean a TLS
+            // handshake, which is the very work being refused.
+            let Some(admission) = self.admit(address) else {
+                continue;
+            };
+            let server = Arc::clone(&self);
+            std::thread::spawn(move || {
+                let _admission = admission;
+                if let Err(error) = server.serve(stream, address) {
+                    eprintln!("connection ended: {error}");
+                }
+            });
+        }
     }
 
     fn serve(self: Arc<Self>, stream: TcpStream, address: Option<IpAddr>) -> Result<(), String> {
@@ -279,6 +316,7 @@ impl Server {
             room: Mutex::new(None),
             awareness: Mutex::new(HashSet::new()),
             authed: AtomicBool::new(false),
+            read_only: AtomicBool::new(false),
             outbox: Mutex::new(Vec::new()),
         });
         self.clients
@@ -436,8 +474,14 @@ impl Server {
             );
             return Ok(false);
         }
-        let correct = constant_time_eq(password.as_bytes(), self.config.password.as_bytes());
+        let full = constant_time_eq(password.as_bytes(), self.config.password.as_bytes());
+        // The view password is only ever checked when there is one: an empty password must never
+        // let somebody in as a reader.
+        let view = !self.config.view_password.is_empty()
+            && constant_time_eq(password.as_bytes(), self.config.view_password.as_bytes());
+        let correct = full || view;
         self.record_password(client.address, correct);
+        client.read_only.store(!full && view, Ordering::SeqCst);
         if !correct {
             self.push(
                 client,
@@ -524,6 +568,17 @@ impl Server {
         // label the sidebar prints.
         let key = self.key_of(client);
         let who = self.name_of(client);
+        if client.read_only.load(Ordering::SeqCst)
+            && matches!(
+                message,
+                ClientMsg::Create { .. }
+                    | ClientMsg::SetShare { .. }
+                    | ClientMsg::Update { .. }
+                    | ClientMsg::Delete { .. }
+            )
+        {
+            return Err("this link only lets you read the note".to_string());
+        }
         match message {
             ClientMsg::Hello { .. } => Err("already connected".to_string()),
             ClientMsg::Ping => {
@@ -809,6 +864,13 @@ impl Server {
 
         let key = self.key_of(client);
         match op {
+            ATTACHMENT_SEND if client.read_only.load(Ordering::SeqCst) => {
+                self.push(
+                    client,
+                    FRAME_ATTACHMENT,
+                    net::encode_attachment(ATTACHMENT_MISSING, name, b""),
+                );
+            }
             ATTACHMENT_SEND => {
                 if bytes.is_empty() || bytes.len() > MAX_ATTACHMENT {
                     self.push(
@@ -919,6 +981,10 @@ impl Server {
                     }
                     YMessage::Sync(SyncMessage::SyncStep2(update))
                     | YMessage::Sync(SyncMessage::Update(update)) => {
+                        // A reader's changes are not applied, and not passed on to anybody.
+                        if client.read_only.load(Ordering::SeqCst) {
+                            return;
+                        }
                         self.apply_update(&note_id, client.id, update);
                     }
                     _ => {}
@@ -2181,6 +2247,7 @@ mod tests {
             password: "letmein".into(),
             notes_dir: dir.join("notes"),
             bind: "127.0.0.1".into(),
+            ..ServerConfig::default()
         };
         let server = Arc::new(Server::new(config).expect("server"));
         let busy: IpAddr = "203.0.113.7".parse().unwrap();
@@ -2232,6 +2299,7 @@ mod tests {
             password: "letmein".into(),
             notes_dir: notes,
             bind: "127.0.0.1".into(),
+            ..ServerConfig::default()
         };
         let server = Server::new(config).expect("server");
         {
@@ -2293,6 +2361,7 @@ mod tests {
             password: "letmein".into(),
             notes_dir: notes,
             bind: "127.0.0.1".into(),
+            ..ServerConfig::default()
         };
         let server = Arc::new(Server::new(config).expect("server"));
         std::thread::spawn(move || {
@@ -2622,6 +2691,7 @@ mod tests {
             password: "letmein".into(),
             notes_dir: notes,
             bind: "127.0.0.1".into(),
+            ..ServerConfig::default()
         };
         let server = Server::new(config).expect("server");
         let client = |identity: &str| {
@@ -2633,6 +2703,7 @@ mod tests {
                 room: Mutex::new(None),
                 awareness: Mutex::new(HashSet::new()),
                 authed: AtomicBool::new(true),
+                read_only: AtomicBool::new(false),
                 outbox: Mutex::new(Vec::new()),
             })
         };

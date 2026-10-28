@@ -221,6 +221,7 @@ mod tests {
             password: "pw".into(),
             notes_dir: dir.join("notes"),
             bind: "127.0.0.1".into(),
+            ..ServerConfig::default()
         };
         // The helpers write next to the config dir, so point ELORA_SERVER_DIR at the temp dir.
         // SAFETY: the lock keeps the other test that changes this variable out of the way.

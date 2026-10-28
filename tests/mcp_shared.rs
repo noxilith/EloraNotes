@@ -62,6 +62,7 @@ fn start_server() -> Harness {
         password: "letmein".into(),
         notes_dir: server_notes.clone(),
         bind: "127.0.0.1".into(),
+        ..ServerConfig::default()
     };
     let server = Arc::new(Server::new(config.clone()).expect("server"));
     let fingerprint = elora_notes::tls::read_fingerprint(&config).expect("fingerprint");

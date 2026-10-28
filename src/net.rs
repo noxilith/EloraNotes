@@ -414,6 +414,28 @@ pub struct ServerConfig {
     /// Bind address; `0.0.0.0` accepts connections from other machines.
     #[serde(default = "default_bind")]
     pub bind: String,
+    /// A second password that lets somebody in to read but not to change anything: what a "view
+    /// only" share link carries. Empty means there is none.
+    #[serde(default)]
+    pub view_password: String,
+    /// Where this server keeps its certificate and its list of people, when that is not the
+    /// shared per-user folder: a temporary server for one shared note has a folder of its own.
+    #[serde(default, skip_serializing)]
+    pub identity_dir: Option<PathBuf>,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            port: 7331,
+            password: String::new(),
+            notes_dir: PathBuf::from("notes"),
+            bind: default_bind(),
+            view_password: String::new(),
+            identity_dir: None,
+        }
+    }
 }
 
 fn default_bind() -> String {
@@ -456,11 +478,16 @@ impl ServerConfig {
 
     /// Cert and key live beside the config so a re-install keeps the fingerprint clients pinned.
     pub fn cert_path(&self) -> PathBuf {
-        Self::data_dir().join("cert.pem")
+        self.identity_folder().join("cert.pem")
     }
 
     pub fn key_path(&self) -> PathBuf {
-        Self::data_dir().join("key.pem")
+        self.identity_folder().join("key.pem")
+    }
+
+    /// The folder this server's certificate and people list live in.
+    pub fn identity_folder(&self) -> PathBuf {
+        self.identity_dir.clone().unwrap_or_else(Self::data_dir)
     }
 }
 
@@ -680,6 +707,7 @@ mod tests {
             password: "pw".into(),
             notes_dir: PathBuf::from("/tmp/notes"),
             bind: "0.0.0.0".into(),
+            ..ServerConfig::default()
         };
         let text = serde_json::to_string(&config).unwrap();
         let back: ServerConfig = serde_json::from_str(&text).unwrap();

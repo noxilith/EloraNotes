@@ -23,12 +23,14 @@ path = "src/bin/elora-server.rs"
 default = ["gui"]
 # Everything that draws a window. `cargo build --no-default-features --bin elora-server`
 # produces a server binary with no X11/GL/wayland dependency at all.
-gui = ["assistants", "icons", "dep:eframe", "dep:egui", "dep:image", "dep:arboard", "dep:rfd"]
+gui = ["assistants", "icons", "share", "dep:eframe", "dep:egui", "dep:image", "dep:arboard", "dep:rfd"]
 # The parts that let AI apps use the notes: the MCP server, the setup of AI apps' settings and the
 # memory skill. A build that does not want them (the server, the phone app's core) leaves them out.
 assistants = []
 # The table of icon names and their glyphs, for builds with no window that still draw note icons.
 icons = []
+# Sharing one note by link, with nobody running a server: devices connect to each other directly.
+share = ["dep:iroh", "dep:tokio"]
 
 [dependencies]
 eframe = { version = "0.31", optional = true, default-features = false, features = [
@@ -70,6 +72,9 @@ rand = "0.9"
 base64 = "0.22"
 crossbeam-channel = "0.5"
 zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
+# Direct connections between devices, through firewalls, for sharing a note by link.
+iroh = { version = "1.4", optional = true }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread", "net", "io-util", "time", "sync"] }
 
 [target."cfg(unix)".dependencies]
 flate2 = "1"

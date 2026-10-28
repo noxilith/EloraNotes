@@ -26,6 +26,8 @@ pub mod mcp_shared;
 pub mod net;
 pub mod people;
 pub mod server;
+#[cfg(feature = "share")]
+pub mod share;
 #[cfg(feature = "assistants")]
 pub mod skills;
 pub mod storage;

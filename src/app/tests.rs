@@ -2190,6 +2190,7 @@ fn start_shared_server(label: &str) -> (PathBuf, u16, String) {
         password: "letmein".into(),
         notes_dir,
         bind: "127.0.0.1".into(),
+        ..crate::net::ServerConfig::default()
     };
     let server = std::sync::Arc::new(crate::server::Server::new(config).expect("server"));
     std::thread::spawn(move || {
