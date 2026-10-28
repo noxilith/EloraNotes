@@ -43,6 +43,11 @@ targets:
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UILaunchScreen: {}
+        # Share links (elora://share/…) open the app and join the note.
+        CFBundleURLTypes:
+          - CFBundleURLName: io.github.noxilith.EloraNotes.share
+            CFBundleURLSchemes:
+              - elora
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft

@@ -10,7 +10,7 @@ use elora_notes::graph_layout::{GraphNode, GraphView};
 use elora_notes::live::LiveNote;
 use elora_notes::mcp_shared::{is_shared, meta_with, note_from_meta, NewNote, Shared};
 use elora_notes::net::NoteMeta;
-use elora_notes::share::{Access, Network, ShareHost};
+use elora_notes::share::{find_link, join, Access, Joined, Network, ShareHost};
 use elora_notes::storage::{extract_wiki_links, AppSettings, Note, NoteStorage};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -243,6 +243,72 @@ impl ShareSession {
         self.live.close();
         lock(&self.host).take();
     }
+}
+
+/// Somebody else's note, joined from a link. It lives only while this is held: nothing of it is
+/// written to the phone.
+#[derive(uniffi::Object)]
+pub struct JoinedShare {
+    title: String,
+    view_only: bool,
+    live: Arc<LiveSession>,
+    joined: Mutex<Option<Joined>>,
+}
+
+#[uniffi::export]
+impl JoinedShare {
+    pub fn title(&self) -> String {
+        self.title.clone()
+    }
+
+    /// True for a link that only lets people watch.
+    pub fn view_only(&self) -> bool {
+        self.view_only
+    }
+
+    /// The note as everybody sees it.
+    pub fn live(&self) -> Arc<LiveSession> {
+        self.live.clone()
+    }
+
+    /// Leaves the note.
+    pub fn leave(&self) {
+        self.live.close();
+        lock(&self.joined).take();
+    }
+}
+
+/// The share link in some text, if there is one: a pasted message, or the page's address.
+#[uniffi::export]
+pub fn find_share_link(text: String) -> Option<String> {
+    find_link(&text)
+}
+
+/// Joins the note a link shares. Takes a moment (the person sharing is reached first), so ask for
+/// it away from the screen's own thread.
+#[uniffi::export]
+pub fn join_share(link: String, name: String) -> Result<Arc<JoinedShare>, CoreError> {
+    let link = find_link(&link).ok_or_else(|| failed("that is not a share link"))?;
+    let joined = join(&link, Network::Internet).map_err(failed)?;
+    let name = if name.trim().is_empty() {
+        "Guest".to_string()
+    } else {
+        name
+    };
+    let live = Arc::new(LiveSession {
+        note: LiveNote::open(
+            joined.profile.clone(),
+            name,
+            format!("phone-{}", joined.note_id),
+            joined.note_id.clone(),
+        ),
+    });
+    Ok(Arc::new(JoinedShare {
+        title: joined.title.clone(),
+        view_only: joined.view_only,
+        live,
+        joined: Mutex::new(Some(joined)),
+    }))
 }
 
 type Job = Box<dyn FnOnce(&Shared) + Send>;

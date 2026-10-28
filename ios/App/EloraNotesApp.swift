@@ -10,6 +10,10 @@ struct EloraNotesApp: App {
                 .environmentObject(library)
                 .themed()
                 .task { await library.start() }
+                .onOpenURL { url in
+                    // elora://share/… from a tap on a link, or from the join page.
+                    library.pendingLink = url.absoluteString
+                }
         }
     }
 }

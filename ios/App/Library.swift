@@ -21,6 +21,12 @@ final class Library: ObservableObject {
     /// Notes from this phone being shared by link, by note id. Sharing goes on while the note is
     /// closed and stops with Stop sharing or when the app quits.
     @Published var shares: [String: ShareSession] = [:]
+    /// Notes joined from somebody else's link, by the id used to open them. They exist only while
+    /// they are held here: nothing of them is written to the phone.
+    @Published var joined: [String: JoinedShare] = [:]
+    @Published var joining = false
+    /// A share link the app was opened with, waiting to be joined.
+    @Published var pendingLink: String?
     /// Notes in the trash, as last loaded.
     @Published var trashed: [NoteSummary] = []
     /// A short message after something was done, which goes away by itself.
@@ -139,6 +145,41 @@ final class Library: ObservableObject {
             } catch {
                 problem = describe(error)
             }
+        }
+    }
+
+    /// Joins the note a link shares and returns the id to open it by.
+    func join(_ text: String) async -> String? {
+        guard !joining else { return nil }
+        joining = true
+        defer { joining = false }
+        let name = serverDisplayName
+        do {
+            let share = try await run { _ in try joinShare(link: text, name: name) }
+            let id = "joined:" + UUID().uuidString
+            joined[id] = share
+            return id
+        } catch {
+            showNotice(describe(error))
+            return nil
+        }
+    }
+
+    /// Leaves a joined note: it goes from the list and nothing of it stays.
+    func leave(_ id: String) {
+        joined[id]?.leave()
+        joined[id] = nil
+    }
+
+    /// Keeps what a joined note said last as a note of the person's own.
+    func keepCopy(title: String, body: String) async {
+        do {
+            let summary = try await run {
+                try $0.createNote(title: "\(title) (copy)", folder: nil, body: body, shared: false)
+            }
+            replace(summary)
+        } catch {
+            problem = describe(error)
         }
     }
 

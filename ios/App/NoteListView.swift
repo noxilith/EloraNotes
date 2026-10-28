@@ -20,6 +20,7 @@ struct NoteListView: View {
     @State private var showNew = false
     @State private var showGraph = false
     @State private var showTrash = false
+    @State private var showJoin = false
     @State private var moving: NoteSummary?
     @State private var path: [String] = []
 
@@ -69,7 +70,22 @@ struct NoteListView: View {
             .background(palette.sidebar)
             .toolbar(.hidden, for: .navigationBar)
             .navigationDestination(for: String.self) { id in
-                NoteView(noteID: id, path: $path)
+                if id.hasPrefix("joined:") {
+                    JoinedNoteView(id: id, path: $path)
+                } else {
+                    NoteView(noteID: id, path: $path)
+                }
+            }
+            .onChange(of: library.pendingLink) { _, link in
+                // A share link the app was opened with joins straight away.
+                guard let link else { return }
+                library.pendingLink = nil
+                Task {
+                    if let id = await library.join(link) { path.append(id) }
+                }
+            }
+            .sheet(isPresented: $showJoin) {
+                JoinSheet { id in path.append(id) }
             }
             .navigationDestination(isPresented: $showGraph) {
                 GraphScreen(path: $path)
@@ -162,6 +178,16 @@ struct NoteListView: View {
             Text("notes").font(AppFont.body(21)).foregroundStyle(palette.fgMuted)
             Spacer()
             Button {
+                showJoin = true
+            } label: {
+                Image(systemName: "link")
+                    .font(.system(size: 18))
+                    .foregroundStyle(palette.fgPrimary)
+                    .padding(10)
+                    .background(palette.elevated, in: RoundedRectangle(cornerRadius: 9))
+            }
+            .accessibilityLabel("Join a shared note")
+            Button {
                 showNew = true
             } label: {
                 HStack(spacing: 6) {
@@ -241,6 +267,23 @@ struct NoteListView: View {
         let pinned = library.notes.filter { $0.pinned }
         let remote = split(library.notes.filter { $0.shared && !$0.pinned })
         let local = split(library.notes.filter { !$0.shared && !$0.pinned })
+
+        if !library.joined.isEmpty {
+            sectionHeading(Icon.cloud, "SHARED WITH YOU", tint: palette.accent)
+            ForEach(library.joined.keys.sorted(), id: \.self) { id in
+                Button {
+                    path.append(id)
+                } label: {
+                    Text(library.joined[id]?.title() ?? "Shared note")
+                        .font(AppFont.body(17)).foregroundStyle(palette.fgPrimary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.plain)
+                .listRowInsets(inset(0))
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
+            }
+        }
 
         if !pinned.isEmpty {
             sectionHeading(Icon.pinned, "PINNED", tint: palette.pin)
