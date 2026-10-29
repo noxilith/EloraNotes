@@ -28,8 +28,12 @@ ios/
   tap a note to light it and its links, then open it. The links inside shared notes are read from
   the server (and kept, so the next graph is quick).
 
-Not yet: pictures in notes, tags and folders as screens of their own, and live co-editing (a
-shared note is saved as a whole when you stop typing).
+- **Share a note by link.** The share button next to Edit makes a link that lets people edit or
+  only watch, with no server. The link button in the list joins one (and `elora://` links open the
+  app). A joined note is never saved; if the person sharing is lost the note closes and a copy is
+  kept on the phone.
+
+Not yet: pictures in notes, and tags and folders as screens of their own.
 
 ## Looking at it before you set up TestFlight
 

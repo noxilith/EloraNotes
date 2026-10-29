@@ -22,7 +22,7 @@ a login only you have.
 
 **Promotional text (170)**
 
-A calm, fast notes app. Plain Markdown files, [[wiki links]], backlinks, a graph of how your notes connect, and optional live sharing with the people you choose.
+A calm, fast notes app. Plain Markdown files, [[wiki links]], backlinks, a graph of how your notes connect, and live sharing by link with the people you choose.
 
 **Description (4000)**
 
@@ -38,6 +38,7 @@ CONNECT
 • A graph of your notes: linked notes gather into coloured clusters, loose notes sit on an arc below. Pinch to zoom, drag to move, tap a note to light up its links
 
 SHARE (OPTIONAL)
+• Share a note by link with anyone, with no server and no account: they edit it with you or only watch, live, each in their own colour
 • Connect to a shared library on a server you run (the free EloraNotes server) and edit notes together in real time
 • See everyone else's cursor, in their colour, with their name, as they type
 • No cloud service in between: your notes go only to your own server
@@ -66,7 +67,8 @@ user-generated content shared with strangers). The result is 4+.
 
 **Data Not Collected.** The app has no analytics or third-party SDKs and sends nothing to the
 developer. The optional shared library sends notes to the user's own server, which is not the
-developer. (See the privacy policy.)
+developer. A note shared by link goes straight to the people holding the link (through public
+relays that only carry encrypted traffic), not to the developer. (See the privacy policy.)
 
 ## Export compliance
 
@@ -88,6 +90,10 @@ held for the export-compliance question.
 > elora-server, https://github.com/noxilith/EloraNotes). To try it, use: **you:** server address,
 > port, password, a name and an identifier for a demo server that is online during review.
 > The app does not send anything anywhere until a server is entered.
+>
+> Sharing a note by link needs no server either: open a note, tap the share button next to Edit,
+> choose a kind of access and "Make a link". On a second device, the link joins from the link
+> button in the list (or by opening it). The note is shared while the app is open.
 
 (**you:** App Review may ask to test the shared library. Put a small demo server online for the
 review and fill in its details above.)
