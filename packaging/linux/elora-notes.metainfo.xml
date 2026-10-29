@@ -25,6 +25,15 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.15.2" date="2026-10-29">
+      <description>
+        <p>
+          A note you joined from a link now closes if the person sharing it cannot be reached for
+          a few seconds, and what it said last is kept as a note of your own called "(copy)". The
+          iPhone app can now share a note by link and join one.
+        </p>
+      </description>
+    </release>
     <release version="0.15.1" date="2026-10-29">
       <description>
         <p>
