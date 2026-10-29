@@ -181,11 +181,13 @@ struct NoteListView: View {
                 showJoin = true
             } label: {
                 Image(systemName: "link")
-                    .font(.system(size: 18))
+                    .font(.system(size: 17))
                     .foregroundStyle(palette.fgPrimary)
-                    .padding(10)
+                    .frame(width: 40, height: 38)
                     .background(palette.elevated, in: RoundedRectangle(cornerRadius: 9))
             }
+            .fixedSize()
+            .padding(.trailing, 4)
             .accessibilityLabel("Join a shared note")
             Button {
                 showNew = true

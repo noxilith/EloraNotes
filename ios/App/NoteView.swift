@@ -47,17 +47,22 @@ struct NoteView: View {
         .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItemGroup(placement: .topBarTrailing) {
-                if detail != nil, !shared {
-                    Button { showShare = true } label: {
-                        Image(systemName: sharing == nil ? "person.crop.circle.badge.plus" : "person.2.fill")
+            ToolbarItem(placement: .topBarTrailing) {
+                HStack(spacing: 18) {
+                    if detail != nil, !shared {
+                        Button { showShare = true } label: {
+                            Image(systemName: sharing == nil ? "person.badge.plus" : "person.2.fill")
+                                .font(.system(size: 17))
+                                .frame(width: 26, height: 26)
+                        }
+                        .accessibilityLabel("Share")
                     }
-                    .accessibilityLabel("Share")
+                    Button(editing ? "Done" : "Edit") {
+                        Task { await toggle() }
+                    }
+                    .fixedSize()
+                    .disabled(!canEdit)
                 }
-                Button(editing ? "Done" : "Edit") {
-                    Task { await toggle() }
-                }
-                .disabled(!canEdit)
             }
         }
         .overlay(alignment: .bottom) {
