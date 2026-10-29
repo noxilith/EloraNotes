@@ -175,8 +175,10 @@ struct NoteListView: View {
             Glyph(Icon.feather, size: 26, color: palette.accent)
                 .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] + 6 }
             Text("elora").font(AppFont.body(32)).foregroundStyle(palette.fgPrimary)
+                .lineLimit(1).minimumScaleFactor(0.7)
             Text("notes").font(AppFont.body(21)).foregroundStyle(palette.fgMuted)
-            Spacer()
+                .lineLimit(1).minimumScaleFactor(0.7)
+            Spacer(minLength: 8)
             Button {
                 showJoin = true
             } label: {
@@ -195,7 +197,9 @@ struct NoteListView: View {
                 HStack(spacing: 6) {
                     Glyph(Icon.plus, size: 16, color: palette.fgPrimary)
                     Text("New").font(AppFont.body(17)).foregroundStyle(palette.fgPrimary)
+                        .lineLimit(1)
                 }
+                .fixedSize()
                 .padding(.horizontal, 14)
                 .padding(.vertical, 9)
                 .background(palette.accent.opacity(0.55), in: RoundedRectangle(cornerRadius: 9))

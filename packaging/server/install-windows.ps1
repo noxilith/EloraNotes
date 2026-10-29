@@ -303,6 +303,12 @@ function Invoke-Installer {
         Fail "ELORA_ACTION must be 'update', 'uninstall' or 'purge', not '$action'"
     }
 
+    # Asked to remove a server that is not here, it must not install one instead.
+    if (-not $existing -and ($action -eq "uninstall" -or $action -eq "purge")) {
+        Write-Host "EloraNotes server is not installed on this machine; nothing to remove."
+        return
+    }
+
     $notesDir = Join-Path $InstallDir "notes"
     if ($cur -and $cur.NotesDir) { $notesDir = $cur.NotesDir }
 

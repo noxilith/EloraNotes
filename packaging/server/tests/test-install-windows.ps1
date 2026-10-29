@@ -255,6 +255,8 @@ try {
     $r = Invoke-InstallerRun @{ ELORA_ACTION = "purge" }
     Check "purge succeeds" ($r.Code -eq 0)
     Check "the settings folder is gone" (-not (Test-Path $installDir))
+    $r = Invoke-InstallerRun @{ ELORA_ACTION = "uninstall" }
+    Check "uninstalling what is not installed says so and installs nothing" ($r.Code -eq 0 -and $r.Output -match "not installed" -and -not (Test-Path $installedBinary))
 
     # --- a port in use ----------------------------------------------------------------------
     Section "a port that is already in use"

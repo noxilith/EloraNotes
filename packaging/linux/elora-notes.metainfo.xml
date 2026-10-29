@@ -25,6 +25,14 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.15.3" date="2026-10-29">
+      <description>
+        <p>
+          The Windows server installer no longer installs a server when asked to uninstall one that
+          is not there. The iPhone app's New button no longer wraps onto two lines.
+        </p>
+      </description>
+    </release>
     <release version="0.15.2" date="2026-10-29">
       <description>
         <p>
