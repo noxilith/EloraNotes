@@ -856,6 +856,32 @@ impl Vault {
         Ok(summary_of(&note_from_meta(&saved, String::new())))
     }
 
+    /// Pins a note to the top of the list, or takes the pin off.
+    pub fn set_pinned(&self, id: String, pinned: bool) -> Result<NoteSummary, CoreError> {
+        {
+            let mut local = lock(&self.local);
+            if let Some(index) = local.notes.iter().position(|n| n.id == id) {
+                local.notes[index].pinned = pinned;
+                local.notes[index].updated_at = chrono::Utc::now();
+                let note = local.notes[index].clone();
+                local.storage.save_note(&note).map_err(failed)?;
+                return Ok(summary_of(&note));
+            }
+        }
+        let settings = self
+            .settings()
+            .ok_or_else(|| failed("that note is not on this phone"))?;
+        let meta = self.meta_of(&id)?;
+        let mut note = note_from_meta(&meta, String::new());
+        note.pinned = pinned;
+        let wanted = meta_with(&meta, &note);
+        let saved = self
+            .worker
+            .run(move |shared| shared.update(&settings, &wanted))?
+            .map_err(failed)?;
+        Ok(summary_of(&note_from_meta(&saved, String::new())))
+    }
+
     /// Makes a copy on this phone: of a note here, or of a shared note, which brings it down from
     /// the server. The copy is named after the note and ends in "copy".
     pub fn copy_note(&self, id: String) -> Result<NoteSummary, CoreError> {

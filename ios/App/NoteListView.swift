@@ -369,6 +369,11 @@ struct NoteListView: View {
             .buttonStyle(.plain)
             .contextMenu {
                 Button {
+                    Task { await library.setPinned(note, !note.pinned) }
+                } label: {
+                    Label(note.pinned ? "Unpin" : "Pin", systemImage: note.pinned ? "pin.slash" : "pin")
+                }
+                Button {
                     moving = note
                 } label: {
                     Label(note.folder == nil ? "Add to a folder…" : "Change folder…", systemImage: "folder")

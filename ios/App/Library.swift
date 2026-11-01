@@ -266,6 +266,16 @@ final class Library: ObservableObject {
         }
     }
 
+    func setPinned(_ note: NoteSummary, _ pinned: Bool) async {
+        do {
+            let summary = try await run { try $0.setPinned(id: note.id, pinned: pinned) }
+            replace(summary)
+            showNotice(pinned ? "Pinned to the top" : "Unpinned")
+        } catch {
+            problem = describe(error)
+        }
+    }
+
     /// A copy on this phone: of a note here, or of a shared note.
     @discardableResult
     func copy(_ note: NoteSummary) async -> NoteSummary? {
