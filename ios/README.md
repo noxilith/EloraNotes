@@ -33,7 +33,9 @@ ios/
   app). A joined note is never saved; if the person sharing is lost the note closes and a copy is
   kept on the phone.
 
-Not yet: pictures in notes, and tags and folders as screens of their own.
+- **Pictures.** Pictures in notes show on the phone, whether they are in the notes folder or fetched from the shared library (and kept on the phone). Tap one to see it full screen and save it to Photos or share it; the photo button while editing adds one, and for a shared note it is sent to the library.
+
+Not yet: tags and folders as screens of their own.
 
 ## Looking at it before you set up TestFlight
 

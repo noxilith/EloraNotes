@@ -34,23 +34,29 @@ struct ShareSheet: View {
                     Section {
                         Text(link)
                             .font(.footnote.monospaced())
-                            .lineLimit(3)
+                            .lineLimit(4)
                             .textSelection(.enabled)
-                        ShareLink(item: link) { Label("Send link", systemImage: "square.and.arrow.up") }
+                        if let url = URL(string: link) {
+                            ShareLink(
+                                item: url,
+                                message: Text("Join my note in EloraNotes: \(link)")
+                            ) { Label("Send link", systemImage: "square.and.arrow.up") }
+                        }
                         Button {
                             UIPasteboard.general.string = link
                             copied = true
                         } label: {
                             Label(copied ? "Copied" : "Copy link", systemImage: "doc.on.doc")
                         }
-                        Button {
-                            UIPasteboard.general.string = session.link(viewOnly: viewOnly, web: false)
-                            copied = true
-                        } label: {
-                            Label("Copy app link", systemImage: "link")
-                        }
                     } footer: {
-                        Text("The link works while EloraNotes is open on this phone. Treat it like a password: anyone who has it can get in.")
+                        Text("Opening the link starts EloraNotes and joins the note. It works while EloraNotes is open on this phone. Treat it like a password: anyone who has it can get in.")
+                    }
+                    if let state = library.shareLive[noteID], !state.people.isEmpty {
+                        Section("Here now") {
+                            ForEach(Array(state.people.enumerated()), id: \.offset) { _, person in
+                                Text(person.name)
+                            }
+                        }
                     }
                     Section {
                         Button("Stop sharing", role: .destructive) {

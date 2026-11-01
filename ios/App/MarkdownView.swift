@@ -27,6 +27,7 @@ struct MarkdownView: View {
         case code(String)
         case rule
         case table([[String]])
+        case image(String, String, CGFloat?)
         case paragraph(String)
     }
 
@@ -74,6 +75,17 @@ struct MarkdownView: View {
             flushTable()
             if trimmed.isEmpty { continue }
             let indent = depth(of: line)
+            if trimmed.contains("!["), let pieces = Self.pictures(in: trimmed) {
+                for piece in pieces {
+                    switch piece {
+                    case .text(let words):
+                        if !words.isEmpty { blocks.append(.paragraph(words)) }
+                    case .picture(let alt, let src, let width):
+                        blocks.append(.image(alt, src, width))
+                    }
+                }
+                continue
+            }
             if trimmed == "---" || trimmed == "***" || trimmed == "___" {
                 blocks.append(.rule)
             } else if let level = headingLevel(trimmed) {
@@ -95,6 +107,38 @@ struct MarkdownView: View {
             blocks.append(.code(lines.joined(separator: "\n")))
         }
         return blocks
+    }
+
+    private enum Piece {
+        case text(String)
+        case picture(String, String, CGFloat?)
+    }
+
+    /// A line cut into its words and its `![alt](src){width=N}` pictures, or `nil` when it has none.
+    private static func pictures(in line: String) -> [Piece]? {
+        guard let pattern = try? NSRegularExpression(
+            pattern: #"!\[([^\]]*)\]\(\s*<?([^)\s>]+)>?\s*\)(?:\{width=(\d+)\})?"#)
+        else { return nil }
+        let whole = NSRange(line.startIndex..., in: line)
+        let found = pattern.matches(in: line, range: whole)
+        guard !found.isEmpty else { return nil }
+        var pieces: [Piece] = []
+        var from = line.startIndex
+        for match in found {
+            guard let all = Range(match.range, in: line),
+                  let alt = Range(match.range(at: 1), in: line),
+                  let src = Range(match.range(at: 2), in: line)
+            else { continue }
+            pieces.append(.text(String(line[from..<all.lowerBound]).trimmingCharacters(in: .whitespaces)))
+            var width: CGFloat?
+            if match.range(at: 3).location != NSNotFound, let digits = Range(match.range(at: 3), in: line) {
+                width = Double(line[digits]).map { CGFloat($0) }
+            }
+            pieces.append(.picture(String(line[alt]), String(line[src]), width))
+            from = all.upperBound
+        }
+        pieces.append(.text(String(line[from...]).trimmingCharacters(in: .whitespaces)))
+        return pieces
     }
 
     private func headingLevel(_ line: String) -> Int? {
@@ -409,6 +453,8 @@ struct MarkdownView: View {
                     Rectangle().fill(palette.border).frame(height: 1)
                 case .table(let rows):
                     table(rows)
+                case .image(let alt, let src, let width):
+                    NotePicture(src: src, alt: alt, width: width)
                 case .paragraph(let value):
                     Text(inline(value, size: 18))
                 }

@@ -638,9 +638,9 @@ impl EloraApp {
             name_committed = typed.lost_focus();
         });
         // The identifier is a key, not a word: it is made once by the app, copied to another
-        // computer to be the same person there, and never edited for fun. There is no "make a
-        // new one" button because the server keeps a name bound to the key that claimed it —
-        // a fresh key would be a stranger, locked out of the name and the notes behind it.
+        // computer to be the same person there, and never edited for fun. Making a new one is
+        // possible but asks twice, because the server keeps a name bound to the key that claimed
+        // it: a fresh key is a stranger, locked out of the name and the notes behind it.
         ui.horizontal(|ui| {
             ui.label("Identifier");
             let typed = ui
@@ -655,12 +655,33 @@ impl EloraApp {
                      notes follow you to another computer: copy this value into the same box \
                      there. Treat it like a password.",
                 );
-            let long_enough = self.identifier.trim().len() >= MIN_IDENTIFIER;
+            let long_enough = self.identifier.trim().chars().count() >= MIN_IDENTIFIER;
             identifier_changed = typed.changed() && long_enough;
             // A pasted key only takes effect when the box is left, and only if it is a different
             // one from the connection already open: clicking Copy must not re-key.
             identifier_committed =
                 typed.lost_focus() && long_enough && self.identifier != self.sent_identifier;
+            let asking = self.confirm_new_identifier;
+            if ui
+                .small_button(if asking { "Make a new one?" } else { "New" })
+                .on_hover_text(
+                    "Make a new identifier. The server will see you as a different person: the \
+                     name and notes tied to the old identifier stay with it, so copy the old one \
+                     first if you want it back.",
+                )
+                .clicked()
+            {
+                if asking {
+                    self.identifier = super::sharing::fresh_identifier();
+                    self.confirm_new_identifier = false;
+                    identifier_changed = true;
+                    identifier_committed = true;
+                    self.status_message =
+                        Some("Made a new identifier; copy it to your other computers".to_string());
+                } else {
+                    self.confirm_new_identifier = true;
+                }
+            }
             if ui
                 .small_button("Copy")
                 .on_hover_text("Copy this identifier, to paste into EloraNotes on another computer")
@@ -673,11 +694,12 @@ impl EloraApp {
                 );
             }
         });
-        if self.identifier.trim().len() < MIN_IDENTIFIER {
+        if self.identifier.trim().chars().count() < MIN_IDENTIFIER {
             ui.label(
                 RichText::new(format!(
                     "This identifier is too short to be a key: it needs at least {MIN_IDENTIFIER} \
-                     characters. Paste the one from your other computer here.",
+                     characters. Press New for a fresh one, or paste the one from your other \
+                     computer here.",
                 ))
                 .size(10.5)
                 .color(p.danger),

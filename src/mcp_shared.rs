@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 const CONNECT_WAIT: Duration = Duration::from_secs(10);
 /// How long the server has to answer one request.
 const ANSWER_WAIT: Duration = Duration::from_secs(8);
+/// A picture can be several megabytes, so its transfer is given longer than an answer.
+const PICTURE_WAIT: Duration = Duration::from_secs(40);
 /// After a failed connection, how long before another is tried, so a server that is down does
 /// not make every tool call wait out the timeout again.
 const RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -108,7 +110,7 @@ impl Shared {
         let identifier = settings.identifier.clone();
         let problem = if name.is_empty() {
             Some("set your name in EloraNotes under Settings → Shared library".to_string())
-        } else if identifier.trim().len() < MIN_IDENTIFIER {
+        } else if identifier.trim().chars().count() < MIN_IDENTIFIER {
             Some("the shared library needs your identifier; set it in EloraNotes".to_string())
         } else {
             None
@@ -220,6 +222,64 @@ impl Shared {
                 .iter()
                 .find(|n| n.id == wanted.id && same_properties(n, &wanted))
                 .map(|n| Ok(n.clone())),
+            Incoming::Refused(why) => Some(Err(why.clone())),
+            _ => None,
+        })
+    }
+
+    /// A picture from the library's `attachments` folder, or `None` when the library does not have
+    /// it.
+    pub fn fetch_attachment(
+        &self,
+        settings: &AppSettings,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>, String> {
+        if !crate::net::valid_attachment_name(name) {
+            return Err(format!("{name} is not a picture name"));
+        }
+        if !self.ensure(settings)? {
+            return Err("no shared library is set up".to_string());
+        }
+        let mut state = self.state.borrow_mut();
+        state.collab.fetch_attachment(name);
+        let wanted = name.to_string();
+        wait_for(&mut state.collab, PICTURE_WAIT, |event| match event {
+            Incoming::Attachment { name, bytes } if *name == wanted => {
+                Some(Ok(Some(bytes.clone())))
+            }
+            Incoming::AttachmentMissing { name } if *name == wanted => Some(Ok(None)),
+            Incoming::Refused(why) => Some(Err(why.clone())),
+            _ => None,
+        })
+    }
+
+    /// Puts a picture in the library's `attachments` folder, where everybody with the note can
+    /// fetch it. Returns once the library says it has it.
+    pub fn upload_attachment(
+        &self,
+        settings: &AppSettings,
+        name: &str,
+        bytes: Vec<u8>,
+    ) -> Result<(), String> {
+        if !crate::net::valid_attachment_name(name) {
+            return Err(format!("{name} is not a picture name"));
+        }
+        if bytes.is_empty() || bytes.len() > crate::net::MAX_ATTACHMENT {
+            return Err(
+                "the picture is too large to share with the library (over 12 MB)".to_string(),
+            );
+        }
+        if !self.ensure(settings)? {
+            return Err("no shared library is set up".to_string());
+        }
+        let mut state = self.state.borrow_mut();
+        state.collab.upload_attachment(name, bytes);
+        let wanted = name.to_string();
+        wait_for(&mut state.collab, PICTURE_WAIT, |event| match event {
+            Incoming::AttachmentStored { name } if *name == wanted => Some(Ok(())),
+            Incoming::AttachmentMissing { name } if *name == wanted => {
+                Some(Err("the library did not keep the picture".to_string()))
+            }
             Incoming::Refused(why) => Some(Err(why.clone())),
             _ => None,
         })

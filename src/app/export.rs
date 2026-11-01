@@ -40,7 +40,10 @@ impl EloraApp {
     /// count.
     pub(super) fn plan_export(&self, whole_vault: bool) -> Option<ExportPlan> {
         let notes: Vec<&Note> = if whole_vault {
-            self.notes.iter().filter(|n| !n.trashed).collect()
+            self.notes
+                .iter()
+                .filter(|n| !n.trashed && !self.shares.joined_ids.contains(&n.id))
+                .collect()
         } else {
             let start = self
                 .selected_id

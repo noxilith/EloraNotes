@@ -131,6 +131,8 @@ pub struct NoteImages {
     order: std::collections::VecDeque<String>,
     downloads: HashMap<String, Receiver<Result<Vec<u8>, String>>>,
     resizing: Option<Resizing>,
+    /// A picture whose "Save picture as…" was chosen, with a file name to offer.
+    save_request: Option<(ImageRef, String)>,
     /// Where each picture and its corner handle were drawn, so a test can grab the one it means.
     #[cfg(test)]
     pub(crate) handles: Vec<(String, egui::Rect)>,
@@ -224,11 +226,19 @@ impl NoteImages {
         let response = ui.add(
             egui::Image::new(SizedTexture::new(texture.id(), natural))
                 .fit_to_exact_size(size)
-                .corner_radius(CornerRadius::same(4)),
+                .corner_radius(CornerRadius::same(4))
+                .sense(Sense::click()),
         );
         if !alt.is_empty() {
             response.clone().on_hover_text(alt);
         }
+        // A right click offers to keep a copy of the picture, the way a browser does.
+        response.context_menu(|ui| {
+            if ui.button("Save picture as…").clicked() {
+                self.save_request = Some((reference.clone(), suggested_name(&reference, alt)));
+                ui.close_menu();
+            }
+        });
 
         // The corner square: drag it and the picture grows or shrinks with the pointer, the way
         // a picture on a OneNote page does.
@@ -295,6 +305,11 @@ impl NoteImages {
         kept
     }
 
+    /// The picture somebody asked to save, once: the caller opens the file dialog.
+    pub fn take_save_request(&mut self) -> Option<(ImageRef, String)> {
+        self.save_request.take()
+    }
+
     /// How many pictures are ready to draw. Used by the tests to prove a preview really decoded
     /// an embedded picture rather than leaving a placeholder.
     #[cfg(test)]
@@ -359,6 +374,39 @@ impl NoteImages {
         });
         self.downloads.insert(key, receiver);
     }
+}
+
+/// A file name to offer when saving a picture: the one it already has, or its description.
+fn suggested_name(reference: &ImageRef, alt: &str) -> String {
+    let from_address = match reference {
+        ImageRef::File(path) => path.file_name().map(|n| n.to_string_lossy().into_owned()),
+        ImageRef::Remote(url) => url
+            .split(['?', '#'])
+            .next()
+            .and_then(|path| path.rsplit('/').next())
+            .map(str::to_string),
+    }
+    .filter(|name| name.contains('.'));
+    from_address.unwrap_or_else(|| {
+        let stem: String = alt
+            .chars()
+            .filter(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | ' '))
+            .collect();
+        let stem = stem.trim();
+        format!("{}.png", if stem.is_empty() { "picture" } else { stem })
+    })
+}
+
+/// Writes the picture a note shows to `destination`: a file is copied, an address is downloaded.
+pub fn save_picture(reference: &ImageRef, destination: &Path) -> Result<(), String> {
+    let bytes = match reference {
+        ImageRef::File(path) => {
+            std::fs::read(path).map_err(|e| format!("could not read {}: {e}", path.display()))?
+        }
+        ImageRef::Remote(url) => fetch(url)?,
+    };
+    std::fs::write(destination, bytes)
+        .map_err(|e| format!("could not write {}: {e}", destination.display()))
 }
 
 fn fetch(url: &str) -> Result<Vec<u8>, String> {
@@ -943,5 +991,35 @@ mod tests {
     fn test_decode_rejects_unknown_bytes() {
         let ctx = Context::default();
         assert!(decode(&ctx, "not-an-image", b"definitely not a picture").is_none());
+    }
+
+    #[test]
+    fn test_a_picture_can_be_saved_under_a_name_it_suggests() {
+        let dir = std::env::temp_dir().join(format!("elora-save-picture-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("holiday-1a2b3c4d.png");
+        std::fs::write(&source, b"picture bytes").unwrap();
+        let reference = ImageRef::File(source.clone());
+        assert_eq!(
+            suggested_name(&reference, "A holiday"),
+            "holiday-1a2b3c4d.png"
+        );
+        let copy = dir.join("kept.png");
+        save_picture(&reference, &copy).unwrap();
+        assert_eq!(std::fs::read(&copy).unwrap(), b"picture bytes");
+        assert!(save_picture(&ImageRef::File(dir.join("missing.png")), &copy).is_err());
+        // An address with a file name keeps it; one without falls back on the description.
+        assert_eq!(
+            suggested_name(
+                &ImageRef::Remote("https://x.org/a/cat.jpg?size=2".into()),
+                ""
+            ),
+            "cat.jpg"
+        );
+        assert_eq!(
+            suggested_name(&ImageRef::Remote("https://x.org/render".into()), "My cat!"),
+            "My cat.png"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

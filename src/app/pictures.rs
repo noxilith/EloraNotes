@@ -13,7 +13,64 @@ pub(super) struct PicturePick {
     pub(super) result: Receiver<Option<PathBuf>>,
 }
 
+/// A "save this picture" dialog running on a thread of its own, and then the copy being made.
+pub(super) struct PictureSave {
+    pub(super) result: Receiver<Option<Result<PathBuf, String>>>,
+}
+
 impl EloraApp {
+    /// Asks where to keep a copy of a picture from a note and writes it there. The dialog and the
+    /// copy (which may be a download) both run off the window's thread.
+    pub(super) fn start_picture_save(
+        &mut self,
+        ctx: &egui::Context,
+        reference: ImageRef,
+        name: String,
+    ) {
+        if self.picture_save.is_some() {
+            self.status_message = Some("A picture is already being saved".to_string());
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let wake = ctx.clone();
+        std::thread::spawn(move || {
+            let mut dialog = rfd::FileDialog::new()
+                .set_title("Save this picture")
+                .set_file_name(name);
+            if let Some(start) = dirs::download_dir()
+                .or_else(dirs::picture_dir)
+                .filter(|dir| dir.is_dir())
+            {
+                dialog = dialog.set_directory(start);
+            }
+            let answer = dialog.save_file().map(|destination| {
+                crate::images::save_picture(&reference, &destination).map(|()| destination)
+            });
+            let _ = sender.send(answer);
+            wake.request_repaint();
+        });
+        self.picture_save = Some(PictureSave { result: receiver });
+    }
+
+    /// Picks up the answer of a save, if there is one by now. Called every frame.
+    pub(super) fn poll_picture_save(&mut self) {
+        let Some(save) = self.picture_save.as_ref() else {
+            return;
+        };
+        match save.result.try_recv() {
+            Ok(Some(Ok(path))) => {
+                self.picture_save = None;
+                self.status_message = Some(format!("Saved the picture to {}", path.display()));
+            }
+            Ok(Some(Err(why))) => {
+                self.picture_save = None;
+                self.status_message = Some(format!("Could not save the picture: {why}"));
+            }
+            Ok(None) | Err(TryRecvError::Disconnected) => self.picture_save = None,
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
     /// Where pictures dropped or pasted into a note are kept: a folder beside the note files, so
     /// the Markdown can name them with a path relative to the note.
     pub(super) fn attachments_dir(&self) -> PathBuf {
@@ -327,54 +384,9 @@ impl EloraApp {
     }
 }
 
-/// A file name for a stored picture: lower case letters and digits, with everything else folded
-/// into single dashes, so the Markdown address never ends at a space.
-pub(super) fn picture_name(hint: &str) -> String {
-    let mut name = String::new();
-    for ch in hint.chars() {
-        if ch.is_ascii_alphanumeric() {
-            name.push(ch.to_ascii_lowercase());
-        } else if !name.is_empty() && !name.ends_with('-') {
-            name.push('-');
-        }
-        if name.len() >= 48 {
-            break;
-        }
-    }
-    let name = name.trim_matches('-').to_string();
-    if name.is_empty() {
-        "picture".to_string()
-    } else {
-        name
-    }
-}
-
-/// The formats the preview can decode; anything else is stored as PNG instead.
-pub(super) fn picture_extension(extension: &str) -> String {
-    let extension = extension
-        .trim()
-        .trim_start_matches('.')
-        .to_ascii_lowercase();
-    match extension.as_str() {
-        "png" | "jpg" | "jpeg" | "gif" => extension,
-        _ => "png".to_string(),
-    }
-}
-
-/// The name a picture is filed under: the name it was given, folded down to safe characters,
-/// with a short digest of its bytes, so the same picture always lands on the same file and two
-/// different pictures never can.
-pub(super) fn stored_picture_name(bytes: &[u8], name_hint: &str, extension: &str) -> String {
-    let stem = picture_name(name_hint);
-    let extension = picture_extension(extension);
-    let digest = Sha256::digest(bytes);
-    let tag: String = digest
-        .iter()
-        .take(4)
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    format!("{stem}-{tag}.{extension}")
-}
+pub(super) use crate::attachments::stored_picture_name;
+#[cfg(test)]
+pub(super) use crate::attachments::{picture_extension, picture_name};
 
 /// The pictures a note names with `![alt](attachments/…)`, as plain file names. Anything that is
 /// not a plain picture name is ignored: a note can only ask the library for what it could keep.

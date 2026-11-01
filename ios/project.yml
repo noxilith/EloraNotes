@@ -57,6 +57,8 @@ targets:
         LSSupportsOpeningDocumentsInPlace: true
         # The shared library may be a server on the same network.
         NSLocalNetworkUsageDescription: EloraNotes connects to your shared library server, which may be on your local network.
+        # Saving a picture from a note to the Photos app.
+        NSPhotoLibraryAddUsageDescription: EloraNotes saves a picture from a note to your photo library when you ask it to.
         # Only the standard encryption of the operating system is used.
         ITSAppUsesNonExemptEncryption: false
     settings:

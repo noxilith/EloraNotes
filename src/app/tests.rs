@@ -4647,23 +4647,19 @@ fn test_a_note_is_shared_by_link_and_edited_from_both_ends() {
         }
     };
     let editing = join(&mut app, &edit_link);
-    let watching = join(&mut app, &view_link);
     assert!(!app.shares.join_open, "the join window closes once joined");
     let body_of =
         |app: &EloraApp, id: &str| app.notes.iter().find(|n| n.id == id).unwrap().body.clone();
     assert_eq!(body_of(&app, &editing), "the first idea");
-    assert!(
-        app.session_blocks_editing(&watching),
-        "a watcher cannot type"
-    );
     assert!(!app.session_blocks_editing(&editing));
-    assert_eq!(
-        app.view_mode,
-        EditorViewMode::Preview,
-        "watching opens in preview"
+    assert!(
+        app.filtered_indices()
+            .iter()
+            .all(|&i| app.notes[i].id != editing),
+        "a joined note is never listed"
     );
 
-    // The host types: the editing guest and the watcher see it.
+    // The host types: the editing guest sees it.
     let at = |app: &EloraApp, id: &str| app.notes.iter().position(|n| n.id == id).unwrap();
     let host_at = at(&app, &host_id);
     app.notes[host_at].body = "the first idea, and a second".to_string();
@@ -4676,10 +4672,9 @@ fn test_a_note_is_shared_by_link_and_edited_from_both_ends() {
             std::thread::sleep(Duration::from_millis(20));
         }
     };
-    let (e, w) = (editing.clone(), watching.clone());
-    settle(&mut app, "the guests to see the host", &|app| {
+    let e = editing.clone();
+    settle(&mut app, "the guest to see the host", &|app| {
         body_of(app, &e) == "the first idea, and a second"
-            && body_of(app, &w) == "the first idea, and a second"
     });
 
     // The editing guest types: it reaches the host's note, and is saved to the host's file.
@@ -4695,6 +4690,34 @@ fn test_a_note_is_shared_by_link_and_edited_from_both_ends() {
         saved.contains("Idea: the first idea, and a second"),
         "{saved}"
     );
+
+    // Joined notes never reach the disk.
+    let joined_file = app.notes[at(&app, &editing)].file_path.clone();
+    assert!(!joined_file.exists());
+
+    // Opening another link leaves the first note: nothing lists it, so it is only there while
+    // it is the one in front of the person.
+    let watching = join(&mut app, &view_link);
+    app.poll_shares(&ctx);
+    assert_eq!(
+        app.shares.joined_ids.iter().collect::<Vec<_>>(),
+        vec![&watching],
+        "only the note being looked at stays joined"
+    );
+    assert!(app.notes.iter().all(|n| n.id != editing));
+    assert!(
+        app.session_blocks_editing(&watching),
+        "a watcher cannot type"
+    );
+    assert_eq!(
+        app.view_mode,
+        EditorViewMode::Preview,
+        "watching opens in preview"
+    );
+    let w = watching.clone();
+    settle(&mut app, "the watcher to see the note", &|app| {
+        body_of(app, &w) == "Idea: the first idea, and a second"
+    });
 
     // The watcher's own changes are put back, and nothing reaches anybody.
     let watch_at = at(&app, &watching);
@@ -4713,11 +4736,9 @@ fn test_a_note_is_shared_by_link_and_edited_from_both_ends() {
         "Idea: the first idea, and a second"
     );
 
-    // Joined notes never reach the disk, and leaving takes them from the list.
-    let joined_file = app.notes[at(&app, &editing)].file_path.clone();
-    assert!(!joined_file.exists());
-    app.leave_shared(&editing);
-    app.leave_shared(&watching);
+    // Selecting a note of the person's own leaves the joined one too.
+    app.selected_id = Some(host_id.clone());
+    app.poll_shares(&ctx);
     assert!(app.shares.joined_ids.is_empty());
     assert!(app
         .notes

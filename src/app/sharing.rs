@@ -23,7 +23,7 @@ impl EloraApp {
         }
         // A short key is not a secret, so it is refused here with a hint rather than at the
         // server with a sentence about keys: this is the box it has to be fixed in.
-        if self.identifier.trim().len() < MIN_IDENTIFIER {
+        if self.identifier.trim().chars().count() < MIN_IDENTIFIER {
             self.status_message = Some(format!(
                 "The identifier needs at least {MIN_IDENTIFIER} characters; paste the one from \
                  your other computer into Settings → Shared library"

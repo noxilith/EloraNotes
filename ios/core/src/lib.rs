@@ -299,7 +299,7 @@ pub fn join_share(link: String, name: String) -> Result<Arc<JoinedShare>, CoreEr
         note: LiveNote::open(
             joined.profile.clone(),
             name,
-            format!("phone-{}", joined.note_id),
+            fresh_identifier(),
             joined.note_id.clone(),
         ),
     });
@@ -374,6 +374,18 @@ pub struct Vault {
     /// The text of shared notes already read, by id, with the version it was read at, so
     /// backlinks and search can use it without going back to the server.
     read: Mutex<HashMap<String, (i64, String)>>,
+}
+
+impl Vault {
+    fn attachments_dir(&self) -> PathBuf {
+        lock(&self.local).storage.root_dir().join("attachments")
+    }
+}
+
+/// A one-off identifier for this phone's part in a note shared by link: random and long, so no
+/// two people are ever the same person to the temporary server, and it is never too short.
+fn fresh_identifier() -> String {
+    format!("{:032x}", rand::random::<u128>())
 }
 
 fn summary_of(note: &Note) -> NoteSummary {
@@ -629,7 +641,7 @@ impl Vault {
             note: LiveNote::open(
                 host.local_profile(),
                 name,
-                format!("phone-{}", host.note_id()),
+                fresh_identifier(),
                 host.note_id().to_string(),
             ),
         });
@@ -854,6 +866,77 @@ impl Vault {
             .run(move |shared| shared.update(&settings, &wanted))?
             .map_err(failed)?;
         Ok(summary_of(&note_from_meta(&saved, String::new())))
+    }
+
+    /// The bytes of a picture a note names with `![alt](attachments/name)`. A picture already on
+    /// this phone is read from its folder; one that is not is fetched from the shared library
+    /// and kept there, so it is still shown after the app is closed and reopened.
+    pub fn image(&self, src: String) -> Result<Vec<u8>, CoreError> {
+        let name = src
+            .trim()
+            .trim_start_matches("./")
+            .strip_prefix("attachments/")
+            .map(str::to_string)
+            .filter(|name| elora_notes::net::valid_attachment_name(name))
+            .ok_or_else(|| failed("this picture is not one the app can open"))?;
+        let path = self.attachments_dir().join(&name);
+        if let Ok(bytes) = std::fs::read(&path) {
+            if !bytes.is_empty() {
+                return Ok(bytes);
+            }
+        }
+        let settings = self
+            .settings()
+            .ok_or_else(|| failed("this picture is not on this phone"))?;
+        let wanted = name.clone();
+        let fetched = self
+            .worker
+            .run(move |shared| shared.fetch_attachment(&settings, &wanted))?
+            .map_err(failed)?;
+        let bytes =
+            fetched.ok_or_else(|| failed("the shared library does not have this picture"))?;
+        if let Err(e) = std::fs::create_dir_all(self.attachments_dir())
+            .and_then(|()| std::fs::write(&path, &bytes))
+        {
+            // Showing it does not need the copy on the phone; the next look just asks again.
+            let _ = e;
+        }
+        Ok(bytes)
+    }
+
+    /// Adds a picture to a note: it is filed in this phone's pictures folder (beside the notes,
+    /// where the desktop app keeps them too) and, for a note in the shared library, sent to the
+    /// library so everybody with the note can see it. Returns the address to write into the note.
+    pub fn add_image(
+        &self,
+        bytes: Vec<u8>,
+        name_hint: String,
+        extension: String,
+        shared: bool,
+    ) -> Result<String, CoreError> {
+        if bytes.is_empty() {
+            return Err(failed("that picture is empty"));
+        }
+        if bytes.len() > elora_notes::net::MAX_ATTACHMENT {
+            return Err(failed("that picture is too large (over 12 MB)"));
+        }
+        let name = elora_notes::attachments::stored_picture_name(&bytes, &name_hint, &extension);
+        let dir = self.attachments_dir();
+        std::fs::create_dir_all(&dir).map_err(failed)?;
+        let path = dir.join(&name);
+        if !path.is_file() {
+            std::fs::write(&path, &bytes).map_err(failed)?;
+        }
+        if shared {
+            let settings = self
+                .settings()
+                .ok_or_else(|| failed("no shared library is set up"))?;
+            let sent = name.clone();
+            self.worker
+                .run(move |library| library.upload_attachment(&settings, &sent, bytes))?
+                .map_err(failed)?;
+        }
+        Ok(format!("attachments/{name}"))
     }
 
     /// Pins a note to the top of the list, or takes the pin off.
@@ -1372,5 +1455,35 @@ mod tests {
     #[test]
     fn the_version_is_the_crates() {
         assert_eq!(core_version(), env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn a_picture_is_filed_beside_the_notes_and_read_back() {
+        let (vault, dir) = vault("pictures");
+        let png = b"\x89PNG\r\n\x1a\nnot really a picture".to_vec();
+        let src = vault
+            .add_image(png.clone(), "My Cat".into(), "PNG".into(), false)
+            .unwrap();
+        assert!(src.starts_with("attachments/my-cat-"), "{src}");
+        assert!(dir.join(&src).is_file(), "kept next to the notes");
+        assert_eq!(vault.image(src.clone()).unwrap(), png);
+        // Adding it again files it under the same name.
+        assert_eq!(
+            vault
+                .add_image(png, "My Cat".into(), "png".into(), false)
+                .unwrap(),
+            src
+        );
+        // Anything that is not a plain picture name is turned away.
+        assert!(vault.image("attachments/../secrets.png".into()).is_err());
+        assert!(vault.image("somewhere/else.png".into()).is_err());
+        // With no library set up, a picture that is not here cannot be found.
+        assert!(vault
+            .image("attachments/absent-1a2b3c4d.png".into())
+            .is_err());
+        assert!(vault
+            .add_image(Vec::new(), "x".into(), "png".into(), false)
+            .is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

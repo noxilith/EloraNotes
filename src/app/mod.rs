@@ -22,7 +22,6 @@ use egui::{
     Align, Align2, Color32, CornerRadius, FontFamily, FontId, Frame, Id, Key, Layout, Margin, Pos2,
     Rect, RichText, ScrollArea, Sense, Stroke, TextEdit, TextStyle, Ui, UiBuilder, Vec2,
 };
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -291,8 +290,11 @@ pub struct EloraApp {
     /// The identifier the open connection was made with, so a pasted one can be noticed and
     /// acted on rather than waiting for the next reconnect.
     sent_identifier: String,
+    /// The "New" identifier button has been pressed once and waits for a second press.
+    confirm_new_identifier: bool,
     /// A system file dialog running on its own thread, with the note its picture belongs to.
     picture_pick: Option<PicturePick>,
+    picture_save: Option<pictures::PictureSave>,
     /// Ko-fi's mark, painted in the theme's colours beside Settings.
     kofi: Option<KofiMark>,
     /// The window of a note's earlier versions, while it is open.
@@ -454,6 +456,7 @@ impl EloraApp {
             identifier: settings.identifier.clone(),
             peer_color: settings.peer_color,
             sent_identifier: String::new(),
+            confirm_new_identifier: false,
             remote_ids: BTreeSet::new(),
             remote_bodies: BTreeMap::new(),
             collab_open: None,
@@ -490,6 +493,7 @@ impl EloraApp {
             requested_pictures: BTreeSet::new(),
             shared_uploads: BTreeSet::new(),
             picture_pick: None,
+            picture_save: None,
             kofi: KofiMark::load(ctx),
             history: None,
             mcp_check: McpCheck::default(),
@@ -724,7 +728,11 @@ impl EloraApp {
     /// folder (and the other way round) by accident.
     fn folders_for(&self, remote: bool) -> Vec<String> {
         let mut folders: BTreeSet<String> = BTreeSet::new();
-        for note in self.notes.iter().filter(|n| !n.trashed) {
+        for note in self
+            .notes
+            .iter()
+            .filter(|n| !n.trashed && !self.shares.joined_ids.contains(&n.id))
+        {
             if self.is_remote(&note.id) == remote {
                 if let Some(folder) = &note.folder {
                     folders.insert(folder.clone());
@@ -736,7 +744,11 @@ impl EloraApp {
 
     fn all_tags_with_counts(&self) -> Vec<(String, usize)> {
         let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-        for note in self.notes.iter().filter(|n| !n.trashed) {
+        for note in self
+            .notes
+            .iter()
+            .filter(|n| !n.trashed && !self.shares.joined_ids.contains(&n.id))
+        {
             for tag in note.all_tags() {
                 *counts.entry(tag).or_insert(0) += 1;
             }
@@ -750,6 +762,11 @@ impl EloraApp {
             .iter()
             .enumerate()
             .filter(|(_, note)| {
+                // A note joined from a link is open only while it is the one being looked at,
+                // and is never listed: the invite link is the way back to it.
+                if self.shares.joined_ids.contains(&note.id) {
+                    return false;
+                }
                 match self.sidebar_section {
                     SidebarSection::AllNotes => {
                         if note.trashed {
@@ -1257,7 +1274,11 @@ impl EloraApp {
         let q = self.command_palette_query.trim().to_lowercase();
         let mut items = Vec::new();
 
-        for note in self.notes.iter().filter(|n| !n.trashed) {
+        for note in self
+            .notes
+            .iter()
+            .filter(|n| !n.trashed && !self.shares.joined_ids.contains(&n.id))
+        {
             let title = note.display_title();
             let title_lower = title.to_lowercase();
             let tags = note.all_tags();
@@ -1752,8 +1773,17 @@ impl EloraApp {
 
         ui.add_space(6.0);
 
-        let active_count = self.notes.iter().filter(|n| !n.trashed).count();
-        let pinned_count = self.notes.iter().filter(|n| !n.trashed && n.pinned).count();
+        let hidden = |n: &Note| self.shares.joined_ids.contains(&n.id);
+        let active_count = self
+            .notes
+            .iter()
+            .filter(|n| !n.trashed && !hidden(n))
+            .count();
+        let pinned_count = self
+            .notes
+            .iter()
+            .filter(|n| !n.trashed && n.pinned && !hidden(n))
+            .count();
         let trash_count = self.notes.iter().filter(|n| n.trashed).count();
         let assistant_count = self
             .notes
@@ -2134,15 +2164,12 @@ impl EloraApp {
         // server's notes get their own group, titled with the server's name.
         let mut folder_groups: Vec<(String, Vec<usize>)> = Vec::new();
         let mut remote_indices: Vec<usize> = Vec::new();
-        let mut joined_indices: Vec<usize> = Vec::new();
         let mut unfiled: Vec<usize> = Vec::new();
         let mut trashed_indices: Vec<usize> = Vec::new();
         let server_label = self.collab.server_name().unwrap_or("Shared").to_string();
         for &i in &filtered {
             let note = &self.notes[i];
-            if self.shares.joined_ids.contains(&note.id) {
-                joined_indices.push(i);
-            } else if self.remote_ids.contains(&note.id) {
+            if self.remote_ids.contains(&note.id) {
                 remote_indices.push(i);
             } else if note.trashed {
                 trashed_indices.push(i);
@@ -2161,7 +2188,6 @@ impl EloraApp {
         // Each group follows the sort the sidebar is set to; the groups themselves keep their
         // own order, so folders stay alphabetical and pinned notes stay on top.
         self.sort_group(&mut unfiled);
-        self.sort_group(&mut joined_indices);
         self.sort_group(&mut trashed_indices);
         for (_, list) in &mut folder_groups {
             self.sort_group(list);
@@ -2200,41 +2226,6 @@ impl EloraApp {
                             self.roomy_cards,
                         );
                         ui.add_space(4.0);
-                    }
-
-                    // Notes joined from a link: people are in them right now.
-                    if !joined_indices.is_empty() {
-                        let key = "shared-with-you".to_string();
-                        let collapsed = !folders_open && self.collapsed_folders.contains(&key);
-                        if folder_header_with(
-                            ui,
-                            icon::USERS,
-                            "Shared with you",
-                            joined_indices.len(),
-                            collapsed,
-                            p,
-                        )
-                        .clicked()
-                        {
-                            toggled_folder = Some(key);
-                        }
-                        if !collapsed {
-                            ui.add_space(2.0);
-                            render_note_rows(
-                                ui,
-                                &self.notes,
-                                &joined_indices,
-                                self.selected_id.as_deref(),
-                                p,
-                                &self.search_query,
-                                None,
-                                &mut picked,
-                                SIDEBAR_INDENT_STEP,
-                                self.show_card_previews,
-                                self.roomy_cards,
-                            );
-                            ui.add_space(3.0);
-                        }
                     }
 
                     if !remote_indices.is_empty() {
@@ -4171,6 +4162,10 @@ impl eframe::App for EloraApp {
         self.check_ai_apps_at_start(ctx);
         self.poll_collab(ctx);
         self.poll_picture_pick();
+        self.poll_picture_save();
+        if let Some((reference, name)) = self.note_images.take_save_request() {
+            self.start_picture_save(ctx, reference, name);
+        }
         self.poll_disk();
         self.sync_open_note();
         self.settings_window(ctx);

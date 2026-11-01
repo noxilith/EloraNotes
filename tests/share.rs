@@ -63,10 +63,13 @@ fn test_a_link_is_read_back_and_junk_is_refused() {
     // The web form carries the same ticket, and so do links inside a sentence.
     let web = host.web_link(Access::Edit);
     assert!(
-        web.starts_with("https://noxilith.github.io/join/#"),
+        web.starts_with("https://noxilith.github.io/join/") && !web.contains('#'),
         "{web}"
     );
     assert_eq!(Ticket::from_link(web).unwrap().pw, edit.pw);
+    // Invite links made when the code still came after a `#` keep working.
+    let old = web.replacen("/join/", "/join/#", 1);
+    assert_eq!(Ticket::from_link(&old).unwrap().pw, edit.pw);
     let sentence = format!("Join my note: {} (it is live!)", host.link(Access::View));
     assert_eq!(Ticket::from_link(&sentence).unwrap().pw, view.pw);
     let found = elora_notes::share::find_link(&sentence).unwrap();

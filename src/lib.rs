@@ -6,6 +6,7 @@
 
 #[cfg(feature = "gui")]
 pub mod app;
+pub mod attachments;
 pub mod collab;
 pub mod format;
 pub mod graph_layout;

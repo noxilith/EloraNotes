@@ -264,6 +264,18 @@ impl EloraApp {
     /// Once a frame: finish what was being started, and bring each shared note up to date with
     /// what the other people have typed.
     pub(super) fn poll_shares(&mut self, ctx: &egui::Context) {
+        // A joined note is only there while it is the open one: with nothing listing it, the
+        // invite link is the way back, so moving to another note leaves it.
+        let strays: Vec<String> = self
+            .shares
+            .joined_ids
+            .iter()
+            .filter(|id| self.selected_id.as_deref() != Some(id.as_str()))
+            .cloned()
+            .collect();
+        for id in strays {
+            self.leave_shared(&id);
+        }
         let mut arrived = std::mem::take(&mut self.shares.queued);
         if let Some(inbox) = &self.shares.inbox {
             arrived.extend(inbox.take());
@@ -534,7 +546,6 @@ impl EloraApp {
                 return;
             };
             let link = host.web_link(access).to_string();
-            let app_link = host.link(access).to_string();
             let connected = session.connected;
             let error = session.error.clone();
             let people: Vec<(String, [u8; 3])> = session
@@ -558,15 +569,7 @@ impl EloraApp {
             ui.horizontal(|ui| {
                 if ui.button(format!("{}  Copy link", icon::COPY)).clicked() {
                     ui.ctx().copy_text(link.clone());
-                    self.status_message = Some("Copied the share link".to_string());
-                }
-                if ui
-                    .button("Copy app link")
-                    .on_hover_text("The elora:// form, which opens EloraNotes directly")
-                    .clicked()
-                {
-                    ui.ctx().copy_text(app_link.clone());
-                    self.status_message = Some("Copied the elora:// link".to_string());
+                    self.status_message = Some("Copied the invite link".to_string());
                 }
                 if ui.button("Stop sharing").clicked() {
                     self.stop_sharing(&id);

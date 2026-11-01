@@ -59,6 +59,10 @@ struct JoinedNoteView: View {
             }
         }
         .onReceive(tick) { _ in look() }
+        .onDisappear {
+            // Nothing lists a joined note, so the invite link is the way back: going back leaves.
+            if !path.contains(id) { library.leave(id) }
+        }
     }
 
     private var whoIsHere: some View {

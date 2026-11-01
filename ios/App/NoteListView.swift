@@ -274,23 +274,6 @@ struct NoteListView: View {
         let remote = split(library.notes.filter { $0.shared && !$0.pinned })
         let local = split(library.notes.filter { !$0.shared && !$0.pinned })
 
-        if !library.joined.isEmpty {
-            sectionHeading(Icon.cloud, "SHARED WITH YOU", tint: palette.accent)
-            ForEach(library.joined.keys.sorted(), id: \.self) { id in
-                Button {
-                    path.append(id)
-                } label: {
-                    Text(library.joined[id]?.title() ?? "Shared note")
-                        .font(AppFont.body(17)).foregroundStyle(palette.fgPrimary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .buttonStyle(.plain)
-                .listRowInsets(inset(0))
-                .listRowBackground(Color.clear)
-                .listRowSeparator(.hidden)
-            }
-        }
-
         if !pinned.isEmpty {
             sectionHeading(Icon.pinned, "PINNED", tint: palette.pin)
             rows(pinned, indent: 0)

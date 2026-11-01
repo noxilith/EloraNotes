@@ -95,7 +95,11 @@ impl EloraApp {
     /// that link to it. The same rule the link itself follows decides whether it is broken, so
     /// the report never lists something the link would have opened.
     pub(super) fn collect_broken_links(&self) -> Vec<(String, Vec<String>)> {
-        let live: Vec<&Note> = self.notes.iter().filter(|n| !n.trashed).collect();
+        let live: Vec<&Note> = self
+            .notes
+            .iter()
+            .filter(|n| !n.trashed && !self.shares.joined_ids.contains(&n.id))
+            .collect();
         let mut broken: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for note in &live {
             for target in extract_wiki_links(&note.body) {
@@ -124,7 +128,11 @@ impl EloraApp {
             self.graph_loader = None;
             return;
         }
-        let live: Vec<&Note> = self.notes.iter().filter(|n| !n.trashed).collect();
+        let live: Vec<&Note> = self
+            .notes
+            .iter()
+            .filter(|n| !n.trashed && !self.shares.joined_ids.contains(&n.id))
+            .collect();
         let mut nodes: Vec<GraphNode> = live
             .iter()
             .map(|n| GraphNode {

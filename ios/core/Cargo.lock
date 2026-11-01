@@ -860,6 +860,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "elora-notes",
+ "rand 0.9.5",
  "uniffi",
 ]
 

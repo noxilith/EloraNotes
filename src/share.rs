@@ -26,7 +26,7 @@ use std::time::Duration;
 const ALPN: &[u8] = b"elora-notes/share/1";
 const LINK_PREFIX: &str = "elora://share/";
 /// The page that opens a link in the app, for places where `elora://` cannot be clicked.
-const WEB_PREFIX: &str = "https://noxilith.github.io/join/#";
+const WEB_PREFIX: &str = "https://noxilith.github.io/join/";
 
 /// How devices find each other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,9 +68,10 @@ impl Ticket {
         )
     }
 
-    /// The same link as a web address that works when clicked in a browser, a chat or an email:
-    /// a small page on the docs site hands it to the app. What follows the `#` is never sent to
-    /// any server, so the secret in it stays between the page's own script and the person.
+    /// The invite link: `https://noxilith.github.io/join/INVITECODE`. It works when clicked in a
+    /// browser, a chat or an email: a small page on the docs site hands the code to the app. The
+    /// code is part of the address, so the site's host can see it; the link is as private as the
+    /// place it is sent to.
     pub fn to_web_link(&self) -> String {
         let link = self.to_link();
         format!("{WEB_PREFIX}{}", &link[LINK_PREFIX.len()..])
@@ -101,6 +102,8 @@ fn payload_in(text: &str) -> Option<&str> {
         lower.find(WEB_PREFIX).map(|at| at + WEB_PREFIX.len())?
     };
     let rest = &text[start..];
+    // Invite links made before the code moved into the path had a `#` in front of it.
+    let rest = rest.strip_prefix('#').unwrap_or(rest);
     // The ticket is letters, digits, dashes and underscores; whatever follows (a full stop at the
     // end of a sentence, a bracket) is not part of it.
     let end = rest

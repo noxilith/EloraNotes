@@ -11,6 +11,7 @@ struct SettingsView: View {
     @State private var password = ""
     @State private var name = ""
     @State private var identifier = ""
+    @State private var confirmNewIdentifier = false
     @State private var busy = false
     @State private var message: String?
     @State private var confirming: String?
@@ -49,7 +50,28 @@ struct SettingsView: View {
                     TextField("Port", text: $port).keyboardType(.numberPad)
                     SecureField("Server password", text: $password)
                     TextField("Your name", text: $name)
-                    SecureField("Your identifier", text: $identifier)
+                    HStack {
+                        SecureField("Your identifier", text: $identifier)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        Button("New") {
+                            // With none yet, one is made at once; replacing one asks first.
+                            if identifier.trimmingCharacters(in: .whitespaces).isEmpty {
+                                identifier = Self.freshIdentifier()
+                            } else {
+                                confirmNewIdentifier = true
+                            }
+                        }
+                        .buttonStyle(.borderless)
+                        Button("Copy") { UIPasteboard.general.string = identifier }
+                            .buttonStyle(.borderless)
+                            .disabled(identifier.isEmpty)
+                    }
+                    if !identifier.isEmpty, !identifierLongEnough {
+                        Text("The identifier needs at least 3 characters. Press New for a fresh one, or paste the one from your other device.")
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                    }
                 } header: {
                     Text("Shared library")
                 } footer: {
@@ -90,6 +112,12 @@ struct SettingsView: View {
                 ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
             }
             .onAppear(perform: fill)
+            .confirmationDialog("Make a new identifier?", isPresented: $confirmNewIdentifier, titleVisibility: .visible) {
+                Button("Make a new one", role: .destructive) { identifier = Self.freshIdentifier() }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("The server will see you as a different person: the name and notes tied to the old identifier stay with it. Copy the old one first if you want it back.")
+            }
             .alert(
                 "Trust this server?",
                 isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } })
@@ -116,9 +144,18 @@ struct SettingsView: View {
         .frame(width: 64, alignment: .leading)
     }
 
+    /// A new identifier: 32 random hexadecimal characters, the same kind the desktop app makes.
+    private static func freshIdentifier() -> String {
+        (0..<16).map { _ in String(format: "%02x", UInt8.random(in: 0...255)) }.joined()
+    }
+
+    private var identifierLongEnough: Bool {
+        identifier.trimmingCharacters(in: .whitespacesAndNewlines).count >= 3
+    }
+
     private var ready: Bool {
         !host.trimmingCharacters(in: .whitespaces).isEmpty && !password.isEmpty
-            && !name.trimmingCharacters(in: .whitespaces).isEmpty && identifier.trimmingCharacters(in: .whitespaces).count >= 3
+            && !name.trimmingCharacters(in: .whitespaces).isEmpty && identifierLongEnough
             && UInt16(port) != nil
     }
 
@@ -145,7 +182,8 @@ struct SettingsView: View {
         message = nil
         let (h, p, pw, n, i) = (
             host.trimmingCharacters(in: .whitespaces), UInt16(port) ?? 7331, password,
-            name.trimmingCharacters(in: .whitespaces), identifier
+            name.trimmingCharacters(in: .whitespaces),
+            identifier.trimmingCharacters(in: .whitespacesAndNewlines)
         )
         do {
             let found = try await library.run {
@@ -169,7 +207,7 @@ struct SettingsView: View {
                 password: password,
                 fingerprint: fingerprint,
                 displayName: name.trimmingCharacters(in: .whitespaces),
-                identifier: identifier))
+                identifier: identifier.trimmingCharacters(in: .whitespacesAndNewlines)))
         library.applyServer()
         await library.refresh()
         message = library.sharedError ?? "Connected."
