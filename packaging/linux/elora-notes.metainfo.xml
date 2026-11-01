@@ -25,6 +25,14 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.15.7" date="2026-11-01">
+      <description>
+        <p>
+          The iPhone app no longer adds pictures to notes (pictures are added from the desktop
+          app); pictures in notes still show, and can be saved or shared from the full-screen view.
+        </p>
+      </description>
+    </release>
     <release version="0.15.6" date="2026-11-01">
       <description>
         <p>
