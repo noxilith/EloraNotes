@@ -1068,6 +1068,64 @@ fn test_a_caret_follows_the_text_typed_before_it() {
     bob.disconnect();
 }
 
+/// The usual case: somebody's caret is at the end of the last line, and another person types
+/// earlier in the note. Their caret stays at the end instead of falling back letter by letter.
+#[test]
+fn test_a_caret_at_the_end_stays_at_the_end_as_others_type_before_it() {
+    let _turn = SERVER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let harness = start_server();
+    let note_id = harness.note_id.clone();
+
+    let mut alice = Collab::new();
+    alice.connect(harness.profile(), "alice".into(), key("alice"));
+    settle(&mut alice, &mut String::new(), "alice", |c, _| {
+        c.is_connected()
+    });
+    alice.open_note(&note_id, "hello");
+    settle(&mut alice, &mut String::new(), "alice", |_, body| {
+        body == "hello"
+    });
+
+    let mut bob = Collab::new();
+    bob.connect(harness.profile(), "bob".into(), key("bob"));
+    let mut bob_body = String::new();
+    settle(&mut bob, &mut bob_body, "bob", |c, _| c.is_connected());
+    bob.open_note(&note_id, "hello");
+    settle(&mut bob, &mut bob_body, "bob", |_, body| body == "hello");
+    settle(&mut bob, &mut bob_body, "bob sees alice", |c, _| {
+        c.peers().iter().any(|p| p.name == "alice")
+    });
+
+    // Alice's caret is after "hello", the very end of the note.
+    alice.send_cursor(&note_id, 5);
+    settle(&mut bob, &mut bob_body, "bob sees her caret", |c, _| {
+        c.peers()
+            .iter()
+            .any(|p| p.name == "alice" && p.cursor == Some(5))
+    });
+
+    // Bob types at the start, a letter at a time. Her caret stays at the end each time.
+    let mut typed = String::from("hello");
+    for (step, letter) in ["a", "b", "c"].into_iter().enumerate() {
+        typed.insert_str(step, letter);
+        bob.send_body(&note_id, &typed);
+        let end = typed.len();
+        settle(
+            &mut bob,
+            &mut bob_body,
+            "her caret stays at the end",
+            |c, _| {
+                c.peers()
+                    .iter()
+                    .any(|p| p.name == "alice" && p.cursor == Some(end))
+            },
+        );
+    }
+
+    alice.disconnect();
+    bob.disconnect();
+}
+
 /// The colour somebody picks in Settings is the one the others draw their caret and name in —
 /// and a colour picked while the note is already open reaches them without a reconnect.
 #[test]

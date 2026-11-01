@@ -723,6 +723,10 @@ struct Session {
     /// What the window was last told about the other people, so a caret that only moved because
     /// the text around it changed is sent on, and one that did not move is not.
     last_peers: Vec<PeerLook>,
+    /// A caret from an app that sends only a byte count, tied to this copy's text when it was
+    /// first seen, so it follows edits made here like the others do.
+    remembered_carets:
+        std::cell::RefCell<std::collections::HashMap<yrs::ClientID, (usize, StickyIndex)>>,
     name: String,
     color: [u8; 3],
 }
@@ -952,6 +956,7 @@ impl Session {
             last_ping: Instant::now(),
             pending_pong: None,
             last_peers: Vec::new(),
+            remembered_carets: Default::default(),
             name: name.to_string(),
             color: color.unwrap_or_else(|| default_peer_color(name)),
         };
@@ -1102,7 +1107,7 @@ impl Session {
                 self.pending_cursor = Some(byte);
                 self.pending_anchor = {
                     let txn = self.awareness.doc().transact();
-                    self.text.sticky_index(&txn, byte as u32, Assoc::After)
+                    caret_anchor(&txn, &self.text, byte)
                 };
                 // The first caret goes out immediately; after that it is throttled so typing
                 // does not turn into a stream of awareness frames. A held-back one is not
@@ -1553,18 +1558,17 @@ impl Session {
                 .get("cursor")
                 .and_then(|c| c.as_u64())
                 .map(|c| c as usize);
-            // A caret tied to the text follows every edit made since it was sent; one from an
-            // older app only has the byte count it was sent with.
-            let cursor = value
-                .get("anchor")
-                .and_then(|a| a.as_str())
-                .and_then(hex_decode)
-                .and_then(|bytes| StickyIndex::decode_v1(&bytes).ok())
-                .and_then(|sticky| {
-                    let txn = self.awareness.doc().transact();
-                    sticky.get_offset(&txn).map(|offset| offset.index as usize)
-                })
-                .or(stated);
+            let cursor = {
+                let mut remembered = self.remembered_carets.borrow_mut();
+                resolve_caret(
+                    self.awareness.doc(),
+                    &self.text,
+                    &mut remembered,
+                    client_id,
+                    value.get("anchor").and_then(|a| a.as_str()),
+                    stated,
+                )
+            };
             out.push(RemotePeer {
                 name: name.to_string(),
                 color,
@@ -1587,6 +1591,64 @@ impl Session {
             .and_then(|_| self.stream.flush())
             .map_err(|e| format!("lost the server: {e}"))
     }
+}
+
+/// A position tied to the text at byte `at`. A caret at the very end is tied to the end of the
+/// text itself (yrs cannot tie one to the words after it, because there are none), so it stays at
+/// the end as people type before it; that is where somebody typing a line last in a note sits.
+fn caret_anchor<T: ReadTxn>(txn: &T, text: &TextRef, at: usize) -> Option<StickyIndex> {
+    if at as u32 >= text.len(txn) {
+        Some(StickyIndex::from_type(txn, text, Assoc::After))
+    } else {
+        text.sticky_index(txn, at as u32, Assoc::After)
+    }
+}
+
+/// Where somebody's caret is in this copy of the text right now.
+///
+/// A caret sent with a position tied to the text follows every edit made since it was sent. One
+/// from an app that only sends a byte count is tied to this copy's text the first time it is
+/// seen, which is when it was sent: from then on it follows edits too, instead of staying at the
+/// same number while the words move.
+fn resolve_caret(
+    doc: &Doc,
+    text: &TextRef,
+    remembered: &mut std::collections::HashMap<yrs::ClientID, (usize, StickyIndex)>,
+    client: yrs::ClientID,
+    anchor: Option<&str>,
+    stated: Option<usize>,
+) -> Option<usize> {
+    let txn = doc.transact();
+    let resolve =
+        |sticky: &StickyIndex| sticky.get_offset(&txn).map(|offset| offset.index as usize);
+    if let Some(found) = anchor
+        .and_then(hex_decode)
+        .and_then(|bytes| StickyIndex::decode_v1(&bytes).ok())
+        .and_then(|sticky| resolve(&sticky))
+    {
+        remembered.remove(&client);
+        return Some(found);
+    }
+    let Some(stated) = stated else {
+        remembered.remove(&client);
+        return None;
+    };
+    if let Some((was, sticky)) = remembered.get(&client) {
+        if *was == stated {
+            if let Some(found) = resolve(sticky) {
+                return Some(found);
+            }
+        }
+    }
+    match caret_anchor(&txn, text, stated) {
+        Some(sticky) => {
+            remembered.insert(client, (stated, sticky));
+        }
+        None => {
+            remembered.remove(&client);
+        }
+    }
+    Some(stated)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -1984,5 +2046,53 @@ mod tests {
         assert_eq!(default_peer_color("nova"), default_peer_color("nova"));
         assert!(PEER_COLORS.contains(&default_peer_color("nova")));
         assert!(PEER_COLORS.contains(&default_peer_color("other person")));
+    }
+
+    #[test]
+    fn test_a_caret_without_an_anchor_still_follows_edits_made_here() {
+        let doc = Doc::new();
+        let text = doc.get_or_insert_text("text");
+        text.insert(&mut doc.transact_mut(), 0, "hey\nwhats up");
+        let mut remembered = Default::default();
+        // An older app says its caret is at the end of the second line, in bytes.
+        let who = yrs::ClientID::new(7);
+        let at = |remembered: &mut _| resolve_caret(&doc, &text, remembered, who, None, Some(12));
+        assert_eq!(at(&mut remembered), Some(12));
+        // Typing on the first line pushes the words along; the caret stays after "up".
+        text.insert(&mut doc.transact_mut(), 3, " h");
+        assert_eq!(at(&mut remembered), Some(14));
+        text.insert(&mut doc.transact_mut(), 5, "o");
+        assert_eq!(at(&mut remembered), Some(15));
+        // When that person moves their caret, the new number is tied to the text in turn.
+        assert_eq!(
+            resolve_caret(&doc, &text, &mut remembered, who, None, Some(7)),
+            Some(7)
+        );
+        text.insert(&mut doc.transact_mut(), 0, ">>");
+        assert_eq!(
+            resolve_caret(&doc, &text, &mut remembered, who, None, Some(7)),
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn test_a_caret_at_the_end_of_the_note_stays_there_as_text_is_typed_before_it() {
+        let doc = Doc::new();
+        let text = doc.get_or_insert_text("text");
+        text.insert(&mut doc.transact_mut(), 0, "hey\nwhats up");
+        let anchor = {
+            let txn = doc.transact();
+            hex_encode(&caret_anchor(&txn, &text, 12).unwrap().encode_v1())
+        };
+        let who = yrs::ClientID::new(7);
+        let mut remembered = Default::default();
+        for typed in [" h", "o"] {
+            text.insert(&mut doc.transact_mut(), 3, typed);
+            let len = text.get_string(&doc.transact()).len();
+            assert_eq!(
+                resolve_caret(&doc, &text, &mut remembered, who, Some(&anchor), Some(12)),
+                Some(len)
+            );
+        }
     }
 }
