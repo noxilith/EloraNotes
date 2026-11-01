@@ -25,6 +25,15 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.15.8" date="2026-11-01">
+      <description>
+        <p>
+          Carets in a note people are editing together stay in place in more cases: a caret at
+          the end of the note no longer slides back as others type earlier in it, and carets from
+          older versions of the app follow the text too.
+        </p>
+      </description>
+    </release>
     <release version="0.15.7" date="2026-11-01">
       <description>
         <p>
