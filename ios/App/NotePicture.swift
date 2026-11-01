@@ -1,9 +1,6 @@
 import PhotosUI
 import SwiftUI
 
-/// Pictures already loaded, so scrolling back to one does not ask again.
-private let pictureCache = NSCache<NSString, UIImage>()
-
 /// A picture in a note: `![alt](attachments/name.jpg)` is read from this phone's pictures folder or
 /// fetched from the shared library (and kept on the phone, so it is there after the app is closed
 /// and reopened); an `https://` address is downloaded. Tapping it opens it full screen, where it
@@ -62,36 +59,16 @@ struct NotePicture: View {
     }
 
     private func load(force: Bool) async {
-        if !force, let kept = pictureCache.object(forKey: src as NSString) {
-            image = kept
-            return
-        }
         guard !loading else { return }
         loading = true
         failure = nil
         defer { loading = false }
         do {
-            let bytes: Data
-            let lower = src.lowercased()
-            if lower.hasPrefix("https://") || lower.hasPrefix("http://") {
-                guard let url = URL(string: src) else { throw PictureError.unreadable }
-                bytes = try await URLSession.shared.data(from: url).0
-            } else {
-                let wanted = src
-                bytes = try await library.run { Data(try $0.image(src: wanted)) }
-            }
-            guard let decoded = UIImage(data: bytes) else { throw PictureError.unreadable }
-            pictureCache.setObject(decoded, forKey: src as NSString)
-            image = decoded
+            image = try await library.picture(src, force: force)
         } catch {
             failure = library.describe(error)
         }
     }
-}
-
-private enum PictureError: LocalizedError {
-    case unreadable
-    var errorDescription: String? { "This is not a picture the app can show." }
 }
 
 /// A picture full screen: pinch to zoom, save it to Photos, or share it.

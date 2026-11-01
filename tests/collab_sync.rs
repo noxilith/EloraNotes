@@ -1019,6 +1019,55 @@ fn test_a_caret_moved_twice_in_a_moment_still_arrives() {
     bob.disconnect();
 }
 
+/// A caret is tied to the words around it: when somebody types before it, it moves along on
+/// every other screen, without its owner having to move it again.
+#[test]
+fn test_a_caret_follows_the_text_typed_before_it() {
+    let _turn = SERVER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let harness = start_server();
+    let note_id = harness.note_id.clone();
+
+    let mut alice = Collab::new();
+    alice.connect(harness.profile(), "alice".into(), key("alice"));
+    settle(&mut alice, &mut String::new(), "alice", |c, _| {
+        c.is_connected()
+    });
+    alice.open_note(&note_id, "hello");
+    settle(&mut alice, &mut String::new(), "alice", |_, body| {
+        body == "hello"
+    });
+
+    let mut bob = Collab::new();
+    bob.connect(harness.profile(), "bob".into(), key("bob"));
+    let mut bob_body = String::new();
+    settle(&mut bob, &mut bob_body, "bob", |c, _| c.is_connected());
+    bob.open_note(&note_id, "hello");
+    settle(&mut bob, &mut bob_body, "bob", |_, body| body == "hello");
+    settle(&mut bob, &mut bob_body, "bob sees alice", |c, _| {
+        c.peers().iter().any(|p| p.name == "alice")
+    });
+
+    // Alice puts her caret after "hell".
+    alice.send_cursor(&note_id, 4);
+    settle(&mut bob, &mut bob_body, "bob sees her caret", |c, _| {
+        c.peers()
+            .iter()
+            .any(|p| p.name == "alice" && p.cursor == Some(4))
+    });
+
+    // Bob types two letters at the start. Alice does nothing, and her caret is still between
+    // the same two letters on Bob's screen.
+    bob.send_body(&note_id, "XYhello");
+    settle(&mut bob, &mut bob_body, "her caret moves along", |c, _| {
+        c.peers()
+            .iter()
+            .any(|p| p.name == "alice" && p.cursor == Some(6))
+    });
+
+    alice.disconnect();
+    bob.disconnect();
+}
+
 /// The colour somebody picks in Settings is the one the others draw their caret and name in —
 /// and a colour picked while the note is already open reaches them without a reconnect.
 #[test]

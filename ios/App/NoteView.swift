@@ -130,7 +130,10 @@ struct NoteView: View {
                     live?.setText(text: text)
                 },
                 onCursor: { byte in live?.setCursor(byte: UInt32(byte)) },
-                insertion: insertion)
+                insertion: insertion,
+                loadPicture: { src, done in
+                    Task { done(try? await library.picture(src)) }
+                })
         } else {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {

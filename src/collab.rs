@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use yrs::sync::{Awareness, AwarenessUpdate, Message as YMessage, SyncMessage};
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
-use yrs::{Doc, GetString, ReadTxn, Text, TextRef, Transact};
+use yrs::{Assoc, Doc, GetString, IndexedSequence, ReadTxn, StickyIndex, Text, TextRef, Transact};
 
 /// How long the encrypted handshake may wait for the server's answer. It needs at least one
 /// round trip, which is tens of milliseconds to a server across the internet; the short polling
@@ -705,6 +705,11 @@ struct Session {
     /// A caret the throttle is holding back. It is published the moment the interval allows,
     /// even when no further keystroke arrives to carry it out.
     pending_cursor: Option<usize>,
+    /// The same caret tied to the text as it was when it was set, so that a held-back caret still
+    /// lands on the same words if somebody typed in the meantime.
+    pending_anchor: Option<StickyIndex>,
+    /// The text-tied position last published, which is what other copies of the note follow.
+    sent_anchor: Option<StickyIndex>,
     /// Versions the window may still be showing, newest first. A keystroke typed before the
     /// window drew the newest text was made on one of these, and placing it on the right one is
     /// what stops a frame's worth of somebody else's words from being wiped out.
@@ -715,9 +720,15 @@ struct Session {
     /// When the last keepalive ping went out, and when the one still unanswered was sent.
     last_ping: Instant,
     pending_pong: Option<Instant>,
+    /// What the window was last told about the other people, so a caret that only moved because
+    /// the text around it changed is sent on, and one that did not move is not.
+    last_peers: Vec<PeerLook>,
     name: String,
     color: [u8; 3],
 }
+
+/// Who is in the note and where their caret is, to tell whether anything moved.
+type PeerLook = (String, [u8; 3], Option<usize>);
 
 /// Opens the socket to the server, trying each address it resolves to and giving up on one that
 /// never answers. The error says what a failed attempt usually means, because the app has no
@@ -934,10 +945,13 @@ impl Session {
             last_cursor: Instant::now(),
             last_cursor_sent: None,
             pending_cursor: None,
+            pending_anchor: None,
+            sent_anchor: None,
             recent: Vec::new(),
             window: String::new(),
             last_ping: Instant::now(),
             pending_pong: None,
+            last_peers: Vec::new(),
             name: name.to_string(),
             color: color.unwrap_or_else(|| default_peer_color(name)),
         };
@@ -1017,6 +1031,8 @@ impl Session {
                 self.open = Some(id);
                 self.last_cursor_sent = None;
                 self.pending_cursor = None;
+                self.pending_anchor = None;
+                self.sent_anchor = None;
                 // Announce ourselves in the room so the presence list has a name to show even
                 // before this person moves their caret.
                 self.publish_awareness(events, true);
@@ -1080,9 +1096,14 @@ impl Session {
                 let byte = map_position(&self.mirror, &self.doc_text(), byte);
                 if self.last_cursor_sent == Some(byte) {
                     self.pending_cursor = None;
+                    self.pending_anchor = None;
                     return Ok(());
                 }
                 self.pending_cursor = Some(byte);
+                self.pending_anchor = {
+                    let txn = self.awareness.doc().transact();
+                    self.text.sticky_index(&txn, byte as u32, Assoc::After)
+                };
                 // The first caret goes out immediately; after that it is throttled so typing
                 // does not turn into a stream of awareness frames. A held-back one is not
                 // dropped: `keep_alive` sends the newest as soon as the interval is up.
@@ -1238,7 +1259,7 @@ impl Session {
                     return Ok(());
                 };
                 if self.awareness.apply_update(update).is_ok() {
-                    events.send(Incoming::Peers(self.peers()));
+                    self.emit_peers_if_moved(events);
                 }
             }
             _ => {}
@@ -1401,6 +1422,7 @@ impl Session {
     /// and the ping that keeps the session open. Returns the reason the link is gone when it no
     /// longer answers.
     fn keep_alive(&mut self, events: &Notify) -> Result<(), String> {
+        self.emit_peers_if_moved(events);
         if self.pending_cursor.is_some() && self.last_cursor.elapsed() >= CURSOR_INTERVAL {
             self.publish_cursor(events);
         }
@@ -1421,22 +1443,58 @@ impl Session {
         Ok(())
     }
 
+    /// Tells the window when somebody's caret has moved because the text changed around it.
+    fn emit_peers_if_moved(&mut self, events: &Notify) {
+        let peers = self.peers();
+        let look: Vec<PeerLook> = peers
+            .iter()
+            .map(|peer| (peer.name.clone(), peer.color, peer.cursor))
+            .collect();
+        if look != self.last_peers {
+            self.last_peers = look;
+            events.send(Incoming::Peers(peers));
+        }
+    }
+
     /// Sends the caret the throttle has been holding, now that it may.
     fn publish_cursor(&mut self, events: &Notify) {
         let Some(byte) = self.pending_cursor.take() else {
             return;
         };
         self.last_cursor = Instant::now();
+        self.sent_anchor = self.pending_anchor.take();
         self.last_cursor_sent = Some(byte);
         self.publish_awareness(events, false);
     }
 
     fn publish_awareness(&mut self, events: &Notify, force: bool) {
-        let cursor = if force { None } else { self.last_cursor_sent };
+        // The caret goes out tied to the text around it, which every other copy of the note
+        // resolves against its own text each time it looks. A plain byte count is right only for
+        // the text it was counted in: as soon as anybody typed before it, it pointed at the wrong
+        // place until the owner of the caret moved it again. The byte count is where that
+        // position is in this copy right now, for apps that only read the count.
+        let anchor = if force {
+            None
+        } else {
+            self.sent_anchor.clone()
+        };
+        let cursor = if force {
+            None
+        } else {
+            anchor
+                .as_ref()
+                .and_then(|sticky| {
+                    let txn = self.awareness.doc().transact();
+                    sticky.get_offset(&txn).map(|offset| offset.index as usize)
+                })
+                .or(self.last_cursor_sent)
+        };
+        let anchor = anchor.map(|sticky| hex_encode(&sticky.encode_v1()));
         let state = serde_json::json!({
             "name": self.name,
             "color": self.color,
             "cursor": cursor,
+            "anchor": anchor,
         });
         if self.awareness.set_local_state(state).is_err() {
             return;
@@ -1448,7 +1506,7 @@ impl Session {
         if let Ok(update) = self.awareness.update_with_clients([own]) {
             let bytes = update.encode_v1();
             let _ = self.send_frame(FRAME_AWARENESS, &bytes);
-            events.send(Incoming::Peers(self.peers()));
+            self.emit_peers_if_moved(events);
         }
     }
 
@@ -1491,10 +1549,22 @@ impl Session {
                     ])
                 })
                 .unwrap_or([137, 180, 250]);
-            let cursor = value
+            let stated = value
                 .get("cursor")
                 .and_then(|c| c.as_u64())
                 .map(|c| c as usize);
+            // A caret tied to the text follows every edit made since it was sent; one from an
+            // older app only has the byte count it was sent with.
+            let cursor = value
+                .get("anchor")
+                .and_then(|a| a.as_str())
+                .and_then(hex_decode)
+                .and_then(|bytes| StickyIndex::decode_v1(&bytes).ok())
+                .and_then(|sticky| {
+                    let txn = self.awareness.doc().transact();
+                    sticky.get_offset(&txn).map(|offset| offset.index as usize)
+                })
+                .or(stated);
             out.push(RemotePeer {
                 name: name.to_string(),
                 color,
@@ -1517,6 +1587,21 @@ impl Session {
             .and_then(|_| self.stream.flush())
             .map_err(|e| format!("lost the server: {e}"))
     }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    (text.len().is_multiple_of(2) && text.is_ascii())
+        .then(|| {
+            (0..text.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&text[i..i + 2], 16).ok())
+                .collect()
+        })
+        .flatten()
 }
 
 /// Commands that arrive while the handshake is in flight are dropped, except Disconnect.

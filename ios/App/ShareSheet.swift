@@ -37,10 +37,9 @@ struct ShareSheet: View {
                             .lineLimit(4)
                             .textSelection(.enabled)
                         if let url = URL(string: link) {
-                            ShareLink(
-                                item: url,
-                                message: Text("Join my note in EloraNotes: \(link)")
-                            ) { Label("Send link", systemImage: "square.and.arrow.up") }
+                            // Just the address: a message with the address in it as well would be
+                            // sent along with it, and the link would arrive twice.
+                            ShareLink(item: url) { Label("Send link", systemImage: "square.and.arrow.up") }
                         }
                         Button {
                             UIPasteboard.general.string = link

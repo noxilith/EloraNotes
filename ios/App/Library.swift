@@ -15,6 +15,14 @@ struct ShareLive: Equatable {
     var version = 0
 }
 
+/// Pictures already loaded, so scrolling back to one does not ask again.
+private let pictureCache = NSCache<NSString, UIImage>()
+
+enum PictureError: LocalizedError {
+    case unreadable
+    var errorDescription: String? { "This is not a picture the app can show." }
+}
+
 enum LibraryError: Error {
     case notReady
 }
@@ -198,6 +206,26 @@ final class Library: ObservableObject {
         } catch {
             problem = describe(error)
         }
+    }
+
+    // MARK: Pictures
+
+    /// A picture a note names: read from this phone's pictures folder, fetched from the shared
+    /// library (and kept on the phone, so it is there after the app is closed and reopened), or
+    /// downloaded from an `https://` address.
+    func picture(_ src: String, force: Bool = false) async throws -> UIImage {
+        if !force, let kept = pictureCache.object(forKey: src as NSString) { return kept }
+        let bytes: Data
+        let lower = src.lowercased()
+        if lower.hasPrefix("https://") || lower.hasPrefix("http://") {
+            guard let url = URL(string: src) else { throw PictureError.unreadable }
+            bytes = try await URLSession.shared.data(from: url).0
+        } else {
+            bytes = try await run { Data(try $0.image(src: src)) }
+        }
+        guard let decoded = UIImage(data: bytes) else { throw PictureError.unreadable }
+        pictureCache.setObject(decoded, forKey: src as NSString)
+        return decoded
     }
 
     // MARK: Notes shared by link from this phone

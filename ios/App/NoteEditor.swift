@@ -25,6 +25,8 @@ struct NoteEditor: UIViewRepresentable {
     let onEdit: (String) -> Void
     let onCursor: (Int) -> Void
     var insertion: EditorInsertion?
+    /// Fetches a picture the text names (`attachments/…`), for showing it under its line.
+    var loadPicture: ((String, @escaping (UIImage?) -> Void) -> Void)?
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -43,7 +45,10 @@ struct NoteEditor: UIViewRepresentable {
         view.smartQuotesType = .no
         view.smartDashesType = .no
         view.spellCheckingType = .yes
-        view.onLayout = { [weak coordinator = context.coordinator] in coordinator?.placeCarets() }
+        view.onLayout = { [weak coordinator = context.coordinator] in
+            coordinator?.placeCarets()
+            coordinator?.placePictures()
+        }
         context.coordinator.view = view
         // A tap on a task's box ticks it.
         let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.tapped(_:)))
@@ -89,6 +94,10 @@ struct NoteEditor: UIViewRepresentable {
         var palette: Palette
         var lastIncoming = -1
         var lastInsertion = 0
+        /// Pictures the text names, by address, once they have loaded; and the ones being fetched.
+        private var pictures: [String: UIImage] = [:]
+        private var fetching: Set<String> = []
+        private var pictureViews: [UIImageView] = []
         var people: [LivePerson] = []
         /// Somebody's typing that arrived while a word was still being composed (an accent, a
         /// Japanese or Chinese word): it waits for the word to be finished.
@@ -349,10 +358,95 @@ struct NoteEditor: UIViewRepresentable {
                     storage.addAttribute(.foregroundColor, value: color, range: match.range(at: 2))
                 }
             }
+            // A line that is only a picture shows the picture under it: room is made, and the
+            // picture itself is drawn into that room by `placePictures`.
+            each(Self.pictureLine, .anchorsMatchLines) { match in
+                guard let src = Range(match.range(at: 1), in: text).map({ String(text[$0]) }) else { return }
+                storage.addAttributes(
+                    [.foregroundColor: dim, .font: face("Ubuntu-Light", 13)], range: match.range)
+                guard let image = pictures[src] else {
+                    fetch(src)
+                    return
+                }
+                let style = NSMutableParagraphStyle()
+                style.lineSpacing = 5
+                style.paragraphSpacing = pictureSize(image, width: Self.width(in: text, match)).height + 14
+                storage.addAttribute(.paragraphStyle, value: style, range: match.range)
+            }
             storage.endEditing()
             view.typingAttributes = [.font: body, .foregroundColor: ui(palette.fgPrimary), .paragraphStyle: paragraph]
             if view.selectedRange != selection { view.selectedRange = selection }
             quiet = false
+        }
+
+        // MARK: Pictures
+
+        /// A whole line that is `![alt](address)`, with an optional `{width=N}` after it.
+        static let pictureLine = #"^!\[[^\]\n]*\]\(\s*<?([^)\s>]+)>?\s*\)(?:\{width=(\d+)\})?[ \t]*$"#
+
+        private static func width(in text: String, _ match: NSTextCheckingResult) -> CGFloat? {
+            guard match.range(at: 2).location != NSNotFound, let digits = Range(match.range(at: 2), in: text)
+            else { return nil }
+            return Double(text[digits]).map { CGFloat($0) }
+        }
+
+        /// The size a picture is drawn at: as wide as the text, or as the note asks, and no wider
+        /// than the picture itself.
+        private func pictureSize(_ image: UIImage, width: CGFloat?) -> CGSize {
+            guard let view else { return .zero }
+            let room = max(60, view.bounds.width - view.textContainerInset.left - view.textContainerInset.right
+                - 2 * view.textContainer.lineFragmentPadding)
+            let wide = min(room, width ?? image.size.width, image.size.width)
+            guard image.size.width > 0 else { return .zero }
+            return CGSize(width: wide, height: wide * image.size.height / image.size.width)
+        }
+
+        /// Asks for a picture once; when it arrives the text is styled again to make room for it.
+        private func fetch(_ src: String) {
+            guard !fetching.contains(src), let load = parent.loadPicture else { return }
+            fetching.insert(src)
+            load(src) { [weak self] image in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    if let image {
+                        self.pictures[src] = image
+                        self.restyle()
+                        self.view?.setNeedsLayout()
+                    } else {
+                        // Not found (yet): it is asked for again the next time the note opens.
+                    }
+                }
+            }
+        }
+
+        /// Draws each loaded picture in the room left under its line.
+        func placePictures() {
+            guard let view else { return }
+            for old in pictureViews { old.removeFromSuperview() }
+            pictureViews.removeAll()
+            let text = view.textStorage.string
+            guard let regex = try? NSRegularExpression(pattern: Self.pictureLine, options: .anchorsMatchLines)
+            else { return }
+            let whole = NSRange(location: 0, length: (text as NSString).length)
+            for match in regex.matches(in: text, range: whole) {
+                guard let src = Range(match.range(at: 1), in: text).map({ String(text[$0]) }),
+                      let image = pictures[src]
+                else { continue }
+                let glyphs = view.layoutManager.glyphRange(forCharacterRange: match.range, actualCharacterRange: nil)
+                let line = view.layoutManager.boundingRect(forGlyphRange: glyphs, in: view.textContainer)
+                let size = pictureSize(image, width: Self.width(in: text, match))
+                let shown = UIImageView(image: image)
+                shown.contentMode = .scaleAspectFit
+                shown.clipsToBounds = true
+                shown.layer.cornerRadius = 6
+                shown.isUserInteractionEnabled = false
+                shown.frame = CGRect(
+                    x: view.textContainerInset.left + view.textContainer.lineFragmentPadding,
+                    y: view.textContainerInset.top + line.maxY + 6,
+                    width: size.width, height: size.height)
+                view.insertSubview(shown, at: 0)
+                pictureViews.append(shown)
+            }
         }
 
         private static func color(hex: String) -> UIColor? {
