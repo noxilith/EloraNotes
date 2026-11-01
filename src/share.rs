@@ -14,7 +14,7 @@ use crate::collab::ServerProfile;
 use crate::net::ServerConfig;
 use crate::server::Server;
 use base64::Engine;
-use iroh::{endpoint::presets, Endpoint, EndpointAddr};
+use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, RelayUrl, TransportAddr};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -60,12 +60,120 @@ pub struct Ticket {
 }
 
 impl Ticket {
+    /// The link in the app's own form. The ticket is packed into bytes (about a quarter of the
+    /// size of its JSON) whenever it can be, which is always for tickets this app makes.
     pub fn to_link(&self) -> String {
-        let json = serde_json::to_vec(self).unwrap_or_default();
+        let bytes = self
+            .pack()
+            .unwrap_or_else(|| serde_json::to_vec(self).unwrap_or_default());
         format!(
             "{LINK_PREFIX}{}",
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
         )
+    }
+
+    /// The ticket as bytes: a version byte, the access, the host's key, the password and the
+    /// certificate as raw bytes, the addresses, then the note's id and title. `None` for a ticket
+    /// holding something the packed form cannot, which then travels as JSON.
+    fn pack(&self) -> Option<Vec<u8>> {
+        let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let password = engine.decode(&self.pw).ok().filter(|pw| pw.len() == 16)?;
+        let fingerprint = hex_bytes(&self.fp).filter(|fp| fp.len() == 32)?;
+        let mut out = vec![PACKED, u8::from(self.view)];
+        out.extend_from_slice(self.addr.id.as_bytes());
+        out.extend_from_slice(&password);
+        out.extend_from_slice(&fingerprint);
+        out.push(u8::try_from(self.addr.addrs.len()).ok()?);
+        for addr in &self.addr.addrs {
+            match addr {
+                TransportAddr::Relay(url) => {
+                    let url = url.to_string();
+                    if url == DEFAULT_RELAY {
+                        out.push(0);
+                    } else {
+                        out.push(1);
+                        out.push(u8::try_from(url.len()).ok()?);
+                        out.extend_from_slice(url.as_bytes());
+                    }
+                }
+                TransportAddr::Ip(SocketAddr::V4(ip)) => {
+                    out.push(2);
+                    out.extend_from_slice(&ip.ip().octets());
+                    out.extend_from_slice(&ip.port().to_be_bytes());
+                }
+                TransportAddr::Ip(SocketAddr::V6(ip)) => {
+                    out.push(3);
+                    out.extend_from_slice(&ip.ip().octets());
+                    out.extend_from_slice(&ip.port().to_be_bytes());
+                }
+                _ => return None,
+            }
+        }
+        for text in [&self.note, &self.title] {
+            // A long title is cut: it is only a label, and the link should stay short.
+            let text: String = if text.len() > 60 {
+                text.chars()
+                    .scan(0, |n, c| {
+                        *n += c.len_utf8();
+                        (*n <= 60).then_some(c)
+                    })
+                    .collect()
+            } else {
+                text.clone()
+            };
+            out.push(u8::try_from(text.len()).ok()?);
+            out.extend_from_slice(text.as_bytes());
+        }
+        Some(out)
+    }
+
+    fn unpack(bytes: &[u8]) -> Option<Self> {
+        let mut at = Reader { bytes, at: 0 };
+        if at.take(1)? != [PACKED] {
+            return None;
+        }
+        let view = at.take(1)?[0] != 0;
+        let id = EndpointId::from_bytes(at.take(32)?.try_into().ok()?).ok()?;
+        let password = at.take(16)?;
+        let fingerprint = at.take(32)?;
+        let mut addr = EndpointAddr::new(id);
+        for _ in 0..at.take(1)?[0] {
+            match at.take(1)?[0] {
+                0 => addr = addr.with_relay_url(DEFAULT_RELAY.parse::<RelayUrl>().ok()?),
+                1 => {
+                    let length = usize::from(at.take(1)?[0]);
+                    let url = std::str::from_utf8(at.take(length)?).ok()?;
+                    addr = addr.with_relay_url(url.parse::<RelayUrl>().ok()?);
+                }
+                2 => {
+                    let ip: [u8; 4] = at.take(4)?.try_into().ok()?;
+                    let port = u16::from_be_bytes(at.take(2)?.try_into().ok()?);
+                    addr = addr.with_ip_addr(SocketAddr::from((ip, port)));
+                }
+                3 => {
+                    let ip: [u8; 16] = at.take(16)?.try_into().ok()?;
+                    let port = u16::from_be_bytes(at.take(2)?.try_into().ok()?);
+                    addr = addr.with_ip_addr(SocketAddr::from((ip, port)));
+                }
+                _ => return None,
+            }
+        }
+        let mut texts = Vec::new();
+        for _ in 0..2 {
+            let length = usize::from(at.take(1)?[0]);
+            texts.push(String::from_utf8(at.take(length)?.to_vec()).ok()?);
+        }
+        let title = texts.pop()?;
+        let note = texts.pop()?;
+        Some(Self {
+            v: 1,
+            addr,
+            fp: fingerprint.iter().map(|b| format!("{b:02x}")).collect(),
+            note,
+            title,
+            pw: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(password),
+            view,
+        })
     }
 
     /// The invite link: `https://noxilith.github.io/join/INVITECODE`. It works when clicked in a
@@ -84,12 +192,48 @@ impl Ticket {
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(body)
             .map_err(|_| "that share link is damaged: copy it again")?;
-        let ticket: Ticket = serde_json::from_slice(&bytes)
-            .map_err(|_| "that share link is damaged: copy it again")?;
+        // Links made by this version are packed bytes; earlier ones are JSON.
+        let ticket: Ticket = match bytes.first() {
+            Some(&PACKED) => {
+                Self::unpack(&bytes).ok_or("that share link is damaged: copy it again")?
+            }
+            _ => serde_json::from_slice(&bytes)
+                .map_err(|_| "that share link is damaged: copy it again")?,
+        };
         if ticket.v != 1 {
             return Err("that link is from a newer EloraNotes: update the app".to_string());
         }
         Ok(ticket)
+    }
+}
+
+/// Marks a packed ticket. JSON starts with `{`, so the two can never be mistaken for each other.
+const PACKED: u8 = 2;
+/// The relay most links name, written as one byte instead of its address.
+const DEFAULT_RELAY: &str = "https://use1-1.relay.n0.iroh.link./";
+
+fn hex_bytes(text: &str) -> Option<Vec<u8>> {
+    (text.len().is_multiple_of(2) && text.is_ascii())
+        .then(|| {
+            (0..text.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&text[i..i + 2], 16).ok())
+                .collect()
+        })
+        .flatten()
+}
+
+/// Reads a packed ticket front to back.
+struct Reader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, count: usize) -> Option<&'a [u8]> {
+        let slice = self.bytes.get(self.at..self.at.checked_add(count)?)?;
+        self.at += count;
+        Some(slice)
     }
 }
 
@@ -398,5 +542,71 @@ impl Drop for Joined {
             });
             runtime.shutdown_timeout(Duration::from_secs(1));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(view: bool) -> Ticket {
+        let id: EndpointId = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let addr = EndpointAddr::new(id)
+            .with_relay_url(DEFAULT_RELAY.parse::<RelayUrl>().unwrap())
+            .with_ip_addr("69.21.135.75:42088".parse().unwrap())
+            .with_ip_addr("[fe80::1]:42088".parse().unwrap());
+        Ticket {
+            v: 1,
+            addr,
+            fp: "c962aae3ea8200447773acd49939b8d454030ae6196c1b36ec92877cb0c25c4d".into(),
+            note: "test-share-20261028-210530".into(),
+            title: "Test Share".into(),
+            pw: secret(),
+            view,
+        }
+    }
+
+    #[test]
+    fn a_ticket_packs_small_and_reads_back_the_same() {
+        for view in [false, true] {
+            let ticket = sample(view);
+            let link = ticket.to_link();
+            let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&ticket).unwrap());
+            assert!(
+                link.len() < LINK_PREFIX.len() + json.len() / 2,
+                "{} packed against {} as JSON",
+                link.len(),
+                json.len()
+            );
+            let back = Ticket::from_link(&link).unwrap();
+            assert_eq!(back.addr, ticket.addr);
+            assert_eq!(
+                (back.fp, back.note, back.title, back.pw, back.view),
+                (ticket.fp, ticket.note, ticket.title, ticket.pw, ticket.view)
+            );
+        }
+    }
+
+    #[test]
+    fn links_made_before_packing_still_open() {
+        let ticket = sample(false);
+        let old = format!(
+            "{LINK_PREFIX}{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&ticket).unwrap())
+        );
+        assert_eq!(Ticket::from_link(&old).unwrap().pw, ticket.pw);
+        // A cut-off packed link is refused rather than misread.
+        let packed = ticket.to_link();
+        assert!(Ticket::from_link(&packed[..packed.len() - 9]).is_err());
+    }
+
+    #[test]
+    fn a_long_title_is_cut_to_keep_the_link_short() {
+        let mut ticket = sample(false);
+        ticket.title = "é".repeat(100);
+        let back = Ticket::from_link(&ticket.to_link()).unwrap();
+        assert!(back.title.len() <= 60 && !back.title.is_empty());
     }
 }
