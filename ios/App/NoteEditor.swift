@@ -8,12 +8,6 @@ struct EditorText: Equatable {
     var text: String
 }
 
-/// Words to put in at the caret (a picture's Markdown, say), once: a new `id` is a new request.
-struct EditorInsertion: Equatable {
-    var id: Int
-    var text: String
-}
-
 /// The Markdown editor. The text is styled as it is typed the way the desktop editor styles it,
 /// somebody else's typing is folded in without moving your caret, and other people's carets are
 /// drawn where they are, in their colour, with their name.
@@ -24,7 +18,6 @@ struct NoteEditor: UIViewRepresentable {
     let editable: Bool
     let onEdit: (String) -> Void
     let onCursor: (Int) -> Void
-    var insertion: EditorInsertion?
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -74,10 +67,6 @@ struct NoteEditor: UIViewRepresentable {
             coordinator.lastIncoming = incoming.id
             coordinator.apply(incoming.text)
         }
-        if let insertion, insertion.id != coordinator.lastInsertion {
-            coordinator.lastInsertion = insertion.id
-            coordinator.insertAtCaret(insertion.text)
-        }
         coordinator.people = people
         coordinator.placeCarets()
     }
@@ -88,7 +77,6 @@ struct NoteEditor: UIViewRepresentable {
         var bar: FormatBar?
         var palette: Palette
         var lastIncoming = -1
-        var lastInsertion = 0
         var people: [LivePerson] = []
         /// Somebody's typing that arrived while a word was still being composed (an accent, a
         /// Japanese or Chinese word): it waits for the word to be finished.
@@ -99,17 +87,6 @@ struct NoteEditor: UIViewRepresentable {
         init(_ parent: NoteEditor) {
             self.parent = parent
             self.palette = parent.palette
-        }
-
-        /// Puts `words` in at the caret (or over the selection) as an edit like typing, so it is
-        /// undone, saved and sent to everybody the same way.
-        func insertAtCaret(_ words: String) {
-            guard let view, view.isEditable, view.markedTextRange == nil,
-                  let range = view.selectedTextRange
-            else { return }
-            view.replace(range, withText: words)
-            textViewDidChange(view)
-            textViewDidChangeSelection(view)
         }
 
         // MARK: Task boxes

@@ -904,41 +904,6 @@ impl Vault {
         Ok(bytes)
     }
 
-    /// Adds a picture to a note: it is filed in this phone's pictures folder (beside the notes,
-    /// where the desktop app keeps them too) and, for a note in the shared library, sent to the
-    /// library so everybody with the note can see it. Returns the address to write into the note.
-    pub fn add_image(
-        &self,
-        bytes: Vec<u8>,
-        name_hint: String,
-        extension: String,
-        shared: bool,
-    ) -> Result<String, CoreError> {
-        if bytes.is_empty() {
-            return Err(failed("that picture is empty"));
-        }
-        if bytes.len() > elora_notes::net::MAX_ATTACHMENT {
-            return Err(failed("that picture is too large (over 12 MB)"));
-        }
-        let name = elora_notes::attachments::stored_picture_name(&bytes, &name_hint, &extension);
-        let dir = self.attachments_dir();
-        std::fs::create_dir_all(&dir).map_err(failed)?;
-        let path = dir.join(&name);
-        if !path.is_file() {
-            std::fs::write(&path, &bytes).map_err(failed)?;
-        }
-        if shared {
-            let settings = self
-                .settings()
-                .ok_or_else(|| failed("no shared library is set up"))?;
-            let sent = name.clone();
-            self.worker
-                .run(move |library| library.upload_attachment(&settings, &sent, bytes))?
-                .map_err(failed)?;
-        }
-        Ok(format!("attachments/{name}"))
-    }
-
     /// Pins a note to the top of the list, or takes the pin off.
     pub fn set_pinned(&self, id: String, pinned: bool) -> Result<NoteSummary, CoreError> {
         {
@@ -1458,21 +1423,16 @@ mod tests {
     }
 
     #[test]
-    fn a_picture_is_filed_beside_the_notes_and_read_back() {
+    fn a_picture_beside_the_notes_is_read_back() {
         let (vault, dir) = vault("pictures");
         let png = b"\x89PNG\r\n\x1a\nnot really a picture".to_vec();
-        let src = vault
-            .add_image(png.clone(), "My Cat".into(), "PNG".into(), false)
-            .unwrap();
-        assert!(src.starts_with("attachments/my-cat-"), "{src}");
-        assert!(dir.join(&src).is_file(), "kept next to the notes");
-        assert_eq!(vault.image(src.clone()).unwrap(), png);
-        // Adding it again files it under the same name.
+        std::fs::create_dir_all(dir.join("attachments")).unwrap();
+        std::fs::write(dir.join("attachments/my-cat-1a2b3c4d.png"), &png).unwrap();
         assert_eq!(
             vault
-                .add_image(png, "My Cat".into(), "png".into(), false)
+                .image("attachments/my-cat-1a2b3c4d.png".into())
                 .unwrap(),
-            src
+            png
         );
         // Anything that is not a plain picture name is turned away.
         assert!(vault.image("attachments/../secrets.png".into()).is_err());
@@ -1480,9 +1440,6 @@ mod tests {
         // With no library set up, a picture that is not here cannot be found.
         assert!(vault
             .image("attachments/absent-1a2b3c4d.png".into())
-            .is_err());
-        assert!(vault
-            .add_image(Vec::new(), "x".into(), "png".into(), false)
             .is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }

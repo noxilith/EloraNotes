@@ -1,4 +1,3 @@
-import PhotosUI
 import SwiftUI
 
 /// One note: read it with its links and backlinks, or edit its text. A note on this phone saves
@@ -22,8 +21,6 @@ struct NoteView: View {
     @State private var liveError: String?
     @State private var people: [LivePerson] = []
     @State private var showShare = false
-    @State private var pickedPhoto: PhotosPickerItem?
-    @State private var insertion = EditorInsertion(id: 0, text: "")
     @State private var seenShareVersion = 0
     @State private var retryAt = Date.distantFuture
     private let tick = Timer.publish(every: 0.06, on: .main, in: .common).autoconnect()
@@ -54,14 +51,6 @@ struct NoteView: View {
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 HStack(spacing: 18) {
-                    if editing, canEdit {
-                        PhotosPicker(selection: $pickedPhoto, matching: .images) {
-                            Image(systemName: "photo")
-                                .font(.system(size: 17))
-                                .frame(width: 26, height: 26)
-                        }
-                        .accessibilityLabel("Add a picture")
-                    }
                     if detail != nil, !shared {
                         Button { showShare = true } label: {
                             Image(systemName: sharing == nil ? "person.badge.plus" : "person.2.fill")
@@ -100,11 +89,6 @@ struct NoteView: View {
             .environment(\.palette, palette)
         }
         .task { await load() }
-        .onChange(of: pickedPhoto) { _, item in
-            guard let item else { return }
-            pickedPhoto = nil
-            Task { await addPicture(item) }
-        }
         .onReceive(tick) { _ in look() }
         .onChange(of: draft) { _, _ in
             if live == nil || sharing != nil { scheduleSave() }
@@ -129,8 +113,7 @@ struct NoteView: View {
                     draft = text
                     live?.setText(text: text)
                 },
-                onCursor: { byte in live?.setCursor(byte: UInt32(byte)) },
-                insertion: insertion)
+                onCursor: { byte in live?.setCursor(byte: UInt32(byte)) })
         } else {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
@@ -294,27 +277,6 @@ struct NoteView: View {
         } else {
             editorText = EditorText(id: editorText.id + 1, text: draft)
             editing = true
-        }
-    }
-
-    /// A picture chosen from the photo library goes into the note: filed on this phone and, for a
-    /// note in the shared library, sent to the library, then written into the text at the caret.
-    private func addPicture(_ item: PhotosPickerItem) async {
-        guard let data = try? await item.loadTransferable(type: Data.self),
-              let jpeg = PictureExport.jpeg(from: data)
-        else {
-            library.showNotice("That picture could not be read")
-            return
-        }
-        let inLibrary = shared
-        do {
-            let src = try await library.run {
-                try $0.addImage(bytes: jpeg, nameHint: "photo", extension: "jpg", shared: inLibrary)
-            }
-            insertion = EditorInsertion(id: insertion.id + 1, text: "\n![photo](\(src))\n")
-            library.showNotice(inLibrary ? "Picture added and sent to the shared library" : "Picture added")
-        } catch {
-            library.showNotice(library.describe(error))
         }
     }
 

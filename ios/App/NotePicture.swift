@@ -1,4 +1,3 @@
-import PhotosUI
 import SwiftUI
 
 /// A picture in a note: `![alt](attachments/name.jpg)` is read from this phone's pictures folder or
@@ -112,26 +111,5 @@ struct PictureViewer: View {
             .toolbarBackground(.visible, for: .navigationBar)
             .toolbarColorScheme(.dark, for: .navigationBar)
         }
-    }
-}
-
-/// What a picture chosen from the photo library turns into before it goes in a note: no side
-/// longer than 2048 points, as a JPEG, so a photo from the camera is a few hundred kilobytes
-/// rather than ten megabytes (the library only keeps pictures up to 12 MB).
-enum PictureExport {
-    static func jpeg(from data: Data) -> Data? {
-        guard let source = UIImage(data: data) else { return nil }
-        let longest = max(source.size.width, source.size.height)
-        let factor = longest > 2048 ? 2048 / longest : 1
-        let size = CGSize(width: source.size.width * factor, height: source.size.height * factor)
-        let format = UIGraphicsImageRendererFormat.default()
-        format.scale = 1
-        format.opaque = true
-        let drawn = UIGraphicsImageRenderer(size: size, format: format).image { context in
-            UIColor.white.setFill()
-            context.fill(CGRect(origin: .zero, size: size))
-            source.draw(in: CGRect(origin: .zero, size: size))
-        }
-        return drawn.jpegData(compressionQuality: 0.85)
     }
 }
