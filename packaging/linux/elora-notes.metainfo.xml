@@ -25,6 +25,17 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.15.5" date="2026-11-01">
+      <description>
+        <p>
+          Invite links are now https://noxilith.github.io/join/INVITECODE and about a third of
+          the length. A note joined from a link is no longer listed under "Shared with you": it is
+          open only while you look at it. Pictures can be saved from a note (right-click on the
+          desktop, tap on the phone). Settings has a New button for the identifier, and the
+          phone shows pictures and can add them.
+        </p>
+      </description>
+    </release>
     <release version="0.15.4" date="2026-10-31">
       <description>
         <p>
