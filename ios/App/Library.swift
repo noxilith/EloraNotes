@@ -3,6 +3,18 @@ import SwiftUI
 
 extension NoteSummary: Identifiable {}
 
+/// The live state of one note shared by link from this phone.
+struct ShareLive: Equatable {
+    var people: [LivePerson] = []
+    var connected = false
+    var error: String?
+    /// True once the note's text has arrived from the temporary server.
+    var ready = false
+    var text = ""
+    /// Goes up each time somebody else changes the text.
+    var version = 0
+}
+
 enum LibraryError: Error {
     case notReady
 }
@@ -21,6 +33,9 @@ final class Library: ObservableObject {
     /// Notes from this phone being shared by link, by note id. Sharing goes on while the note is
     /// closed and stops with Stop sharing or when the app quits.
     @Published var shares: [String: ShareSession] = [:]
+    /// What the people in each shared note are doing, kept up to date whether or not the note is
+    /// open, so the owner sees who joined and what they typed even from another screen.
+    @Published var shareLive: [String: ShareLive] = [:]
     /// Notes joined from somebody else's link, by the id used to open them. They exist only while
     /// they are held here: nothing of them is written to the phone.
     @Published var joined: [String: JoinedShare] = [:]
@@ -39,6 +54,7 @@ final class Library: ObservableObject {
 
     private var vault: Vault?
     let store = ServerStore()
+    private var pump: Task<Void, Never>?
 
     /// Opens the phone's notes folder, which is also visible in the Files app.
     func start() async {
@@ -58,6 +74,7 @@ final class Library: ObservableObject {
             let folder = documents.appendingPathComponent("EloraNotes", isDirectory: true)
             vault = try Vault.open(directory: folder.path)
             applyServer()
+            startPump()
             await refresh()
         } catch {
             problem = describe(error)
@@ -181,6 +198,48 @@ final class Library: ObservableObject {
         } catch {
             problem = describe(error)
         }
+    }
+
+    // MARK: Notes shared by link from this phone
+
+    /// Looks at every shared note a few times a second: who is in it, and what they typed. What
+    /// they typed is saved at once, so the note on this phone is right even if it was never opened.
+    private func startPump() {
+        guard pump == nil else { return }
+        pump = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                await self?.lookAtShares()
+            }
+        }
+    }
+
+    private func lookAtShares() async {
+        // A shared note keeps the screen awake: a phone that locks puts the share to sleep, and
+        // then nobody can reach the note.
+        let wanted = !shares.isEmpty
+        if UIApplication.shared.isIdleTimerDisabled != wanted {
+            UIApplication.shared.isIdleTimerDisabled = wanted
+        }
+        for (id, session) in shares {
+            let update = session.live().poll()
+            var state = shareLive[id] ?? ShareLive()
+            state.people = update.people
+            state.connected = update.connected
+            state.error = update.error
+            if let text = update.text {
+                state.ready = true
+                if text != state.text {
+                    state.text = text
+                    state.version += 1
+                    if let summary = try? await run({ try $0.saveNote(id: id, body: text) }) {
+                        replace(summary)
+                    }
+                }
+            }
+            if state != shareLive[id] { shareLive[id] = state }
+        }
+        for id in shareLive.keys where shares[id] == nil { shareLive[id] = nil }
     }
 
     func showNotice(_ text: String) {

@@ -38,6 +38,10 @@ struct NoteEditor: UIViewRepresentable {
         view.spellCheckingType = .yes
         view.onLayout = { [weak coordinator = context.coordinator] in coordinator?.placeCarets() }
         context.coordinator.view = view
+        // A tap on a task's box ticks it.
+        let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.tapped(_:)))
+        tap.delegate = context.coordinator
+        view.addGestureRecognizer(tap)
         if DemoData.screen == "edit" {
             DispatchQueue.main.async { view.becomeFirstResponder() }
         }
@@ -67,7 +71,7 @@ struct NoteEditor: UIViewRepresentable {
         coordinator.placeCarets()
     }
 
-    final class Coordinator: NSObject, UITextViewDelegate {
+    final class Coordinator: NSObject, UITextViewDelegate, UIGestureRecognizerDelegate {
         var parent: NoteEditor
         weak var view: CaretTextView?
         var bar: FormatBar?
@@ -83,6 +87,46 @@ struct NoteEditor: UIViewRepresentable {
         init(_ parent: NoteEditor) {
             self.parent = parent
             self.palette = parent.palette
+        }
+
+        // MARK: Task boxes
+
+        func gestureRecognizer(
+            _ gestureRecognizer: UIGestureRecognizer,
+            shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
+        ) -> Bool { true }
+
+        /// A tap on the `- [ ]` at the start of a task line flips it to `- [x]` and back, as an
+        /// edit like any other (so it is undone, saved and sent to everybody like typing).
+        @objc func tapped(_ tap: UITapGestureRecognizer) {
+            guard let view, view.isEditable, view.markedTextRange == nil, tap.state == .ended else { return }
+            var point = tap.location(in: view)
+            point.x -= view.textContainerInset.left
+            point.y -= view.textContainerInset.top
+            let storage = view.textStorage
+            guard storage.length > 0 else { return }
+            let glyph = view.layoutManager.glyphIndex(for: point, in: view.textContainer)
+            let rect = view.layoutManager.boundingRect(forGlyphRange: NSRange(location: glyph, length: 1), in: view.textContainer)
+            guard rect.insetBy(dx: -22, dy: -8).contains(point) else { return }
+            let index = view.layoutManager.characterIndexForGlyph(at: glyph)
+            let text = storage.string as NSString
+            let line = text.lineRange(for: NSRange(location: min(index, text.length - 1), length: 0))
+            guard let regex = try? NSRegularExpression(pattern: #"^(\s*[-*+] )\[( |x|X)\]"#),
+                  let match = regex.firstMatch(in: text as String, range: line)
+            else { return }
+            // The box and a little either side of it, since it is a small target.
+            let box = NSRange(location: match.range(at: 1).location + match.range(at: 1).length - 1, length: 5)
+            guard index >= box.location, index <= box.location + box.length else { return }
+            let mark = match.range(at: 2)
+            let now = text.substring(with: mark)
+            guard let from = view.position(from: view.beginningOfDocument, offset: mark.location),
+                  let to = view.position(from: from, offset: mark.length),
+                  let range = view.textRange(from: from, to: to)
+            else { return }
+            let keep = view.selectedRange
+            view.replace(range, withText: now == " " ? "x" : " ")
+            view.selectedRange = keep
+            textViewDidChange(view)
         }
 
         // MARK: Text in and out
@@ -223,8 +267,20 @@ struct NoteEditor: UIViewRepresentable {
             each(#"^\s*(?:[-*+] (?:\[[ xX]\] )?|\d+\. )"#, .anchorsMatchLines) { match in
                 storage.addAttribute(.foregroundColor, value: ui(palette.fgMuted), range: match.range)
             }
+            each(#"^\s*[-*+] \[[xX]\] (.*)$"#, .anchorsMatchLines) { match in
+                storage.addAttributes(
+                    [.foregroundColor: ui(palette.fgMuted),
+                     .strikethroughStyle: NSUnderlineStyle.single.rawValue],
+                    range: match.range(at: 1))
+            }
             each(#"^>.*$"#, .anchorsMatchLines) { match in
                 storage.addAttribute(.foregroundColor, value: ui(palette.fgSecondary), range: match.range)
+            }
+            each(#"\*\*\*(.+?)\*\*\*"#) { match in
+                storage.addAttributes(
+                    [.font: face("DejaVuSans-Bold", 16), .obliqueness: 0.22], range: match.range(at: 1))
+                storage.addAttribute(.foregroundColor, value: dim, range: NSRange(location: match.range.location, length: 3))
+                storage.addAttribute(.foregroundColor, value: dim, range: NSRange(location: match.range.location + match.range.length - 3, length: 3))
             }
             each(#"\*\*(.+?)\*\*"#) { match in
                 storage.addAttribute(.font, value: face("DejaVuSans-Bold", 16), range: match.range(at: 1))
@@ -253,6 +309,12 @@ struct NoteEditor: UIViewRepresentable {
             }
             each(#"(?<![\w&])#[\p{L}\p{N}_/-]+"#) { match in
                 storage.addAttribute(.foregroundColor, value: ui(palette.accent), range: match.range)
+            }
+            each(#"(?<![=\{])==(?![=\{])(.+?)(?<!=)=="#) { match in
+                storage.addAttribute(
+                    .backgroundColor, value: UIColor(red: 1, green: 0.77, blue: 0.3, alpha: 0.4), range: match.range(at: 1))
+                storage.addAttribute(.foregroundColor, value: dim, range: NSRange(location: match.range.location, length: 2))
+                storage.addAttribute(.foregroundColor, value: dim, range: NSRange(location: match.range.location + match.range.length - 2, length: 2))
             }
             each(#"==\{#([0-9A-Fa-f]{6})\}(.+?)=="#) { match in
                 if let hex = Range(match.range(at: 1), in: text), let color = Self.color(hex: String(text[hex])) {

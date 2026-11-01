@@ -10,6 +10,8 @@ use super::*;
 use crate::collab::RemotePeer;
 use crate::live::LiveNote;
 use crate::share::{Access, Joined, Network, ShareHost};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 pub(super) enum Role {
     Hosting { host: ShareHost },
@@ -73,6 +75,9 @@ pub(super) struct Shares {
     queued: Vec<String>,
     /// Whether the Join window has already looked at the clipboard for a link.
     join_checked: bool,
+    /// True while any note is shared: a thread keeps asking for a redraw then, so people's typing
+    /// and arrivals are folded in even when the window is behind another or has no input.
+    awake: Arc<AtomicBool>,
     /// Tests shorten the wait before a cut-off note is given up.
     pub(super) lost_after: Option<Duration>,
 }
@@ -88,6 +93,16 @@ impl EloraApp {
     pub(super) fn listen_for_links(&mut self, ctx: &egui::Context) {
         let repaint = ctx.clone();
         self.shares.inbox = Some(crate::links::listen(move || repaint.request_repaint()));
+        let awake = self.shares.awake.clone();
+        let heartbeat = ctx.clone();
+        let _ = std::thread::Builder::new()
+            .name("elora-share-heartbeat".to_string())
+            .spawn(move || loop {
+                std::thread::sleep(Duration::from_millis(150));
+                if awake.load(Ordering::Relaxed) {
+                    heartbeat.request_repaint();
+                }
+            });
     }
 
     /// A share link the program was opened with: it joins as soon as the window is up.
@@ -276,10 +291,11 @@ impl EloraApp {
                 }
             }
         }
-        if self.shares.sessions.is_empty()
-            && self.shares.starting.is_none()
-            && self.shares.joining.is_none()
-        {
+        let busy = !self.shares.sessions.is_empty()
+            || self.shares.starting.is_some()
+            || self.shares.joining.is_some();
+        self.shares.awake.store(busy, Ordering::Relaxed);
+        if !busy {
             return;
         }
         // Somebody's typing arrives at any moment, and an idle window is never asked to draw.

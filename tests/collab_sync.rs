@@ -548,7 +548,7 @@ fn test_a_name_cannot_be_taken_by_another_key() {
     // A key too short to be a secret is refused before it can own anything, so a typo in
     // Settings cannot quietly turn a private note into a guessable one.
     let mut vague = Collab::new();
-    vague.connect(harness.profile(), "bob".into(), "short".into());
+    vague.connect(harness.profile(), "bob".into(), "ab".into());
     wait_until(&mut vague, "the short key", |c| {
         c.last_error()
             .is_some_and(|error| error.contains("too short"))

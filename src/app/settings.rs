@@ -675,10 +675,10 @@ impl EloraApp {
         });
         if self.identifier.trim().len() < MIN_IDENTIFIER {
             ui.label(
-                RichText::new(
-                    "This identifier is too short to be a key: it needs at least 16 characters. \
-                     Paste the one from your other computer here.",
-                )
+                RichText::new(format!(
+                    "This identifier is too short to be a key: it needs at least {MIN_IDENTIFIER} \
+                     characters. Paste the one from your other computer here.",
+                ))
                 .size(10.5)
                 .color(p.danger),
             );

@@ -31,11 +31,10 @@ pub struct Registry {
     path: Option<PathBuf>,
 }
 
-/// The shortest identifier accepted, in characters. Anything shorter is a name again rather
-/// than a key: somebody who knows the person's display name could guess it, which is the whole
-/// thing this keeps apart. The app makes 32-character identifiers, so this only turns away a
-/// typo or a hand-written key.
-pub const MIN_IDENTIFIER: usize = 16;
+/// The shortest identifier accepted, in characters, on the desktop app, the phone app and the
+/// server alike. The app makes 32-character identifiers; this only turns away an empty or
+/// near-empty one. A short, hand-written identifier is easy to guess, so it protects little.
+pub const MIN_IDENTIFIER: usize = 3;
 
 /// The most names one key may hold. A person renames themselves now and then, and every old
 /// name stays theirs; without a limit, one key could reconnect under name after name and hold

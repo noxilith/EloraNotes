@@ -53,7 +53,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Shared library")
                 } footer: {
-                    Text("The same address, password, name and identifier as in EloraNotes on your computer, under Settings → Shared library.")
+                    Text("The same address, password, name and identifier as in EloraNotes on your computer, under Settings → Shared library. The identifier needs at least 3 characters.")
                 }
                 Section {
                     Button(busy ? "Connecting…" : "Connect") { Task { await connect() } }
@@ -118,7 +118,7 @@ struct SettingsView: View {
 
     private var ready: Bool {
         !host.trimmingCharacters(in: .whitespaces).isEmpty && !password.isEmpty
-            && !name.trimmingCharacters(in: .whitespaces).isEmpty && identifier.count >= 8
+            && !name.trimmingCharacters(in: .whitespaces).isEmpty && identifier.trimmingCharacters(in: .whitespaces).count >= 3
             && UInt16(port) != nil
     }
 

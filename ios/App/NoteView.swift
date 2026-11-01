@@ -21,6 +21,8 @@ struct NoteView: View {
     @State private var liveError: String?
     @State private var people: [LivePerson] = []
     @State private var showShare = false
+    @State private var seenShareVersion = 0
+    @State private var retryAt = Date.distantFuture
     private let tick = Timer.publish(every: 0.06, on: .main, in: .common).autoconnect()
 
     private var shared: Bool { detail?.summary.shared ?? false }
@@ -34,8 +36,8 @@ struct NoteView: View {
     var body: some View {
         VStack(spacing: 0) {
             if !people.isEmpty { whoIsHere }
-            if shared, !liveReady, editing {
-                Text(liveError ?? "Connecting to the shared library…")
+            if editedLive, !liveReady {
+                Text(liveError ?? (sharing != nil ? "Starting to share…" : "Connecting to the shared library…"))
                     .font(AppFont.body(14)).foregroundStyle(palette.fgSecondary).padding(8)
             }
             if editing { pageHeader }
@@ -116,7 +118,10 @@ struct NoteView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     pageHeader.padding(.horizontal, -16)
-                    MarkdownView(text: draft, links: detail?.links ?? []) { id in
+                    MarkdownView(
+                        text: draft, links: detail?.links ?? [],
+                        onToggle: canEdit ? { line in toggleTask(line) } : nil
+                    ) { id in
                         path.append(id)
                     }
                     if let backlinks = detail?.backlinks, !backlinks.isEmpty {
@@ -207,22 +212,56 @@ struct NoteView: View {
                 // Still shared from before: carry on with the same connection.
                 live = session.live()
                 liveReady = true
+                seenShareVersion = library.shareLive[noteID]?.version ?? 0
             } else if found.summary.shared, live == nil {
                 // Opening the note live: its text arrives through `look`.
-                live = try? await library.run { try $0.openLive(id: noteID) }
+                await openLive()
             }
         } catch {
             message = library.describe(error)
         }
     }
 
+    /// Opens the shared library's note for live editing. When that fails the reason is shown and
+    /// it is tried again in a few seconds, so Edit does not stay out of reach.
+    private func openLive() async {
+        do {
+            live = try await library.run { try $0.openLive(id: noteID) }
+            liveError = nil
+        } catch {
+            liveError = library.describe(error)
+            retryAt = Date().addingTimeInterval(4)
+        }
+    }
+
     /// Asked every few hundredths of a second: what has somebody else done to the note?
     private func look() {
+        if sharing != nil {
+            // The library watches notes shared from this phone, open or not; this shows what it saw.
+            guard let state = library.shareLive[noteID] else { return }
+            people = state.people
+            liveReady = state.ready
+            liveError = state.error
+            if state.version != seenShareVersion {
+                seenShareVersion = state.version
+                if state.text != draft {
+                    draft = state.text
+                    saved = state.text
+                    editorText = EditorText(id: editorText.id + 1, text: state.text)
+                }
+            }
+            return
+        }
+        if shared, live == nil, Date() > retryAt {
+            retryAt = .distantFuture
+            Task { await openLive() }
+        }
         guard let live else { return }
         let update = live.poll()
         people = update.people
         liveError = update.error
-        if update.connected, update.text != nil { liveReady = true }
+        // The text has arrived, so the note can be edited, even if the connection blinked since.
+        if update.text != nil { liveReady = true }
         if let text = update.text, text != draft {
             draft = text
             saved = text
@@ -239,6 +278,25 @@ struct NoteView: View {
             editorText = EditorText(id: editorText.id + 1, text: draft)
             editing = true
         }
+    }
+
+    /// A task's box was tapped, in the reading view: its `[ ]` becomes `[x]` or the other way
+    /// round, in the text and for everyone else with the note open.
+    private func toggleTask(_ line: Int) {
+        var lines = draft.components(separatedBy: "\n")
+        guard line >= 0, line < lines.count else { return }
+        let text = lines[line]
+        if let open = text.range(of: "[ ]") {
+            lines[line] = text.replacingCharacters(in: open, with: "[x]")
+        } else if let done = text.range(of: "[x]") ?? text.range(of: "[X]") {
+            lines[line] = text.replacingCharacters(in: done, with: "[ ]")
+        } else {
+            return
+        }
+        let updated = lines.joined(separator: "\n")
+        draft = updated
+        editorText = EditorText(id: editorText.id + 1, text: updated)
+        live?.setText(text: updated)
     }
 
     private func scheduleSave() {

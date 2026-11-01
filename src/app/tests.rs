@@ -614,7 +614,7 @@ fn test_a_short_identifier_never_reaches_the_server() {
     app.server_form.host = "127.0.0.1".into();
     app.server_form.port = 1;
     app.server_form.password = "letmein".into();
-    app.identifier = "abc".to_string();
+    app.identifier = "ab".to_string();
 
     app.connect_server();
     let message = app.status_message.clone().expect("a message saying why");
