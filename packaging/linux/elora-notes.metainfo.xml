@@ -25,6 +25,17 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.15.4" date="2026-10-31">
+      <description>
+        <p>
+          The identifier needs at least 3 characters everywhere (desktop, phone and server). A
+          note shared from the window keeps updating while the window is behind others. The
+          iPhone app draws bold, italic, highlights and task lists properly, lets you tick tasks,
+          shows who joined a note you share and what they typed even from another screen, and
+          pins notes from the hold menu.
+        </p>
+      </description>
+    </release>
     <release version="0.15.3" date="2026-10-29">
       <description>
         <p>
