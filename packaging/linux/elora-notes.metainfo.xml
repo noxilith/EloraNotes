@@ -25,6 +25,15 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.15.6" date="2026-11-01">
+      <description>
+        <p>
+          Carets in a note people are editing together now stay in the right place: each caret is
+          tied to the words around it, so it follows other people's typing instead of drifting
+          until its owner moves it. The iPhone app sends a link once instead of twice.
+        </p>
+      </description>
+    </release>
     <release version="0.15.5" date="2026-11-01">
       <description>
         <p>
