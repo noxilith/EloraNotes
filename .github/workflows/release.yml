@@ -127,17 +127,55 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
 
-      - name: Package portable exe
+      - name: Build collaboration server
+        shell: bash
+        run: cargo build --release --locked --no-default-features --bin elora-server
+
+      # Code signing by SignPath (https://signpath.io), free for open source. Every signing
+      # step below only runs once SIGNPATH_ORGANIZATION_ID is set as a repository variable and
+      # SIGNPATH_API_TOKEN as a secret, so until then the release is built unsigned as before.
+      - name: Collect the programs to sign
+        if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+        shell: bash
+        run: |
+          mkdir -p unsigned
+          cp target/release/elora.exe target/release/elora-server.exe unsigned/
+
+      - name: Upload the programs for signing
+        if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+        id: upload-programs
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-programs-unsigned
+          path: unsigned/*
+
+      - name: Sign the programs
+        if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'EloraNotes' }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG || 'release-signing' }}
+          artifact-configuration-slug: binaries
+          github-artifact-id: ${{ steps.upload-programs.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed
+          parameters: |
+            version: "${{ env.VERSION }}"
+
+      - name: Use the signed programs
+        if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+        shell: bash
+        run: |
+          cp signed/elora.exe target/release/elora.exe
+          cp signed/elora-server.exe target/release/elora-server.exe
+
+      - name: Package portable exe and server
         shell: bash
         run: |
           mkdir -p dist
           cp target/release/elora.exe "dist/EloraNotes-$VERSION-windows-x86_64-portable.exe"
-
-      - name: Build collaboration server
-        shell: bash
-        run: |
-          cargo build --release --locked --no-default-features --bin elora-server
-          mkdir -p dist
           cp target/release/elora-server.exe dist/elora-server-windows-x86_64.exe
           cp packaging/server/install-windows.ps1 dist/install-elora-server.ps1
 
@@ -150,6 +188,32 @@ jobs:
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
             "/DAppVersion=$env:VERSION" `
             "packaging\windows\elora-notes.iss"
+
+      - name: Upload the setup wizard for signing
+        if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+        id: upload-installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer-unsigned
+          path: dist/EloraNotes-*-windows-x86_64-setup.exe
+
+      - name: Sign the setup wizard
+        if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'EloraNotes' }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG || 'release-signing' }}
+          artifact-configuration-slug: installer
+          github-artifact-id: ${{ steps.upload-installer.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed-installer
+
+      - name: Use the signed setup wizard
+        if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+        shell: bash
+        run: cp signed-installer/EloraNotes-*-windows-x86_64-setup.exe dist/
 
       - name: Show what will be published
         shell: bash

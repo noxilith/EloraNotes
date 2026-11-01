@@ -70,6 +70,17 @@ An assistant reaches the shared library as you: it uses your saved name, identif
 - **Five themes.** Obsidian, Paper, Nordic, Matcha, or Matugen to pull colours from your wallpaper.
 - **Keeps itself current.** EloraNotes checks GitHub for a newer release and updates the way it was installed, then restarts.
 
+## Code signing policy
+
+Windows builds are signed so Windows and your antivirus can tell they come from this project.
+
+Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org).
+
+- **Committers and reviewers:** [Noxilith](https://github.com/noxilith), the project's only maintainer.
+- **Approvers:** [Noxilith](https://github.com/noxilith). Every release is approved by hand before it is signed.
+- **What is signed:** only builds made by this repository's release workflow from the source in it, never a file built anywhere else. The Windows program, the server and the setup wizard are signed; upstream libraries are compiled in.
+- **Privacy:** see the [privacy policy](https://noxilith.github.io/docs/privacy/). In short: the app has no analytics and sends nothing to the developer. The only automatic network request is the update check against GitHub when the app starts; a shared library is contacted only when you connect to one, and a note is shared by link only when you start sharing it.
+
 ## Download
 
 Grab the build for your platform from the [latest release](https://github.com/noxilith/EloraNotes/releases/latest).

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SignPath artifact configuration "binaries": paste into the SignPath project (Artifact
+  configurations -> Add). The release workflow uploads elora.exe and elora-server.exe in one zip.
+  The product name and version are checked against what the build embedded.
+-->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <parameters>
+    <parameter name="version" />
+  </parameters>
+  <zip-file>
+    <pe-file path="elora.exe" product-name="EloraNotes" product-version="${version}">
+      <authenticode-sign/>
+    </pe-file>
+    <pe-file path="elora-server.exe" product-name="EloraNotes" product-version="${version}">
+      <authenticode-sign/>
+    </pe-file>
+  </zip-file>
+</artifact-configuration>
