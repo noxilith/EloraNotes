@@ -23,7 +23,10 @@ finish-args:
   # folder the app actually defaults to is granted by name as well.
   - --filesystem=xdg-documents
   - --filesystem=~/Documents
+  # Like documents, `xdg-download` is empty without an XDG user-dirs file, and a file saved to
+  # a Downloads folder the sandbox cannot see vanishes with it, so the folder is granted by name.
   - --filesystem=xdg-download
+  - --filesystem=~/Downloads
   # matugen (and anything else following the README) writes the wallpaper colors to
   # ~/.config/elora/matugen.json, which the sandbox would otherwise hide.
   - --filesystem=xdg-config/elora:ro

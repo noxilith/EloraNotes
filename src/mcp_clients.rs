@@ -365,6 +365,16 @@ fn claude_desktop_paths(env: &Environment) -> (Vec<PathBuf>, bool) {
     if classic.is_dir() {
         present = true;
     }
+    // The community Linux builds (claude-desktop-debian: .deb, .rpm, AppImage, Nix) read the same
+    // `~/.config/Claude` folder, but a copy that has never been opened has not made it yet. Its
+    // launcher, or its own settings folder, shows it is installed.
+    if env.os == Os::Linux
+        && (env.find_program("claude-desktop-unofficial").is_some()
+            || env.find_program("claude-desktop").is_some()
+            || env.config_home.join("claude-desktop-debian").is_dir())
+    {
+        present = true;
+    }
     // The classic folder is used when it exists, and as the only choice when nothing else does.
     if classic.is_dir() || paths.is_empty() {
         paths.push(classic.join(FILE));

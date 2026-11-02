@@ -25,6 +25,15 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.15.9" date="2026-11-01">
+      <description>
+        <p>
+          Saving the memory skill as a ZIP now asks where to put it, so the file is no longer lost
+          when the app runs in a sandbox. Claude Desktop is also recognised when it comes from the
+          community Linux packages.
+        </p>
+      </description>
+    </release>
     <release version="0.15.8" date="2026-11-01">
       <description>
         <p>

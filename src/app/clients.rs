@@ -57,6 +57,8 @@ pub(super) struct McpClients {
     notes: HashMap<Key, (bool, String)>,
     /// What saving the skill as a ZIP said.
     zip_note: Option<(bool, String)>,
+    /// The "where should it go" dialog for the ZIP, while it is open.
+    zip_dialog: Option<Receiver<Option<PathBuf>>>,
     /// A computer other than this one to look at; only the tests set it.
     pub(super) environment: Option<Environment>,
     sandboxed: Option<bool>,
@@ -170,6 +172,21 @@ impl McpClients {
                     self.scan = None;
                 }
                 Err(TryRecvError::Disconnected) => self.scan = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(rx) = &self.zip_dialog {
+            match rx.try_recv() {
+                Ok(chosen) => {
+                    self.zip_dialog = None;
+                    if let Some(file) = chosen {
+                        self.zip_note = Some(match skills::save_zip(&file) {
+                            Ok(text) => (true, text),
+                            Err(text) => (false, text),
+                        });
+                    }
+                }
+                Err(TryRecvError::Disconnected) => self.zip_dialog = None,
                 Err(TryRecvError::Empty) => {}
             }
         }
@@ -665,14 +682,28 @@ impl EloraApp {
                 .on_hover_text("They take a skill as an uploaded file: Customize → Skills → Upload")
                 .clicked()
             {
-                let folder = dirs::download_dir()
-                    .or_else(dirs::home_dir)
-                    .unwrap_or_default();
-                let file = folder.join("elora-memory-skill.zip");
-                self.mcp_clients.zip_note = Some(match skills::save_zip(&file) {
-                    Ok(text) => (true, text),
-                    Err(text) => (false, text),
-                });
+                // A dialog, not a guessed folder: a sandboxed app cannot see every folder, and
+                // a file written where it cannot be seen is gone. The portal's dialog writes
+                // wherever the person picks, and the path it hands back is a real one.
+                if self.mcp_clients.zip_dialog.is_none() {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let wake = ui.ctx().clone();
+                    std::thread::spawn(move || {
+                        let mut dialog = rfd::FileDialog::new()
+                            .set_title("Save the memory skill")
+                            .set_file_name("elora-memory-skill.zip")
+                            .add_filter("ZIP", &["zip"]);
+                        if let Some(start) = dirs::download_dir()
+                            .filter(|dir| dir.is_dir())
+                            .or_else(|| dirs::home_dir().filter(|dir| dir.is_dir()))
+                        {
+                            dialog = dialog.set_directory(start);
+                        }
+                        let _ = tx.send(dialog.save_file());
+                        wake.request_repaint();
+                    });
+                    self.mcp_clients.zip_dialog = Some(rx);
+                }
             }
         });
         if let Some((ok, text)) = &self.mcp_clients.zip_note {
